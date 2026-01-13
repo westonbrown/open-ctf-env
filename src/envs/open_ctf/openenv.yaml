@@ -1,0 +1,5 @@
+spec_version: 1
+name: open-ctf
+version: 0.1.0
+description: A cybersecurity CTF environment wrapping XBow benchmarks.
+port: 8000
