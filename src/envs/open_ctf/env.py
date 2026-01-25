@@ -1,13 +1,24 @@
+import re
+import logging
 import gymnasium as gym
 from gymnasium import spaces
-import logging
-from typing import Optional, Tuple, Dict, Any
-import re
 from .docker_manager import DockerManager
+from typing import Optional, Tuple, Dict, Any
 
 logger = logging.getLogger(__name__)
 
 class OpenCTFEnv(gym.Env):
+    """
+    This is a standard gynamsium (OpenAI Gym) environment that wraps the CTF challenge system for reinforcement learning.
+
+    This contains the following key components:
+
+    1. Action space: Text commands up to 1000 characters, the agent sends shell commands.
+    2. Observation space: This returns stdout, return_code and flag_captured status
+    3. Reset(): This cleans up the old containers, starts a fresh challenge and an attacker container
+    4. Srtep(): Executes the agent's command, checks for the flag patterns and returns the reward if the flag is found.
+    5. Episode limits: 50 max steps to prevent infinite loops
+    """
     metadata = {"render_modes": ["ansi"]}
 
     def __init__(self, challenge_id: str, benchmark_path: str = "benchmarks/xbow"):

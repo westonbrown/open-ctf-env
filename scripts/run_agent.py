@@ -120,7 +120,7 @@ def stop_challenge(challenge_id: str):
 
 
 def run_agent(target: str, objective: str, model: str = None, iterations: int = 50):
-    """Run Cyber-AutoAgent against the target."""
+    """Run pagainst the target."""
     
     # Determine provider from env
     provider = os.environ.get("CYBER_AGENT_PROVIDER", "litellm")

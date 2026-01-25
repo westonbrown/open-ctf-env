@@ -1,3 +1,8 @@
+"""
+This is an alternative interface using the OpenEnv framework (not Gymnasium). It provides a server-based
+API for agents
+"""
+
 import logging
 from uuid import uuid4
 from typing import Optional
