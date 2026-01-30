@@ -1,0 +1,51 @@
+# GLM-4.7-Flash Fine-tuning Configuration
+# ========================================
+
+# Model settings
+model:
+  name: "unsloth/GLM-4.7-Flash-bnb-4bit"
+  max_seq_length: 8192
+  load_in_4bit: true
+
+# LoRA configuration
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: "none"
+  use_rslora: false
+
+# Training hyperparameters
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  max_steps: 100
+  warmup_steps: 10
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  optim: "adamw_8bit"
+  seed: 3407
+
+# Saving & logging
+output:
+  dir: "outputs/glm4-ctf"
+  save_steps: 25
+  save_total_limit: 3
+  logging_steps: 1
+  report_to: "none"  # or "tensorboard", "wandb"
+
+# Dataset
+data:
+  path: "scripts/train/train_sharegpt.jsonl"
+  text_field: "messages"
+  num_proc: 2
+  packing: false

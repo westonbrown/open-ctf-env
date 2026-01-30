@@ -18,6 +18,8 @@ dependencies = [
     "bitsandbytes",
     "codecarbon",
     "docker",
+    "zmq>=0.0.0",
+    "numpy<2.3",
 ]
 
 [project.optional-dependencies]

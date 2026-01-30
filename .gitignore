@@ -75,3 +75,5 @@ checkpoints/
 *.ckpt
 *.pt
 *.bin
+scripts/train/training_data/sessions/
+scripts/train/*.jsonl
