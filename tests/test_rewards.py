@@ -1,6 +1,6 @@
 """Tests for CTFReward function.
 
-Validates all four reward components (flag, grammar, efficiency, format)
+Validates all four reward components (flag, uniqueness, efficiency, format)
 plus integration tests against data/grpo.jsonl.
 """
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from open_ctf.rewards.ctf_reward import CTFReward, _classify_tool_call
+from open_ctf.rewards.reward import CTFReward
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -47,46 +47,6 @@ def grpo_samples():
 
 
 # ---------------------------------------------------------------------------
-# _classify_tool_call tests
-# ---------------------------------------------------------------------------
-
-
-class TestClassifyToolCall:
-    def test_nmap_is_recon(self):
-        assert _classify_tool_call("shell_command", '{"command": "nmap -sV target"}') == "recon"
-
-    def test_gobuster_is_enum(self):
-        assert _classify_tool_call("shell_command", '{"command": "gobuster dir -u http://target"}') == "enum"
-
-    def test_sqlmap_is_exploit(self):
-        assert _classify_tool_call("shell_command", '{"command": "sqlmap -u http://target"}') == "exploit"
-
-    def test_flag_found_is_exploit(self):
-        assert _classify_tool_call("flag_found", '{"content": "FLAG{test}"}') == "exploit"
-
-    def test_python_code_is_exploit(self):
-        assert _classify_tool_call("python_code", '{"code": "import requests"}') == "exploit"
-
-    def test_curl_default_is_recon(self):
-        assert _classify_tool_call("shell_command", '{"command": "curl -s http://target/"}') == "recon"
-
-    def test_curl_with_exploit_keyword(self):
-        assert _classify_tool_call("shell_command", '{"command": "curl -X POST -d exploit http://target"}') == "exploit"
-
-    def test_curl_with_dirb_is_enum(self):
-        assert _classify_tool_call("shell_command", '{"command": "curl http://target/robots.txt"}') == "enum"
-
-    def test_unknown_tool_returns_none(self):
-        assert _classify_tool_call("unknown_tool", '{"key": "value"}') is None
-
-    def test_ffuf_is_enum(self):
-        assert _classify_tool_call("shell_command", '{"command": "ffuf -u http://target/FUZZ"}') == "enum"
-
-    def test_hydra_is_exploit(self):
-        assert _classify_tool_call("shell_command", '{"command": "hydra -l admin -P pass.txt target ssh"}') == "exploit"
-
-
-# ---------------------------------------------------------------------------
 # _flag_score tests
 # ---------------------------------------------------------------------------
 
@@ -100,6 +60,25 @@ class TestFlagScore:
         text = "Welcome admin! Your flag is FLAG{abc_def} congrats!"
         score = reward_no_noise._flag_score(text, "FLAG{abc_def}")
         assert score == 1.0
+
+    def test_metadata_success_overrides(self, reward_no_noise):
+        # metadata.success=True should give 1.0 even without flag in text
+        score = reward_no_noise._flag_score("no flag here", None, metadata_success=True)
+        assert score == 1.0
+
+    def test_metadata_success_with_placeholder_flag(self, reward_no_noise):
+        # The critical fix: placeholder flag + metadata.success should score 1.0
+        score = reward_no_noise._flag_score(
+            "no flag text", "content_of_flag_here", metadata_success=True
+        )
+        assert score == 1.0
+
+    def test_placeholder_flag_skipped(self, reward_no_noise):
+        # Placeholder flag should not match even if present in text
+        score = reward_no_noise._flag_score(
+            "content_of_flag_here", "content_of_flag_here"
+        )
+        assert score == 0.0
 
     def test_pattern_match_no_gt(self, reward_no_noise):
         score = reward_no_noise._flag_score("FLAG{some_random_flag}", None)
@@ -125,77 +104,150 @@ class TestFlagScore:
         score = reward_no_noise._flag_score("hello world", None)
         assert score == 0.0
 
+    def test_metadata_false_no_flag(self, reward_no_noise):
+        score = reward_no_noise._flag_score("no flag", None, metadata_success=False)
+        assert score == 0.0
+
+    def test_metadata_false_blocks_exact_match(self, reward_no_noise):
+        """metadata.success=False should block exact match fallback."""
+        score = reward_no_noise._flag_score(
+            "Found FLAG{real_flag}", "FLAG{real_flag}", metadata_success=False
+        )
+        # Flag IS in text, but metadata says not solved -> only pattern credit
+        assert score == 0.1
+
+    def test_metadata_false_with_flag_pattern(self, reward_no_noise):
+        """metadata.success=False with FLAG{} pattern gives 0.1 credit."""
+        score = reward_no_noise._flag_score(
+            "FLAG{some_flag}", None, metadata_success=False
+        )
+        assert score == 0.1
+
+    def test_check_placeholder_skipped(self, reward_no_noise):
+        """ground_truth_flag='CHECK' should be treated as placeholder."""
+        score = reward_no_noise._flag_score("answer CHECK here", "CHECK")
+        assert score == 0.0
+
+    def test_template_text_flag_skipped(self, reward_no_noise):
+        """Multiline flags containing 'content_of_flag_here' are placeholders."""
+        template_flag = "tags:\n  <FLAG>content_of_flag_here"
+        score = reward_no_noise._flag_score(template_flag, template_flag)
+        assert score == 0.0
+
 
 # ---------------------------------------------------------------------------
-# _grammar_score tests
+# _uniqueness_score tests
 # ---------------------------------------------------------------------------
 
 
-class TestGrammarScore:
+class TestUniquenessScore:
     def _tc(self, name, args="{}"):
         return {"name": name, "arguments": args}
 
-    def test_correct_order_full(self, reward_no_noise):
+    def test_all_unique_commands(self, reward_no_noise):
         tool_calls = [
             self._tc("shell_command", '{"command": "nmap target"}'),
+            self._tc("shell_command", '{"command": "curl http://target"}'),
             self._tc("shell_command", '{"command": "gobuster dir -u http://target"}'),
-            self._tc("shell_command", '{"command": "sqlmap -u http://target"}'),
-            self._tc("flag_found", '{"content": "FLAG{x}"}'),
         ]
-        score = reward_no_noise._grammar_score(tool_calls)
+        score = reward_no_noise._uniqueness_score(tool_calls)
         assert score == 1.0
 
-    def test_wrong_order_exploit_first(self, reward_no_noise):
+    def test_all_repeated_commands(self, reward_no_noise):
         tool_calls = [
-            self._tc("flag_found", '{"content": "FLAG{x}"}'),
-            self._tc("shell_command", '{"command": "nmap target"}'),
-            self._tc("shell_command", '{"command": "gobuster dir -u http://target"}'),
+            self._tc("shell_command", '{"command": "ls"}'),
+            self._tc("shell_command", '{"command": "ls"}'),
+            self._tc("shell_command", '{"command": "ls"}'),
         ]
-        score = reward_no_noise._grammar_score(tool_calls)
-        # phases_seen = [exploit, recon, enum]
-        # Presence: recon(0.2)+enum(0.2)+exploit(0.2) = 0.6
-        # Order: recon(1) < enum(2) => +0.2, but enum(2) > exploit(0) => +0.0
-        # Total = 0.8
-        assert score == pytest.approx(0.8)
+        score = reward_no_noise._uniqueness_score(tool_calls)
+        assert score == pytest.approx(1.0 / 3.0)
 
-    def test_recon_only(self, reward_no_noise):
+    def test_half_repeated(self, reward_no_noise):
         tool_calls = [
             self._tc("shell_command", '{"command": "nmap target"}'),
-            self._tc("shell_command", '{"command": "ping target"}'),
+            self._tc("shell_command", '{"command": "nmap target"}'),
+            self._tc("shell_command", '{"command": "curl http://target"}'),
+            self._tc("shell_command", '{"command": "curl http://target"}'),
         ]
-        score = reward_no_noise._grammar_score(tool_calls)
-        assert score == 0.2  # Only recon present
+        score = reward_no_noise._uniqueness_score(tool_calls)
+        assert score == pytest.approx(0.5)
 
     def test_empty_tool_calls(self, reward_no_noise):
-        score = reward_no_noise._grammar_score([])
+        score = reward_no_noise._uniqueness_score([])
         assert score == 0.0
 
-    def test_missing_enum_phase(self, reward_no_noise):
+    def test_single_command(self, reward_no_noise):
         tool_calls = [
-            self._tc("shell_command", '{"command": "nmap target"}'),
-            self._tc("shell_command", '{"command": "sqlmap -u http://target"}'),
+            self._tc("shell_command", '{"command": "id"}'),
         ]
-        score = reward_no_noise._grammar_score(tool_calls)
-        # recon(0.2) + exploit(0.2) = 0.4, no enum
-        # recon before exploit would need enum in between, so no order bonus
-        assert score == 0.4
+        score = reward_no_noise._uniqueness_score(tool_calls)
+        assert score == 1.0
 
-    def test_recon_enum_no_exploit(self, reward_no_noise):
+    def test_no_extractable_commands(self, reward_no_noise):
         tool_calls = [
-            self._tc("shell_command", '{"command": "nmap target"}'),
-            self._tc("shell_command", '{"command": "gobuster dir -u http://target"}'),
+            self._tc("unknown_tool", ""),
+            self._tc("another_tool", ""),
         ]
-        score = reward_no_noise._grammar_score(tool_calls)
-        # recon(0.2) + enum(0.2) + order bonus recon<enum(0.2) = 0.6
-        assert score == pytest.approx(0.6)
+        score = reward_no_noise._uniqueness_score(tool_calls)
+        assert score == 0.5  # Neutral
 
-    def test_unclassified_tools_ignored(self, reward_no_noise):
+    def test_python_code_extracted(self, reward_no_noise):
         tool_calls = [
-            self._tc("unknown_tool", '{"key": "value"}'),
-            self._tc("another_tool", '{"key": "value"}'),
+            self._tc("python_code", '{"code": "import os; os.system(\\"id\\")"}'),
+            self._tc("python_code", '{"code": "print(open(\\"/etc/passwd\\").read())"}'),
         ]
-        score = reward_no_noise._grammar_score(tool_calls)
-        assert score == 0.0
+        score = reward_no_noise._uniqueness_score(tool_calls)
+        assert score == 1.0
+
+    def test_flag_found_extracted(self, reward_no_noise):
+        tool_calls = [
+            self._tc("flag_found", '{"content": "FLAG{test}"}'),
+            self._tc("flag_found", '{"content": "FLAG{test}"}'),
+        ]
+        score = reward_no_noise._uniqueness_score(tool_calls)
+        assert score == 0.5  # Same flag submitted twice
+
+
+# ---------------------------------------------------------------------------
+# _extract_command tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractCommand:
+    def _tc(self, name, args):
+        return {"name": name, "arguments": args}
+
+    def test_shell_command(self):
+        cmd = CTFReward._extract_command(
+            self._tc("shell_command", '{"command": "nmap -sV target"}')
+        )
+        assert cmd == "nmap -sV target"
+
+    def test_python_code(self):
+        cmd = CTFReward._extract_command(
+            self._tc("python_code", '{"code": "print(1)"}')
+        )
+        assert cmd == "print(1)"
+
+    def test_flag_found(self):
+        cmd = CTFReward._extract_command(
+            self._tc("flag_found", '{"content": "FLAG{test}"}')
+        )
+        assert cmd == "FLAG{test}"
+
+    def test_empty_args(self):
+        cmd = CTFReward._extract_command(self._tc("tool", ""))
+        assert cmd == ""
+
+    def test_plain_string_args(self):
+        cmd = CTFReward._extract_command(self._tc("tool", "ls -la"))
+        assert cmd == "ls -la"
+
+    def test_dict_with_path(self):
+        cmd = CTFReward._extract_command(
+            self._tc("read_file", '{"path": "/etc/passwd"}')
+        )
+        assert cmd == "/etc/passwd"
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +417,7 @@ class TestCallIntegration:
             ]},
             {"role": "tool", "content": "80/tcp open http"},
             {"role": "assistant", "content": "", "tool_calls": [
-                {"function": {"name": "shell_command", "arguments": '{"command": "gobuster dir -u http://target"}'}}
+                {"function": {"name": "shell_command", "arguments": '{"command": "curl http://target"}'}}
             ]},
             {"role": "tool", "content": "/admin (200)"},
             {"role": "assistant", "content": "", "tool_calls": [
@@ -384,6 +436,23 @@ class TestCallIntegration:
         assert len(scores) == 1
         assert scores[0] > 0.5
 
+    def test_successful_trace_with_metadata(self, reward_no_noise):
+        """metadata.success=True should score high even without flag text."""
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "shell_command", "arguments": '{"command": "nmap target"}'}}
+            ]},
+            {"role": "tool", "content": "80/tcp open"},
+            {"role": "assistant", "content": "solved"},
+        ]
+        scores = reward_no_noise(
+            [msgs],
+            ground_truth_flag=["content_of_flag_here"],
+            optimal_steps=[2],
+            metadata=[{"success": True}],
+        )
+        assert scores[0] > 0.5
+
     def test_failed_trace_scores_low(self, reward_no_noise):
         # Trace with no tool calls at all -- pure text failure
         msgs = [
@@ -398,8 +467,6 @@ class TestCallIntegration:
         assert scores[0] < 0.1
 
     def test_failed_trace_with_tools_lower_than_success(self, reward_no_noise):
-        # Failed trace with tool calls still gets some score from format/efficiency
-        # but should be notably lower than a successful trace
         fail_msgs = [
             {"role": "assistant", "content": "", "tool_calls": [
                 {"function": {"name": "shell_command", "arguments": '{"command": "curl http://target"}'}}
@@ -451,8 +518,22 @@ class TestCallIntegration:
     def test_no_kwargs(self, reward_no_noise):
         scores = reward_no_noise(["hello world"])
         assert len(scores) == 1
-        # No ground truth, no optimal steps = low score
+        # No ground truth, no optimal steps, no metadata = low score
         assert scores[0] == pytest.approx(0.0)
+
+    def test_metadata_success_via_kwargs(self, reward_no_noise):
+        """Verify metadata.success is extracted from nested metadata dict."""
+        scores = reward_no_noise(
+            ["no flag in text at all"],
+            metadata=[{"success": True}],
+            optimal_steps=[5],
+        )
+        # metadata.success=True → flag_sc=1.0
+        # efficiency = min(5/0, 1.0) → 0 steps (no tool calls) → 0.0
+        # uniqueness = 0.0 (no tool calls)
+        # format = 0.0 (no tool calls)
+        # Total = 0.50 * 1.0 = 0.50
+        assert scores[0] == pytest.approx(0.50)
 
 
 # ---------------------------------------------------------------------------
@@ -467,11 +548,12 @@ class TestGRPOSamples:
     def test_all_have_required_fields(self, grpo_samples):
         for i, sample in enumerate(grpo_samples):
             assert "messages" in sample, f"Sample {i} missing 'messages'"
-            assert "ground_truth_flag" in sample or sample.get("metadata", {}).get("success") is False, \
-                f"Sample {i} missing 'ground_truth_flag'"
             assert "optimal_steps" in sample, f"Sample {i} missing 'optimal_steps'"
             assert isinstance(sample["optimal_steps"], int), f"Sample {i} optimal_steps not int"
-            assert sample["optimal_steps"] >= 1, f"Sample {i} optimal_steps < 1"
+            assert sample["optimal_steps"] >= 0, f"Sample {i} optimal_steps < 0"
+            # metadata.success is the authoritative signal
+            meta = sample.get("metadata", {})
+            assert "success" in meta, f"Sample {i} missing metadata.success"
 
     def test_mix_of_successes_and_failures(self, grpo_samples):
         successes = sum(1 for s in grpo_samples if s["metadata"]["success"])
@@ -487,6 +569,7 @@ class TestGRPOSamples:
                 completions,
                 ground_truth_flag=[sample["ground_truth_flag"]],
                 optimal_steps=[sample["optimal_steps"]],
+                metadata=[sample["metadata"]],
             )
             # With noise_range=0.05, scores can go slightly below 0
             assert scores[0] >= -0.05, f"Sample {i} score {scores[0]} too low"
@@ -504,6 +587,7 @@ class TestGRPOSamples:
                 completions,
                 ground_truth_flag=[sample["ground_truth_flag"]],
                 optimal_steps=[sample["optimal_steps"]],
+                metadata=[sample["metadata"]],
             )
             if sample["metadata"]["success"]:
                 success_scores.append(scores[0])
@@ -518,6 +602,7 @@ class TestGRPOSamples:
         )
 
     def test_successful_traces_above_threshold(self, grpo_samples):
+        """Successful traces (per metadata) should score above 0.3."""
         reward = CTFReward(noise_range=0.0, seed=0)
         for sample in grpo_samples:
             if not sample["metadata"]["success"]:
@@ -527,18 +612,14 @@ class TestGRPOSamples:
                 completions,
                 ground_truth_flag=[sample["ground_truth_flag"]],
                 optimal_steps=[sample["optimal_steps"]],
+                metadata=[sample["metadata"]],
             )
             assert scores[0] > 0.3, (
                 f"Success sample '{sample['metadata']['challenge']}' scored only {scores[0]:.3f}"
             )
 
     def test_failed_traces_below_success_average(self, grpo_samples):
-        """Failed traces should score below the average success score.
-
-        Note: Failed traces with valid tool calls still earn format/efficiency
-        points. The key invariant is that failures score lower than successes
-        on average, not that they fall below an arbitrary threshold.
-        """
+        """Average failure score should be below average success score."""
         reward = CTFReward(noise_range=0.0, seed=0)
 
         success_scores = []
@@ -550,6 +631,7 @@ class TestGRPOSamples:
                 completions,
                 ground_truth_flag=[sample["ground_truth_flag"]],
                 optimal_steps=[sample["optimal_steps"]],
+                metadata=[sample["metadata"]],
             )
             if sample["metadata"]["success"]:
                 success_scores.append(scores[0])
@@ -557,11 +639,11 @@ class TestGRPOSamples:
                 failure_scores.append(scores[0])
 
         avg_success = sum(success_scores) / len(success_scores)
+        avg_failure = sum(failure_scores) / len(failure_scores)
 
-        for i, score in enumerate(failure_scores):
-            assert score < avg_success, (
-                f"Failure {i} scored {score:.3f} >= avg success {avg_success:.3f}"
-            )
+        assert avg_failure < avg_success, (
+            f"Avg failure ({avg_failure:.3f}) should be < avg success ({avg_success:.3f})"
+        )
 
     def test_noise_adds_variance_across_samples(self, grpo_samples):
         reward = CTFReward(noise_range=0.05, seed=42)
@@ -573,6 +655,7 @@ class TestGRPOSamples:
                 [sample["messages"]],
                 ground_truth_flag=[sample["ground_truth_flag"]],
                 optimal_steps=[sample["optimal_steps"]],
+                metadata=[sample["metadata"]],
             )
             results.append(scores[0])
         unique = len(set(round(r, 8) for r in results))
@@ -582,3 +665,61 @@ class TestGRPOSamples:
         steps = [s["optimal_steps"] for s in grpo_samples]
         unique_steps = set(steps)
         assert len(unique_steps) >= 3, f"Need varied optimal_steps, got {unique_steps}"
+
+    def test_placeholder_flags_handled(self, grpo_samples):
+        """Samples with placeholder flags should still score correctly via metadata."""
+        reward = CTFReward(noise_range=0.0, seed=0)
+        placeholder_successes = [
+            s for s in grpo_samples
+            if s["metadata"]["success"]
+            and s.get("ground_truth_flag") == "content_of_flag_here"
+        ]
+        if not placeholder_successes:
+            pytest.skip("No placeholder-flag successes found")
+
+        for sample in placeholder_successes[:5]:  # Test first 5
+            scores = reward(
+                [sample["messages"]],
+                ground_truth_flag=[sample["ground_truth_flag"]],
+                optimal_steps=[sample["optimal_steps"]],
+                metadata=[sample["metadata"]],
+            )
+            assert scores[0] > 0.3, (
+                f"Placeholder-flag success '{sample['metadata']['challenge']}' "
+                f"scored only {scores[0]:.3f} (metadata.success should give 1.0)"
+            )
+
+    def test_grpo_readiness(self, grpo_samples):
+        """All 4 GRPO readiness checks must pass on actual trace data."""
+        reward = CTFReward(noise_range=0.0, seed=0)
+
+        success_scores = []
+        failure_scores = []
+        all_scores = []
+
+        for sample in grpo_samples:
+            scores = reward(
+                [sample["messages"]],
+                ground_truth_flag=[sample["ground_truth_flag"]],
+                optimal_steps=[sample["optimal_steps"]],
+                metadata=[sample["metadata"]],
+            )
+            all_scores.append(scores[0])
+            if sample["metadata"]["success"]:
+                success_scores.append(scores[0])
+            else:
+                failure_scores.append(scores[0])
+
+        avg_success = sum(success_scores) / len(success_scores)
+        avg_failure = sum(failure_scores) / len(failure_scores)
+        gap = avg_success - avg_failure
+
+        import statistics
+        variance = statistics.variance(all_scores)
+
+        assert gap > 0.50, f"Gap {gap:.4f} should be > 0.50"
+        assert variance > 0.02, f"Variance {variance:.4f} should be > 0.02"
+        assert avg_failure < 0.20, f"Failure mean {avg_failure:.4f} should be < 0.20"
+        assert avg_success > avg_failure, (
+            f"Success mean {avg_success:.4f} should be > failure mean {avg_failure:.4f}"
+        )

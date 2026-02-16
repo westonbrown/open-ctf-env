@@ -112,20 +112,25 @@ def main() -> None:
     _section("2. REWARD FUNCTION")
 
     try:
-        from open_ctf.rewards.ctf_reward import CTFReward, SKILL_PATTERNS
+        from open_ctf.rewards.reward import CTFReward
 
         _ok("CTFReward imported successfully")
 
         reward = CTFReward()
         _ok(f"CTFReward instantiated (weights: flag={reward.flag_weight}, "
-           f"grammar={reward.grammar_weight}, efficiency={reward.efficiency_weight}, "
+           f"uniqueness={reward.uniqueness_weight}, efficiency={reward.efficiency_weight}, "
            f"format={reward.format_weight})")
 
         mock_completions = [
-            '{"name": "shell_command", "arguments": {"command": "nmap 10.10.10.1"}}\n'
-            '{"name": "shell_command", "arguments": {"command": "gobuster dir"}}\n'
-            '{"name": "shell_command", "arguments": {"command": "sqlmap -u target"}}\n'
-            'FLAG{test_flag_12345}',
+            [
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "shell_command", "arguments": '{"command": "nmap 10.10.10.1"}'}}
+                ]},
+                {"role": "tool", "content": "80/tcp open"},
+                {"role": "assistant", "content": "FLAG{test_flag_12345}", "tool_calls": [
+                    {"function": {"name": "flag_found", "arguments": '{"content": "FLAG{test_flag_12345}"}'}}
+                ]},
+            ],
             "I cannot help with that request.",
         ]
 
@@ -133,6 +138,7 @@ def main() -> None:
             completions=mock_completions,
             ground_truth_flag=["FLAG{test_flag_12345}", None],
             optimal_steps=[3, None],
+            metadata=[{"success": True}, {"success": False}],
         )
 
         if len(rewards) == 2:
@@ -144,12 +150,6 @@ def main() -> None:
             _ok(f"Success reward ({rewards[0]:.3f}) > failure reward ({rewards[1]:.3f})")
         else:
             _fail("Success reward should exceed failure reward", errors)
-
-        for phase in ["recon", "enum", "exploit"]:
-            if phase in SKILL_PATTERNS and len(SKILL_PATTERNS[phase]) > 0:
-                _ok(f"SKILL_PATTERNS['{phase}']: {len(SKILL_PATTERNS[phase])} patterns")
-            else:
-                _fail(f"SKILL_PATTERNS missing or empty for '{phase}'", errors)
 
     except ImportError as e:
         _fail(f"CTFReward import failed: {e}", errors)
