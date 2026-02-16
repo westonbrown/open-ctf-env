@@ -61,7 +61,7 @@ graph LR
     subgraph "Core Modules (src/open_ctf/)"
         D1[data/<br/>converter.py<br/>splitter.py]
         T1[training/<br/>sft.py<br/>grpo.py]
-        R1[rewards/<br/>ctf_reward.py]
+        R1[rewards/<br/>reward.py]
         F1[formatters/<br/>base.py<br/>qwen3/glm4/devstral]
         A1[agent/<br/>runner.py]
         E1[eval/<br/>evaluator.py]
@@ -105,7 +105,7 @@ sequenceDiagram
     Note over SFT: Unsloth FastLanguageModel<br/>LoRA r=64, BF16<br/>Packing enabled
     SFT->>GRPO: SFT checkpoint (merged)
 
-    Note over GRPO: TRL GRPOTrainer<br/>CTFReward (4 components)<br/>DAPO loss, beta=0.001
+    Note over GRPO: TRL GRPOTrainer<br/>CTFReward (4 components)<br/>DAPO loss, beta=0.0
     GRPO->>GRPO: Final model
 ```
 
@@ -251,7 +251,7 @@ graph TB
     subgraph "Training Configuration"
         T1[UNSLOTH_MOE_BACKEND=<br/>grouped_mm]
         T2[load_in_4bit=False<br/>Use BF16 LoRA]
-        T3[LoRA r=64, alpha=128<br/>target: attn+FFN+out_proj]
+        T3[LoRA r=64, alpha=64<br/>target: attn+FFN layers]
         T4[Router layers excluded]
     end
 
@@ -453,27 +453,27 @@ Central configuration for both training stages:
 ```yaml
 model:
   name: "unsloth/GLM-4.7-Flash"
-  max_seq_length: 8192
+  max_seq_length: 4096
   load_in_4bit: false  # MoE requires BF16
 
 lora:
-  r: 64               # Higher capacity than Unsloth demo (8)
-  alpha: 128
+  r: 64
+  alpha: 64
   target_modules: [q_proj, k_proj, v_proj, o_proj,
-                   gate_proj, up_proj, down_proj, out_proj]
+                   gate_proj, up_proj, down_proj]
 
 sft:
   epochs: 3
-  batch_size: 2
+  batch_size: 1
   learning_rate: 2.0e-4
   packing: true       # 3x throughput improvement
 
 grpo:
   epochs: 1
   learning_rate: 5.0e-6
-  beta: 0.001         # Low KL penalty for exploration
+  beta: 0.0           # No KL penalty (pure DAPO)
   loss_type: dapo     # Dynamic advantage normalization
-  num_generations: 4
+  num_generations: 8
 ```
 
 ### `src/open_ctf/configs/challenges.yaml`

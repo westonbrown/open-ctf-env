@@ -18,6 +18,7 @@
 #       --data /workspace/data/grpo.jsonl --output /workspace/outputs/grpo
 
 FROM nvcr.io/nvidia/pytorch:25.11-py3
+# Alternative for DGX Spark: FROM unsloth/unsloth:dgxspark-latest
 
 # Avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive

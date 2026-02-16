@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_CHALLENGES = Path(__file__).resolve().parent.parent.parent.parent / "configs" / "challenges.yaml"
+DEFAULT_CHALLENGES = Path(__file__).resolve().parent.parent / "configs" / "challenges.yaml"
 
 
 def cmd_run(args: argparse.Namespace) -> None:

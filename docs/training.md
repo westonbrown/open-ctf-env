@@ -111,21 +111,21 @@ Edit `src/open_ctf/configs/training.yaml`:
 ```yaml
 model:
   name: "unsloth/GLM-4.7-Flash"
-  max_seq_length: 8192
+  max_seq_length: 4096
   # MoE models: use BF16 LoRA (4-bit QLoRA not supported for MoE)
   load_in_4bit: false
 
 lora:
   r: 64
-  alpha: 128
+  alpha: 64
   dropout: 0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
-  use_rslora: true
+  use_rslora: false
 
 sft:
   epochs: 3
-  batch_size: 2
-  gradient_accumulation_steps: 8
+  batch_size: 1
+  gradient_accumulation_steps: 16
   learning_rate: 2.0e-4
   warmup_ratio: 0.03
   weight_decay: 0.01
@@ -165,10 +165,14 @@ grpo:
   gradient_accumulation_steps: 8
   learning_rate: 5.0e-6
   warmup_ratio: 0.10
-  beta: 0.001
+  beta: 0.0
   loss_type: dapo
-  num_generations: 4
+  num_generations: 8
   max_completion_length: 4096
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: "group"
 ```
 
 ### Reward Function
@@ -186,9 +190,9 @@ The CTF reward scores completions on four dimensions:
 
 | Parameter | Recommended | Notes |
 |-----------|-------------|-------|
-| `beta` | 0.001 | Low KL penalty for CTF exploration |
+| `beta` | 0.0 | No KL penalty (pure DAPO) |
 | `loss_type` | dapo | Dynamic advantage normalization |
-| `num_generations` | 4 | Completions per prompt for ranking |
+| `num_generations` | 8 | Completions per prompt for ranking |
 | `learning_rate` | 5e-6 | Much lower than SFT to avoid instability |
 
 ## Merging LoRA Adapters

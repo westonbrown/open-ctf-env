@@ -7,7 +7,7 @@ Pipeline:
   3. Quantize to the requested precision (default: Q4_K_M)
 
 Requirements:
-  - unsloth (pip install unsloth)
+  - unsloth (pip install unsloth) OR transformers + peft (HF fallback)
   - llama.cpp built with `make` (for convert_hf_to_gguf.py and llama-quantize)
 
 Usage:
@@ -54,34 +54,72 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------
 
 def merge_lora(adapter_path: str, base_model: str, output_dir: str) -> str:
-    """Merge LoRA adapter into base model weights using Unsloth.
+    """Merge LoRA adapter into base model weights.
+
+    Tries Unsloth for merging (faster, optimized). Falls back to standard
+    PEFT merge_and_unload() when Unsloth is unavailable or
+    ``OPEN_CTF_NO_UNSLOTH=1`` is set.
 
     Args:
         adapter_path: Path to the LoRA adapter directory (checkpoint or final).
         base_model: HuggingFace model identifier for the base model.
-            If adapter_path already contains the base model config
-            (i.e., it was saved with save_pretrained_merged), this is
-            used as a fallback.
+            Required for the HF/PEFT fallback path.
         output_dir: Directory to save the merged model.
 
     Returns:
         Path to the merged model directory.
     """
     import torch
-    from unsloth import FastLanguageModel
 
     logger.info("Loading base model: %s", base_model)
     logger.info("Loading adapter:    %s", adapter_path)
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=adapter_path,
-        max_seq_length=8192,
-        dtype=torch.bfloat16,
-    )
+    use_unsloth = os.environ.get("OPEN_CTF_NO_UNSLOTH", "").lower() not in ("1", "true")
+    merged = False
 
-    logger.info("Merging LoRA weights into base model...")
-    model.save_pretrained_merged(output_dir, tokenizer, save_method="merged_16bit")
-    logger.info("Merged model saved to %s", output_dir)
+    if use_unsloth:
+        try:
+            from unsloth import FastLanguageModel
+
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=adapter_path,
+                max_seq_length=8192,
+                dtype=torch.bfloat16,
+            )
+
+            logger.info("Merging LoRA weights via Unsloth...")
+            model.save_pretrained_merged(output_dir, tokenizer, save_method="merged_16bit")
+            merged = True
+            logger.info("Merged model saved to %s (Unsloth)", output_dir)
+        except (ImportError, RuntimeError, OSError) as e:
+            logger.warning("Unsloth merge failed (%s), falling back to PEFT", e)
+
+    if not merged:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import PeftModel
+
+        if not base_model:
+            raise ValueError(
+                "HF merge requires --base-model "
+                "(needed to load the base model before applying adapter)"
+            )
+
+        logger.info("Merging LoRA weights via PEFT merge_and_unload()...")
+        tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+        base = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            device_map="auto",
+        )
+        model = PeftModel.from_pretrained(base, adapter_path)
+        model = model.merge_and_unload()
+
+        os.makedirs(output_dir, exist_ok=True)
+        model.save_pretrained(output_dir, safe_serialization=True)
+        tokenizer.save_pretrained(output_dir)
+        logger.info("Merged model saved to %s (PEFT)", output_dir)
+
     return output_dir
 
 

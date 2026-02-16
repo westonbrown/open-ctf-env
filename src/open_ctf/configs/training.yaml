@@ -4,17 +4,17 @@
 
 model:
   name: "unsloth/GLM-4.7-Flash"
-  max_seq_length: 8192
+  # Reduced from 8192 to 4096 for GB10 memory budget (~60GB model + training overhead)
+  max_seq_length: 4096
   # GLM-4.7-Flash is MoE - 4-bit QLoRA NOT supported for MoE models.
   # Use BF16 LoRA (~60GB VRAM). Set to true only for dense models.
   load_in_4bit: false
 
 lora:
   r: 64
-  alpha: 128
+  alpha: 64
   dropout: 0
-  # Unsloth GLM-4.7-Flash example uses: q_proj, k_proj, v_proj, o_proj,
-  # gate_proj, up_proj, down_proj, out_proj. Router layers excluded by default.
+  # GLM-4.7-Flash uses o_proj (not out_proj). Router layers excluded by default.
   target_modules:
     - q_proj
     - k_proj
@@ -23,13 +23,13 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
-    - out_proj
-  use_rslora: true
+  use_rslora: false
 
 sft:
   epochs: 3
-  batch_size: 2
-  gradient_accumulation_steps: 8
+  # Reduced from 2 to 1 for GB10 memory budget
+  batch_size: 1
+  gradient_accumulation_steps: 16
   learning_rate: 2.0e-4
   warmup_ratio: 0.03
   weight_decay: 0.01
@@ -42,10 +42,16 @@ grpo:
   gradient_accumulation_steps: 8
   learning_rate: 5.0e-6
   warmup_ratio: 0.10
-  beta: 0.001
+  beta: 0.0
   loss_type: dapo
-  num_generations: 4
+  num_generations: 8
   max_completion_length: 4096
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  # "batch" uses batch-level std with group-level mean — more robust than "group"
+  scale_rewards: "batch"
+  # GRPO uses FP16 (set in code) — better gradient stability for RL
 
 output:
   save_steps: 50

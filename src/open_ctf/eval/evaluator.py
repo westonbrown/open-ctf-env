@@ -312,8 +312,8 @@ class ModelEvaluator:
             try:
                 with open(results_file) as f:
                     data = json.load(f)
-                solved = data.get("solved", False)
-                turns = data.get("turns", 0)
+                solved = data.get("status") == "success"
+                turns = data.get("total_turns", 0)
                 return solved, turns
             except (json.JSONDecodeError, KeyError):
                 pass

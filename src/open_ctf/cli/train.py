@@ -23,7 +23,11 @@ Usage:
 
 import argparse
 import logging
+import os
 from pathlib import Path
+
+# Tell Unsloth not to start a vLLM server on import (we manage vLLM ourselves).
+os.environ.setdefault("UNSLOTH_VLLM_STANDBY", "1")
 
 # Unsloth MUST be imported before trl/transformers/peft for patching to work.
 # Optional: allows running on systems without Unsloth (e.g. clean PyTorch containers).

@@ -1,11 +1,14 @@
 """Group Relative Policy Optimization (GRPO) stage.
 
 Uses TRL GRPOTrainer with:
-  - DAPO loss for stable policy updates
-  - beta=0.001 (low KL penalty)
+  - DAPO loss with asymmetric clipping (epsilon_high=0.28)
+  - beta=0.0 (no KL penalty, pure DAPO)
+  - num_generations=8 for better group reward estimation
   - max_completion_length=4096 for full CTF trajectories
+  - FP16 precision (better for RL per Unsloth docs)
   - reward_funcs=[fn] (list, not bare function)
   - GRPOConfig passed via ``args=`` (not ``config=``)
+  - Unsloth vLLM fast inference when available (UNSLOTH_VLLM_STANDBY=1)
 
 Uses Unsloth for model loading when available, falls back to standard
 HuggingFace transformers + PEFT otherwise. The fallback is also used when
@@ -18,6 +21,9 @@ import logging
 import math
 import os
 from typing import Any, Callable, Dict, List, Optional
+
+# Pre-set vLLM standby mode before any Unsloth/vLLM imports (~30% memory savings)
+os.environ.setdefault("UNSLOTH_VLLM_STANDBY", "1")
 
 import torch
 from datasets import load_dataset
@@ -42,8 +48,10 @@ def _load_model_unsloth(model_path, max_seq_length, load_in_4bit, lora_cfg):
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path,
         max_seq_length=max_seq_length,
-        dtype=torch.bfloat16,
+        dtype=torch.float16,
         load_in_4bit=load_in_4bit,
+        fast_inference=True,
+        gpu_memory_utilization=0.6,
     )
 
     if isinstance(model, PeftModel):
@@ -59,7 +67,7 @@ def _load_model_unsloth(model_path, max_seq_length, load_in_4bit, lora_cfg):
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
             ]),
-            use_rslora=lora_cfg.get("use_rslora", True),
+            use_rslora=lora_cfg.get("use_rslora", False),
             use_gradient_checkpointing="unsloth",
         )
     return model, tokenizer
@@ -73,14 +81,14 @@ def _load_model_hf(model_path, max_seq_length, load_in_4bit, lora_cfg):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     kwargs = {
-        "torch_dtype": torch.bfloat16,
+        "torch_dtype": torch.float16,
         "trust_remote_code": True,
-        "attn_implementation": "flash_attention_2",
+        "attn_implementation": "sdpa",
     }
     if load_in_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
@@ -215,11 +223,9 @@ def train_grpo(
         dataset = dataset.remove_columns(["metadata"])
 
     # --- Determine wandb availability -----------------------------------
-    report_to = output_cfg.get("report_to", "wandb")
-    try:
-        import wandb  # noqa: F401
-    except ImportError:
-        report_to = "none"
+    from open_ctf.training import check_wandb_available
+
+    report_to = check_wandb_available(output_cfg.get("report_to", "wandb"))
 
     # --- Convert warmup_ratio to warmup_steps ----------------------------
     warmup_ratio = grpo_cfg.get("warmup_ratio", 0.10)
@@ -241,16 +247,20 @@ def train_grpo(
         warmup_steps=warmup_steps,
         logging_steps=output_cfg.get("logging_steps", 1),
         save_steps=output_cfg.get("save_steps", 50),
-        bf16=True,
+        fp16=True,
         optim="adamw_8bit",
         seed=42,
         report_to=report_to,
         gradient_checkpointing=True,
+        max_grad_norm=grpo_cfg.get("max_grad_norm", 0.1),
+        weight_decay=grpo_cfg.get("weight_decay", 0.1),
         # GRPO-specific
-        num_generations=grpo_cfg.get("num_generations", 4),
+        num_generations=grpo_cfg.get("num_generations", 8),
         max_completion_length=grpo_cfg.get("max_completion_length", 4096),
-        beta=grpo_cfg.get("beta", 0.001),
+        beta=grpo_cfg.get("beta", 0.0),
         loss_type=grpo_cfg.get("loss_type", "dapo"),
+        epsilon_high=grpo_cfg.get("epsilon_high", 0.28),
+        scale_rewards=grpo_cfg.get("scale_rewards", "group"),
     )
 
     # --- Trainer ---------------------------------------------------------

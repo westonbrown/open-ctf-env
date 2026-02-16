@@ -1,7 +1,7 @@
 """Supervised Fine-Tuning (SFT) stage.
 
 Uses Unsloth + TRL SFTTrainer with:
-  - LoRA (r=64, alpha=128) via FastLanguageModel or PEFT
+  - LoRA (r=64, alpha=128, use_rslora=False) via FastLanguageModel or PEFT
   - Sequence packing for ~3x throughput (Unsloth only)
   - Gradient checkpointing for VRAM efficiency
   - Native ChatML message handling (no dataset_text_field)
@@ -9,6 +9,10 @@ Uses Unsloth + TRL SFTTrainer with:
 Falls back to HuggingFace transformers + PEFT when:
   - OPEN_CTF_NO_UNSLOTH=1 env var is set (for GB10 Triton OOM issues)
   - Unsloth import fails
+
+HF fallback uses SDPA (PyTorch Scaled Dot-Product Attention) instead of
+FlashAttention 2. On Blackwell GB10 (sm_121), PyTorch SDPA with cuDNN 9.13
+is faster than FlashAttention 2.
 
 MoE model notes (GLM-4.7-Flash):
   - 4-bit QLoRA NOT supported for MoE models (BitsAndBytes limitation)
@@ -98,7 +102,7 @@ def _load_model_unsloth(model_id, max_seq_length, load_in_4bit, lora_cfg):
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ]),
-        use_rslora=lora_cfg.get("use_rslora", True),
+        use_rslora=lora_cfg.get("use_rslora", False),
         use_gradient_checkpointing="unsloth",
     )
     return model, tokenizer
@@ -114,7 +118,7 @@ def _load_model_hf(model_id, max_seq_length, load_in_4bit, lora_cfg):
     kwargs = {
         "torch_dtype": torch.bfloat16,
         "trust_remote_code": True,
-        "attn_implementation": "flash_attention_2",
+        "attn_implementation": "sdpa",
     }
     if load_in_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -205,21 +209,60 @@ def train_sft(
     if val_data_path and Path(val_data_path).exists():
         eval_dataset = load_dataset("json", data_files=val_data_path, split="train")
 
-    # Normalize messages to fix GLM-4 chat template compatibility
-    def _normalize_dataset(example):
-        example["messages"] = _normalize_messages(example["messages"])
-        return example
+    # Drop columns SFTTrainer doesn't need (avoids PyArrow type conflicts
+    # from mixed types in metadata/optimal_steps columns)
+    keep_cols = {"messages"}
+    for ds_name, ds in [("train", dataset), ("val", eval_dataset)]:
+        if ds is None:
+            continue
+        drop = [c for c in ds.column_names if c not in keep_cols]
+        if drop:
+            if ds_name == "train":
+                dataset = dataset.remove_columns(drop)
+            else:
+                eval_dataset = eval_dataset.remove_columns(drop)
+            logger.info("Dropped columns from %s dataset: %s", ds_name, drop)
 
-    dataset = dataset.map(_normalize_dataset)
-    if eval_dataset:
-        eval_dataset = eval_dataset.map(_normalize_dataset)
+    # Build formatting_func to normalize messages at training time.
+    # We do NOT use dataset.map() because _normalize_messages converts
+    # tool_call arguments from JSON strings to dicts, and PyArrow can't
+    # handle the resulting mixed types across rows (e.g., timeout: 300 vs "300").
+    # Instead, normalize on-the-fly via formatting_func which returns
+    # tokenizer.apply_chat_template output directly.
+    #
+    # TRL calls formatting_func in two ways:
+    #   1. Test call: formatting_func(single_example) where single_example is
+    #      a dict like {"messages": [list of message dicts]}
+    #   2. Batch call: formatting_func(batch) where batch["messages"] is
+    #      a list of message lists
+    def _formatting_func(examples):
+        """Format messages with normalization applied at template time."""
+        raw_messages = examples["messages"]
+
+        # Detect single vs batch: single example has messages as a list of dicts,
+        # batch has messages as a list of lists of dicts.
+        if raw_messages and isinstance(raw_messages[0], dict):
+            # Single example: raw_messages IS the message list
+            messages_list = [raw_messages]
+        else:
+            # Batch: raw_messages is a list of message lists
+            messages_list = raw_messages
+
+        texts = []
+        for messages in messages_list:
+            normalized = _normalize_messages(messages)
+            text = tokenizer.apply_chat_template(
+                normalized,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            texts.append(text)
+        return texts
 
     # --- Determine wandb availability -----------------------------------
-    report_to = output_cfg.get("report_to", "wandb")
-    try:
-        import wandb  # noqa: F401
-    except ImportError:
-        report_to = "none"
+    from open_ctf.training import check_wandb_available
+
+    report_to = check_wandb_available(output_cfg.get("report_to", "wandb"))
 
     # --- Convert warmup_ratio to warmup_steps ----------------------------
     # TRL >= 0.26 deprecated warmup_ratio in favor of warmup_steps.
@@ -236,6 +279,8 @@ def train_sft(
     # Packing is an Unsloth optimization - disable if using HF fallback
     enable_packing = sft_cfg.get("packing", True) and use_unsloth
 
+    # When using formatting_func, SFTTrainer expects a "text" dataset_text_field
+    # or we must set dataset_text_field=None and use formatting_func directly.
     training_args = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
@@ -260,17 +305,16 @@ def train_sft(
     )
 
     # --- Trainer ---------------------------------------------------------
-    # TRL >= 0.26: use processing_class instead of tokenizer, and
-    # packing/max_length are now in SFTConfig.
-    # TRL will automatically use tokenizer.apply_chat_template() for datasets
-    # with a "messages" column. No formatting_func needed since we normalized
-    # the messages in the dataset itself.
+    # Use formatting_func to normalize messages on-the-fly during training.
+    # This avoids PyArrow serialization issues from mixed types in tool_call
+    # arguments (e.g., timeout: 300 vs "300" across different rows).
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
         eval_dataset=eval_dataset,
         args=training_args,
+        formatting_func=_formatting_func,
     )
 
     trainer.train(resume_from_checkpoint=resume_from)

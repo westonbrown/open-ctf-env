@@ -64,7 +64,7 @@ open-ctf-env/
 │       │   ├── glm4.py          # GLM-4 formatter
 │       │   └── tool_registry.py # BoxPwnr tool definitions
 │       ├── rewards/             # GRPO reward functions
-│       │   └── ctf_reward.py    # CTFReward (flag + grammar + efficiency)
+│       │   └── reward.py        # CTFReward (flag + grammar + efficiency)
 │       ├── training/            # Training stages
 │       │   ├── sft.py           # SFT with Unsloth + TRL
 │       │   └── grpo.py          # GRPO with DAPO loss
@@ -268,26 +268,26 @@ Edit `src/open_ctf/configs/training.yaml`:
 ```yaml
 model:
   name: "unsloth/GLM-4.7-Flash"
-  max_seq_length: 8192
-  load_in_4bit: true
+  max_seq_length: 4096
+  load_in_4bit: false  # MoE models require BF16 LoRA
 
 lora:
   r: 64
-  alpha: 128
+  alpha: 64
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 sft:
   epochs: 3
-  batch_size: 2
+  batch_size: 1
   learning_rate: 2.0e-4
   packing: true
 
 grpo:
   epochs: 1
   learning_rate: 5.0e-6
-  beta: 0.001
+  beta: 0.0
   loss_type: dapo
-  num_generations: 4
+  num_generations: 8
 ```
 
 ## Reward Function
