@@ -571,9 +571,9 @@ class TestGRPOSamples:
                 optimal_steps=[sample["optimal_steps"]],
                 metadata=[sample["metadata"]],
             )
-            # With noise_range=0.05, scores can go slightly below 0
-            assert scores[0] >= -0.05, f"Sample {i} score {scores[0]} too low"
-            assert scores[0] <= 1.05, f"Sample {i} score {scores[0]} too high"
+            # Floor: hallucination penalty (-0.10) + noise (-0.05) = -0.15
+            assert scores[0] >= -0.16, f"Sample {i} score {scores[0]} too low"
+            assert scores[0] <= 1.10, f"Sample {i} score {scores[0]} too high"
 
     def test_successes_score_higher_than_failures(self, grpo_samples):
         reward = CTFReward(noise_range=0.0, seed=0)

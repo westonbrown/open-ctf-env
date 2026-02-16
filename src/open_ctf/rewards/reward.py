@@ -1,23 +1,28 @@
 """Combined CTF reward function for GRPO training.
 
-Scoring components (4 signals, sum to 1.0):
+Scoring components (6 signals, sum to 1.0 + penalty):
   - Flag capture (0.50): metadata.success > exact match > pattern match
   - Efficiency (0.30): Fewer steps = higher reward, **gated on flag capture**
-  - Uniqueness (0.10): Command diversity (repeated commands = stuck)
-  - Format compliance (0.10): Valid tool call structure
+  - Progression (0.05): RECON→ENUM→EXPLOIT phase ordering, **gated on flag capture**
+  - Exploration (0.05): Novel tool usage weighted toward early trajectory
+  - Uniqueness (0.05): Command diversity (repeated commands = stuck)
+  - Format compliance (0.05): Valid tool call structure
+  - Hallucination penalty: -0.10 for false flag submissions (structural)
 
 Design principles:
   - **Principle of least action**: Flag (boundary condition) + efficiency (shortest
     path) are the only ground-truth-verified signals. Together they encode "reach
     the goal via the shortest path."
-  - **Efficiency gating**: Efficiency is multiplied by flag_score so only successful
-    traces receive credit for being fast. Prevents rewarding quitting early.
-  - **No regex in process signals**: Uniqueness and format use structural analysis
-    (command deduplication, JSON parsing) instead of regex pattern matching.
+  - **Process gating**: Efficiency and progression are multiplied by flag_score so
+    only successful traces receive credit for speed and phase ordering. Prevents
+    rewarding quitting early (efficiency) or cycling through phases (progression).
+  - **No regex in process signals**: Progression uses set-based binary lookup (not
+    regex pattern matching). Uniqueness, exploration, and format use structural
+    analysis (command deduplication, position weighting, JSON parsing).
   - **metadata.success is authoritative in both directions**: True = solved,
-    False = not solved (blocks exact-match fallback). Fixes 151 misscored
-    successes where ground_truth_flag was a placeholder, and 22 failures where
-    the flag string appeared in text but wasn't properly submitted.
+    False = not solved (blocks exact-match fallback).
+  - **Anti-hallucination**: Structural penalty when ``flag_found`` tool is called
+    but the flag is wrong. Catches false submissions without regex.
 
 Noise (+-0.05) is added to every reward to guarantee variance for GRPO gradients.
 """
@@ -35,6 +40,40 @@ _FLAG_PLACEHOLDERS = frozenset({
     "",
     "CHECK",
 })
+
+# ---------------------------------------------------------------------------
+# Phase classification for skill progression (set-based, NO regex).
+# Classify commands by first token (binary name) of shell commands.
+# ---------------------------------------------------------------------------
+_RECON_BINARIES = frozenset({
+    "nmap", "masscan", "ping", "traceroute", "whois", "dig", "nslookup",
+    "host", "arp-scan", "netdiscover", "ftp", "smbclient", "smbmap",
+    "rpcclient", "snmpwalk", "enum4linux",
+})
+_ENUM_BINARIES = frozenset({
+    "curl", "wget", "gobuster", "ffuf", "dirb", "dirsearch", "nikto",
+    "wpscan", "whatweb", "ls", "cat", "head", "tail", "find", "grep",
+    "egrep", "fgrep", "strings", "file", "id", "whoami", "ps", "env",
+    "uname", "hostname", "ip", "ifconfig", "netstat", "ss", "wc",
+    "sort", "uniq", "less", "more", "xxd", "hexdump", "objdump",
+    "readelf", "cd", "echo", "which", "sed", "awk", "apt", "apt-get",
+    "pip", "pip3", "export", "mkdir", "cp", "mv", "rm", "printf",
+    "crackmapexec", "fls", "tesseract", "unzip", "tar", "gunzip",
+})
+_EXPLOIT_BINARIES = frozenset({
+    "sqlmap", "hydra", "john", "hashcat", "python", "python3", "python2",
+    "ruby", "perl", "gcc", "g++", "make", "nc", "ncat", "netcat",
+    "ssh", "scp", "msfconsole", "msfvenom", "chmod", "chown",
+    "gdb", "ltrace", "strace", "pwntools", "sshpass", "bash", "node",
+    "java", "docker", "php", "socat",
+})
+# Tool names (not shell commands) that map directly to phases.
+_TOOL_NAME_PHASES = {
+    "web_search": "recon",
+    "read_file": "enum", "grep": "enum", "file_search": "enum",
+    "python_code": "exploit", "apply_patch": "exploit",
+    "flag_found": "flag",
+}
 
 
 class CTFReward:
@@ -56,23 +95,28 @@ class CTFReward:
     def __init__(
         self,
         flag_weight: float = 0.50,
-        uniqueness_weight: float = 0.10,
         efficiency_weight: float = 0.30,
-        format_weight: float = 0.10,
+        progression_weight: float = 0.05,
+        exploration_weight: float = 0.05,
+        uniqueness_weight: float = 0.05,
+        format_weight: float = 0.05,
+        hallucination_penalty: float = 0.10,
         noise_range: float = 0.05,
         seed: Optional[int] = None,
     ) -> None:
-        total = flag_weight + uniqueness_weight + efficiency_weight + format_weight
+        total = (flag_weight + efficiency_weight + progression_weight
+                 + exploration_weight + uniqueness_weight + format_weight)
         if abs(total - 1.0) > 1e-6:
             raise ValueError(
-                f"Reward weights must sum to 1.0, got {total:.4f} "
-                f"(flag={flag_weight}, uniqueness={uniqueness_weight}, "
-                f"efficiency={efficiency_weight}, format={format_weight})"
+                f"Reward weights must sum to 1.0, got {total:.4f}"
             )
         self.flag_weight = flag_weight
-        self.uniqueness_weight = uniqueness_weight
         self.efficiency_weight = efficiency_weight
+        self.progression_weight = progression_weight
+        self.exploration_weight = exploration_weight
+        self.uniqueness_weight = uniqueness_weight
         self.format_weight = format_weight
+        self.hallucination_penalty = hallucination_penalty
         self.noise_range = noise_range
         self._rng = random.Random(seed)
 
@@ -132,11 +176,16 @@ class CTFReward:
                 meta_success = metadata_list[idx].get("success")
 
             flag_sc = self._flag_score(text, gt_flag, meta_success)
+            # Progression and efficiency are gated on flag_sc:
+            # only reward process quality when the outcome is good.
             score = (
                 self.flag_weight * flag_sc
-                + self.uniqueness_weight * self._uniqueness_score(tool_calls)
                 + self.efficiency_weight * self._efficiency_score(len(tool_calls), opt_steps) * flag_sc
+                + self.progression_weight * self._progression_score(tool_calls) * flag_sc
+                + self.exploration_weight * self._exploration_score(tool_calls)
+                + self.uniqueness_weight * self._uniqueness_score(tool_calls)
                 + self.format_weight * self._format_score(tool_calls)
+                + self._hallucination_score(tool_calls, flag_sc)
             )
 
             # Guarantee variance for GRPO
@@ -288,6 +337,115 @@ class CTFReward:
                     # Arguments present but not valid JSON
                     valid += 0.5
         return min(valid / len(tool_calls), 1.0)
+
+    def _progression_score(self, tool_calls: List[Dict[str, str]]) -> float:
+        """Score RECON→ENUM→EXPLOIT phase presence and ordering.
+
+        Uses set-based binary lookup on the first token of shell commands
+        (no regex). Tool names like ``python_code`` or ``read_file`` are
+        classified directly by name.
+
+        Scoring: 0.6 for phase presence + 0.4 for correct ordering.
+        """
+        if not tool_calls:
+            return 0.0
+
+        # Build deduplicated phase sequence
+        phases: List[str] = []
+        for tc in tool_calls:
+            phase = self._classify_phase(tc)
+            if phase and (not phases or phases[-1] != phase):
+                phases.append(phase)
+
+        if not phases:
+            return 0.0
+
+        has_recon = "recon" in phases
+        has_enum = "enum" in phases
+        has_exploit = "exploit" in phases
+
+        # Phase presence (0.0 - 0.6)
+        presence = 0.2 * has_recon + 0.2 * has_enum + 0.2 * has_exploit
+
+        # Order adherence (0.0 - 0.4)
+        order = 0.0
+        if has_recon and has_enum:
+            if phases.index("recon") < phases.index("enum"):
+                order += 0.2
+        if has_enum and has_exploit:
+            if phases.index("enum") < phases.index("exploit"):
+                order += 0.2
+
+        return min(presence + order, 1.0)
+
+    @staticmethod
+    def _classify_phase(tc: Dict[str, str]) -> Optional[str]:
+        """Classify a tool call into a CTF phase. Set-based, no regex."""
+        name = tc.get("name", "")
+
+        # Direct tool name classification
+        if name in _TOOL_NAME_PHASES:
+            return _TOOL_NAME_PHASES[name]
+
+        # For shell_command / exec_command, classify by first token
+        if name in ("shell_command", "exec_command", "execute_command",
+                    "shell", "bash", "Bash"):
+            cmd = CTFReward._extract_command(tc)
+            if not cmd:
+                return None
+            # Get binary name (first token, strip path)
+            first_token = cmd.split()[0].rsplit("/", 1)[-1].lower()
+            if first_token in _RECON_BINARIES:
+                return "recon"
+            if first_token in _ENUM_BINARIES:
+                return "enum"
+            if first_token in _EXPLOIT_BINARIES:
+                return "exploit"
+
+        return None
+
+    def _exploration_score(self, tool_calls: List[Dict[str, str]]) -> float:
+        """Reward novel tool names weighted toward early trajectory.
+
+        Early exploration (trying new tools at the start) is more valuable
+        than late exploration. Score = Σ (1 - t/T) for each novel tool,
+        normalized to [0, 1]. No regex.
+        """
+        if not tool_calls:
+            return 0.0
+
+        T = len(tool_calls)
+        seen: set = set()
+        score = 0.0
+        max_possible = 0.0
+
+        for t, tc in enumerate(tool_calls):
+            decay = 1.0 - (t / T) if T > 1 else 1.0
+            max_possible += decay
+            name = tc.get("name", "")
+            if name and name not in seen:
+                seen.add(name)
+                score += decay
+
+        return score / max_possible if max_possible > 0 else 0.0
+
+    def _hallucination_score(
+        self, tool_calls: List[Dict[str, str]], flag_sc: float
+    ) -> float:
+        """Penalty for false flag submissions. Structural, no regex.
+
+        Fires when ``flag_found`` tool was called but flag_score < 1.0,
+        meaning the submitted flag was wrong or unverified.
+        Returns a negative value (penalty) or 0.0.
+        """
+        if flag_sc >= 1.0:
+            return 0.0  # Correct flag — no penalty
+
+        for tc in tool_calls:
+            if tc.get("name") == "flag_found":
+                return -self.hallucination_penalty
+
+        return 0.0
 
     # ------------------------------------------------------------------
     # Helpers

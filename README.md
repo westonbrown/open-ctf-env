@@ -1,238 +1,19 @@
 # Open CTF Environment
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](https://github.com/westonbrown/open-ctf-env)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/westonbrown/open-ctf-env)
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-An open-source **CTF training pipeline** for security LLMs. Collect agent traces with [BoxPwnr](https://github.com/0ca/BoxPwnr), fine-tune with SFT + GRPO, and deploy efficient models for autonomous penetration testing.
+An open-source pipeline for **post-training security LLMs on CTF challenge trajectories**. Collect agent traces with [BoxPwnr](https://github.com/0ca/BoxPwnr), fine-tune with SFT + GRPO, evaluate on [CyBench](https://cybench.github.io/), and deploy locally on NVIDIA DGX Spark.
 
-**Latest**: v0.3.0 (February 2026) - Production-ready 2-stage training pipeline with Unsloth 2026.2.1, TRL 0.28.0, full DGX Spark GB10 support.
+> Presented at **[un]prompted — The AI Security Practitioner Conference**
+> March 3-4, 2026 | Salesforce Tower, San Francisco
+
+## Thesis
+
+Base open-weight models understand security concepts but cannot execute multi-step exploits. A 24B model can plan a 5-phase attack but fails to enumerate user IDs. A 20B model gets stuck thinking on step 1. We show that **trajectory-aware post-training** (SFT on expert traces, then GRPO with a multi-signal CTF reward function) closes this gap — producing a deployable security agent from GLM-4.7-Flash (30B MoE, ~3.6B active parameters) that runs locally on modest hardware.
 
 ## Overview
-
-Open CTF Environment provides an end-to-end pipeline:
-
-1. **Run** a BoxPwnr agent against Dockerized CTF challenges
-2. **Convert** traces to structured training data (lossless, all native tool names preserved)
-3. **Train** with SFT (supervised) and GRPO (reinforcement) stages via Unsloth
-4. **Deploy** as GGUF for Ollama/llama.cpp or serve with vLLM
-
-**Key Features:**
-- BoxPwnr integration for 17 native security tools (shell, tmux, python, grep, etc.)
-- Structure-preserving trace converter handling both tool-calling and chat-command formats
-- 2-stage training: SFT for knowledge, GRPO for efficiency optimization
-- CTF reward function with flag capture, skill grammar, and efficiency scoring
-- Model-specific formatters (Qwen3, Devstral, GLM-4)
-- GGUF export pipeline for local deployment
-- Gymnasium-compatible RL interface for [CyBench](https://arxiv.org/abs/2408.08926) challenges
-
-## Project Structure
-
-```
-open-ctf-env/
-├── data/                        # Training data (generated, gitignored)
-│   ├── sft.jsonl                # SFT dataset (successful traces)
-│   └── grpo.jsonl               # GRPO dataset (all traces + flags)
-├── docs/
-│   ├── quickstart.md            # Installation + first run
-│   ├── training.md              # 2-stage pipeline details
-│   ├── deployment.md            # Deploy trained models
-│   └── architecture.md          # Module overview, data flow
-├── scripts/
-│   ├── launch_training.sh       # End-to-end training launcher
-│   └── demo/
-│       └── run_demo.sh          # One-command live demo
-├── src/
-│   └── open_ctf/                # Main package
-│       ├── cli/                 # CLI entry points
-│       │   ├── train.py         # open-ctf-train (sft/grpo/merge)
-│       │   ├── convert_traces.py # open-ctf-convert
-│       │   ├── split_dataset.py # open-ctf-split
-│       │   ├── run_agent.py     # open-ctf-agent
-│       │   ├── evaluate.py      # open-ctf-eval
-│       │   ├── validate_pipeline.py # open-ctf-validate
-│       │   └── export_gguf.py   # open-ctf-export
-│       ├── agent/               # BoxPwnr agent runner
-│       ├── configs/             # Training + challenge YAML configs
-│       ├── data/                # Data processing
-│       │   ├── converter.py     # Lossless BoxPwnr trace converter
-│       │   └── splitter.py      # SFT/GRPO dataset splitter
-│       ├── formatters/          # Model-specific formatters
-│       │   ├── base.py          # Base formatter class
-│       │   ├── qwen3.py         # Qwen3 formatter
-│       │   ├── devstral.py      # Devstral formatter
-│       │   ├── glm4.py          # GLM-4 formatter
-│       │   └── tool_registry.py # BoxPwnr tool definitions
-│       ├── rewards/             # GRPO reward functions
-│       │   └── reward.py        # CTFReward (flag + grammar + efficiency)
-│       ├── training/            # Training stages
-│       │   ├── sft.py           # SFT with Unsloth + TRL
-│       │   └── grpo.py          # GRPO with DAPO loss
-│       ├── envs/                # Gymnasium RL wrappers
-│       └── eval/                # Model evaluation harness
-└── references/
-    └── boxpwnr/                 # BoxPwnr reference (agent framework)
-```
-
-## Quick Start
-
-### 1. Requirements
-
-**Prerequisites:**
-- Python 3.10+
-- PyTorch 2.4+ with CUDA support (install separately for your platform)
-- Docker and Docker Compose (for training)
-- NVIDIA GPU with 24GB+ VRAM (80GB+ recommended for full training)
-
-**For Agent Running:**
-- An LLM backend (Ollama, llama.cpp, vLLM, or any OpenAI-compatible API)
-
-### 2. Setup
-
-```bash
-git clone https://github.com/westonbrown/open-ctf-env.git
-cd open-ctf-env
-
-# Install PyTorch first (CUDA-specific, see https://pytorch.org/get-started/)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-
-# Install open-ctf-env (includes transformers, trl, datasets, etc.)
-pip install -e .
-
-# Optional: Install training dependencies (Unsloth, wandb)
-pip install -e ".[train]"
-
-# Clone BoxPwnr reference
-git clone https://github.com/0ca/BoxPwnr.git references/boxpwnr
-
-# Clone CyBench benchmarks (optional, for evaluation)
-git clone https://github.com/andyzorigin/cybench.git benchmarks/cybench
-
-# Copy environment config
-cp env.example .env
-```
-
-### 3. Run the Agent
-
-```bash
-# Against a CyBench challenge
-open-ctf-agent \
-    --platform cybench \
-    --target sqli-login-1 \
-    --model openrouter/openai/gpt-oss-120b \
-    --max-turns 30
-
-# Check setup
-open-ctf-agent --check
-
-# With a local Ollama model
-open-ctf-agent \
-    --platform cybench \
-    --target sqli-login-1 \
-    --model ollama/qwen3:8b
-```
-
-### 4. Generate Training Data
-
-Convert BoxPwnr traces into SFT and GRPO datasets:
-
-```bash
-# Convert raw traces (from BoxPwnr-Traces repo or your own runs)
-open-ctf-convert \
-    --input /path/to/BoxPwnr-Traces \
-    --output data/all_traces.jsonl \
-    --output-failure data/failed_traces.jsonl \
-    --dedup
-
-# Merge and split into SFT + GRPO
-cat data/all_traces.jsonl data/failed_traces.jsonl > data/combined.jsonl
-open-ctf-split \
-    --input data/combined.jsonl \
-    --sft-output data/sft.jsonl \
-    --grpo-output data/grpo.jsonl
-```
-
-See [Data Collection Guide](docs/data-collection.md) for collecting your own traces with BoxPwnr.
-
-### 5. Train a Model
-
-```bash
-open-ctf-train sft \
-    --model unsloth/GLM-4.7-Flash \
-    --data data/sft.jsonl \
-    --output outputs/sft
-
-# GRPO (reinforcement learning stage)
-open-ctf-train grpo \
-    --model outputs/sft/final \
-    --data data/grpo.jsonl \
-    --output outputs/grpo
-```
-
-### 6. Deploy
-
-```bash
-# Export to GGUF
-open-ctf-export \
-    --adapter outputs/sft/final \
-    --base-model unsloth/GLM-4.7-Flash \
-    --output models/ctf-agent.gguf \
-    --quant Q4_K_M
-
-# Serve with Ollama
-echo 'FROM ./models/ctf-agent.gguf
-PARAMETER num_ctx 32768' > Modelfile
-ollama create ctf-agent -f Modelfile
-ollama run ctf-agent
-```
-
-### One-Command Demo
-
-```bash
-./scripts/demo/run_demo.sh
-# or with options:
-./scripts/demo/run_demo.sh --challenge sqli-login-1 --model ollama/qwen3:8b
-```
-
-## Training Data
-
-Data is generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) using `open-ctf-convert` + `open-ctf-split`. The JSONL files are gitignored (83MB total).
-
-| File | Traces | Size | Description |
-|------|--------|------|-------------|
-| `data/sft.jsonl` | 441 | 37MB | Successful solves (SFT demonstrations) |
-| `data/grpo.jsonl` | 779 | 46MB | All traces with cross-referenced flags (GRPO RL) |
-
-**Source platforms:** HTB (518), PicoCTF (393), PortSwigger (358), XBOW (322), CyBench (142), HackBench (3)
-
-Each trace is a full multi-turn conversation with tool calls preserved in ChatML format. GRPO traces include `ground_truth_flag` and `optimal_steps` for reward computation.
-
-## CLI Commands
-
-After `pip install -e .`, these commands are available:
-
-| Command | Purpose |
-|---------|---------|
-| `open-ctf-train` | SFT, GRPO, and LoRA merge |
-| `open-ctf-convert` | Convert BoxPwnr traces to training format |
-| `open-ctf-split` | Split datasets into SFT and GRPO sets |
-| `open-ctf-agent` | Run agent against CTF challenges |
-| `open-ctf-eval` | Evaluate and compare models |
-| `open-ctf-validate` | Validate pipeline without GPU |
-| `open-ctf-export` | Export LoRA adapter to GGUF |
-
-## Environment Configuration
-
-Copy `env.example` to `.env` and customize:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OPEN_CTF_PROVIDER` | Model provider | `ollama` |
-| `OPEN_CTF_MODEL` | LLM model ID | `ollama/qwen3:8b` |
-| `OLLAMA_HOST` | Ollama server URL | `http://localhost:11434` |
-| `OPEN_CTF_OUTPUT_DIR` | Output directory | `./outputs` |
-
-## Training Pipeline
 
 ```mermaid
 graph LR
@@ -241,7 +22,7 @@ graph LR
     C --> D[DatasetSplitter]
 
     D --> E[SFT Data<br/>Successful traces]
-    D --> F[GRPO Data<br/>Multi-turn + flag]
+    D --> F[GRPO Data<br/>All traces + flags]
 
     E --> G[SFT Training<br/>Unsloth + TRL<br/>LoRA r=64, 3 epochs]
     F --> H[GRPO Training<br/>TRL GRPOTrainer<br/>DAPO loss, 1 epoch]
@@ -253,7 +34,7 @@ graph LR
     J --> K[GGUF Export<br/>Q4_K_M quant]
     J --> L[vLLM Serve<br/>BF16/FP8]
 
-    K --> M[Deploy<br/>Ollama/llama.cpp]
+    K --> M[Deploy<br/>Ollama / llama.cpp]
     L --> N[Deploy<br/>API Server]
 
     style G fill:#e1f5e1
@@ -261,15 +42,176 @@ graph LR
     style J fill:#d4edda
 ```
 
-### Training Configuration
+1. **Collect** — Run BoxPwnr against [CyBench](https://cybench.github.io/) Docker challenges (crypto, web, pwn, forensics, reverse engineering)
+2. **Convert** — Lossless trace conversion preserving all 17 native tool names
+3. **Train** — 2-stage pipeline: SFT for tool format + domain knowledge, GRPO for exploitation efficiency
+4. **Evaluate** — Compare base vs fine-tuned on CyBench challenge suite
+5. **Deploy** — Export to GGUF for local inference on DGX Spark or any GPU
+
+## Results
+
+> Training in progress — results will be published before the [un]prompted talk (March 3-4, 2026).
+
+| Model | CyBench Solve Rate | Avg Steps | Notes |
+|-------|-------------------|-----------|-------|
+| GLM-4.7-Flash (base) | TBD | TBD | Baseline |
+| GLM-4.7-Flash (SFT) | TBD | TBD | After SFT on 441 expert traces |
+| GLM-4.7-Flash (SFT + GRPO) | TBD | TBD | After GRPO with CTF reward |
+
+*For context: Claude Sonnet 4.5 achieves ~76.5% on CyBench. No open-weight model under 100B has published CyBench results.*
+
+## Quick Start
+
+### Requirements
+
+- Python 3.10+
+- PyTorch 2.4+ with CUDA support
+- Docker and Docker Compose
+- NVIDIA GPU with 24GB+ VRAM (60GB+ for GLM-4.7-Flash BF16 LoRA)
+
+### Setup
+
+```bash
+git clone https://github.com/westonbrown/open-ctf-env.git
+cd open-ctf-env
+
+# Install PyTorch first (see https://pytorch.org/get-started/)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# Install open-ctf-env
+pip install -e .
+
+# Optional: training dependencies (Unsloth, wandb)
+pip install -e ".[train]"
+
+# Clone BoxPwnr reference
+git clone https://github.com/0ca/BoxPwnr.git references/boxpwnr
+
+# Copy environment config
+cp env.example .env
+```
+
+### Generate Training Data
+
+```bash
+# Convert BoxPwnr traces to training format
+open-ctf-convert \
+    --input /path/to/BoxPwnr-Traces \
+    --output data/all_traces.jsonl \
+    --output-failure data/failed_traces.jsonl \
+    --dedup
+
+# Split into SFT (successes) + GRPO (all traces with flags)
+cat data/all_traces.jsonl data/failed_traces.jsonl > data/combined.jsonl
+open-ctf-split \
+    --input data/combined.jsonl \
+    --sft-output data/sft.jsonl \
+    --grpo-output data/grpo.jsonl
+```
+
+### Train
+
+```bash
+# Stage 1: SFT (tool format + domain knowledge)
+open-ctf-train sft \
+    --model unsloth/GLM-4.7-Flash \
+    --data data/sft.jsonl \
+    --output outputs/sft
+
+# Merge LoRA adapter into base
+open-ctf-train merge \
+    --adapter outputs/sft/final \
+    --output outputs/sft/merged
+
+# Stage 2: GRPO (exploitation efficiency)
+open-ctf-train grpo \
+    --model outputs/sft/merged \
+    --data data/grpo.jsonl \
+    --output outputs/grpo
+```
+
+### Evaluate
+
+```bash
+# Compare base vs fine-tuned on CyBench
+open-ctf-eval \
+    --model outputs/grpo/final \
+    --baseline unsloth/GLM-4.7-Flash \
+    --challenges cybench
+```
+
+### Deploy
+
+```bash
+# Export to GGUF
+open-ctf-export \
+    --adapter outputs/grpo/final \
+    --base-model unsloth/GLM-4.7-Flash \
+    --output models/ctf-agent.gguf \
+    --quant Q4_K_M
+
+# Serve with Ollama
+echo 'FROM ./models/ctf-agent.gguf
+PARAMETER num_ctx 32768' > Modelfile
+ollama create ctf-agent -f Modelfile
+```
+
+### Validate Pipeline (no GPU needed)
+
+```bash
+open-ctf-validate
+```
+
+## Training Data
+
+Data is generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) — real agent trajectories across 6 CTF platforms, collected by running frontier models (Claude Sonnet 4.5, GPT-5, Grok 4, Gemini 3) against Dockerized challenges.
+
+| Dataset | Traces | Size | Description |
+|---------|--------|------|-------------|
+| `data/sft.jsonl` | 441 | 37MB | Successful solves — expert demonstrations for SFT |
+| `data/grpo.jsonl` | 779 | 46MB | All traces with cross-referenced flags for GRPO |
+
+**Source platforms:** HackTheBox (518), PicoCTF (393), PortSwigger (358), CyBench (142), HackBench (3)
+
+Each trace is a full multi-turn conversation (avg 74 messages, up to 454) with structured tool calls in ChatML format. GRPO traces include `ground_truth_flag` and `optimal_steps` for reward computation.
+
+## Reward Function
+
+The CTF reward for GRPO training uses **6 signals + 1 penalty**, validated on all 779 GRPO traces. Process signals (efficiency, progression) are **gated on flag capture** — only successful traces receive credit for methodology, preventing the model from learning "good process theater" without actual exploitation.
+
+| Signal | Weight | Description |
+|--------|--------|-------------|
+| **Flag Capture** | 0.50 | `metadata.success` > exact match > pattern match (0.1) |
+| **Efficiency** | 0.30 | `min(optimal / actual, 1.0)` — gated on flag |
+| **Progression** | 0.05 | RECON → ENUM → EXPLOIT phase ordering — gated on flag |
+| **Exploration** | 0.05 | Novel tool usage weighted toward early trajectory |
+| **Uniqueness** | 0.05 | Command diversity (detects stuck loops) |
+| **Format** | 0.05 | Valid tool call JSON structure |
+| **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag |
+
+**Design principles:**
+- **No regex in process signals.** Progression uses set-based binary lookup on 60+ command names (not regex pattern matching). Classification covers 90.6% of shell commands in the dataset.
+- **`metadata.success` is authoritative.** BoxPwnr's platform validation signal overrides string matching in both directions.
+- **Noise injection (+-0.05)** guarantees variance for GRPO gradients.
+
+**GRPO readiness (validated on 779 traces):**
+
+| Check | Value | Target | Status |
+|-------|-------|--------|--------|
+| Success-failure gap | 0.853 | > 0.50 | Pass |
+| Failure mean | 0.058 | < 0.20 | Pass |
+| Variance | 0.183 | > 0.02 | Pass |
+| 0 high-scoring failures | 0 | 0 | Pass |
+
+## Training Configuration
 
 Edit `src/open_ctf/configs/training.yaml`:
 
 ```yaml
 model:
-  name: "unsloth/GLM-4.7-Flash"
+  name: "unsloth/GLM-4.7-Flash"    # 30B MoE, ~3.6B active
   max_seq_length: 4096
-  load_in_4bit: false  # MoE models require BF16 LoRA
+  load_in_4bit: false               # MoE requires BF16 LoRA
 
 lora:
   r: 64
@@ -280,36 +222,103 @@ sft:
   epochs: 3
   batch_size: 1
   learning_rate: 2.0e-4
-  packing: true
+  packing: true                     # 3x throughput
 
 grpo:
   epochs: 1
   learning_rate: 5.0e-6
   beta: 0.0
-  loss_type: dapo
+  loss_type: dapo                   # Removes length bias
   num_generations: 8
 ```
 
-## Reward Function
+**Hardware notes:**
+- SFT runs on DGX Spark GB10 (~60GB VRAM for BF16 LoRA, `UNSLOTH_MOE_BACKEND=grouped_mm`)
+- GRPO requires cloud H200/H100 (DGX Spark unified memory can't hold model + vLLM KV cache simultaneously)
+- Deployment runs anywhere — Q4_K_M GGUF fits in ~15GB
 
-The CTF reward for GRPO training scores completions on four dimensions:
+## Project Structure
 
-| Component | Weight | Description |
-|-----------|--------|-------------|
-| Flag Capture | 0.30 | Exact flag match (1.0) or pattern match (0.1) |
-| Skill Grammar | 0.20 | RECON -> ENUM -> EXPLOIT phase ordering |
-| Efficiency | 0.35 | Fewer steps = higher reward |
-| Format | 0.15 | Valid tool call structure |
+```
+open-ctf-env/
+├── data/                        # Training data (generated, gitignored)
+│   ├── sft.jsonl                # 441 successful traces
+│   └── grpo.jsonl               # 779 traces with flags
+├── docs/
+│   ├── quickstart.md
+│   ├── training.md              # 2-stage pipeline details
+│   ├── deployment.md
+│   ├── data-collection.md       # Collecting traces with BoxPwnr
+│   └── architecture.md
+├── scripts/
+│   ├── launch_training.sh       # End-to-end training launcher
+│   └── demo/run_demo.sh
+├── src/open_ctf/
+│   ├── cli/                     # 7 CLI entry points
+│   ├── agent/                   # BoxPwnr agent runner
+│   ├── configs/                 # training.yaml + challenges.yaml
+│   ├── data/                    # Trace converter + dataset splitter
+│   ├── formatters/              # Qwen3, Devstral, GLM-4 formatters
+│   │   └── tool_registry.py     # 17 BoxPwnr tool definitions
+│   ├── rewards/reward.py        # CTFReward (6 signals + penalty)
+│   ├── training/                # SFT + GRPO with Unsloth/HF fallback
+│   ├── eval/                    # CyBench evaluation harness
+│   └── envs/                    # Gymnasium RL interface
+├── tests/test_rewards.py        # 68 tests (unit + GRPO readiness)
+└── references/boxpwnr/          # BoxPwnr agent framework
+```
 
-## Documentation
+## CLI Commands
 
-- [Quick Start](docs/quickstart.md) - Installation and first run
-- [Data Collection Guide](docs/data-collection.md) - **Collect real training data from CyBench**
-- [Training Guide](docs/training.md) - Full 2-stage pipeline details
-- [Deployment Guide](docs/deployment.md) - Deploy trained models
-- [Architecture](docs/architecture.md) - Module overview and data flow
+| Command | Purpose |
+|---------|---------|
+| `open-ctf-train` | SFT, GRPO, and LoRA merge |
+| `open-ctf-convert` | Convert BoxPwnr traces to training format |
+| `open-ctf-split` | Split datasets into SFT and GRPO sets |
+| `open-ctf-agent` | Run agent against CyBench challenges |
+| `open-ctf-eval` | Evaluate and compare models on CyBench |
+| `open-ctf-validate` | Validate pipeline without GPU |
+| `open-ctf-export` | Export LoRA adapter to GGUF |
 
-## BoxPwnr Tools (Preserved in Training Data)
+## Roadmap
+
+### Phase 1: Foundation (Done)
+- [x] BoxPwnr agent integration with 17 native security tools
+- [x] Lossless trace converter (tool-calling + chat-command formats)
+- [x] 2-stage training pipeline: SFT (Unsloth + TRL) + GRPO (DAPO loss)
+- [x] Multi-signal CTF reward function (6 signals + hallucination penalty)
+- [x] Model-specific formatters (Qwen3, Devstral, GLM-4)
+- [x] GGUF export pipeline
+- [x] CyBench challenge configs
+- [x] Validation pipeline (`open-ctf-validate`)
+- [x] Training data: 441 SFT + 779 GRPO traces from BoxPwnr across 6 platforms
+- [x] Reward function validated on all 779 GRPO traces (gap 0.85, 0 reward hacking)
+
+### Phase 2: Baseline + Train + Evaluate (In Progress — Target: March 3)
+- [ ] Baseline GLM-4.7-Flash (base) on CyBench challenge subset
+- [ ] SFT training on DGX Spark (BF16 LoRA, `grouped_mm` MoE backend)
+- [ ] GRPO training on cloud H200 (DAPO loss, 8 generations)
+- [ ] Evaluate fine-tuned model on same CyBench challenges
+- [ ] Analyze failure modes, refine reward weights if needed
+- [ ] Retrain GRPO if reward adjustments are significant
+- [ ] Export final model to GGUF, validate on DGX Spark
+- [ ] Record WandB training curves for talk slides
+- [ ] Publish results table (base vs SFT vs SFT+GRPO)
+
+### Phase 3: Release (Target: March 3)
+- [ ] Upload fine-tuned GLM-4.7-Flash weights to HuggingFace
+- [ ] Publish training configs and reward function
+- [ ] Tag v1.0.0 release
+
+### Phase 4: Self-Improvement (Post-Conference)
+- [ ] Rejection sampling: use GRPO model to generate better traces, retrain
+- [ ] GRPO with live CyBench environment rewards (online RL)
+- [ ] Curriculum learning across difficulty levels
+- [ ] Investigate GDPO for multi-reward normalization
+- [ ] Investigate GiGPO for step-level credit at CTF anchor states
+- [ ] Scale to full CyBench 40-challenge suite
+
+## BoxPwnr Tools
 
 The converter preserves all 17 native BoxPwnr tool names:
 
@@ -323,52 +332,44 @@ The converter preserves all 17 native BoxPwnr tool names:
 | Files | `read_file`, `grep`, `file_search`, `apply_patch` |
 | Other | `flag_found`, `web_search` |
 
-## Gymnasium RL Interface
+## Documentation
 
-```python
-from open_ctf.envs import OpenCTFEnv
+- [Quick Start](docs/quickstart.md) — Installation and first run
+- [Data Collection Guide](docs/data-collection.md) — Collect traces with BoxPwnr on CyBench
+- [Training Guide](docs/training.md) — 2-stage SFT + GRPO pipeline
+- [Deployment Guide](docs/deployment.md) — GGUF export, Ollama, DGX Spark
+- [Architecture](docs/architecture.md) — Module overview and data flow
 
-env = OpenCTFEnv(challenge_id="sqli-login-1")
-obs, info = env.reset()
+## Contributing
 
-obs, reward, done, _, _ = env.step("nmap -p- target")
-print(obs['stdout'])
+```bash
+# Run tests
+pip install -e ".[dev]"
+pytest tests/ -v
 
-obs, reward, done, _, _ = env.step("sqlmap -u target ...")
-if reward > 0:
-    print("Flag captured!")
+# Validate pipeline (no GPU)
+open-ctf-validate
+
+# Add a new CyBench challenge
+# Edit src/open_ctf/configs/challenges.yaml
 ```
 
-## Roadmap
-
-### Phase 1: Foundation (Complete)
-- [x] BoxPwnr agent integration
-- [x] Structure-preserving trace converter (tool-calling + chat-command formats)
-- [x] SFT + GRPO training pipeline with Unsloth
-- [x] CTF reward function
-- [x] Model-specific formatters (Qwen3, Devstral, GLM-4)
-- [x] GGUF export pipeline
-- [x] CyBench benchmark integration
-
-### Phase 2: Scale
-- [ ] Collect traces across CyBench's 40+ challenges (SQLi, LFI, IDOR, SSRF, XSS, etc.)
-- [ ] Train and evaluate fine-tuned models across difficulty levels
-- [ ] Publish trained models and datasets
-- [ ] Multi-platform support (HackTheBox, PortSwigger, CTFd)
-
-### Phase 3: Online Learning
-- [ ] GRPO with live environment rewards
-- [ ] Self-play training loop
-- [ ] Curriculum learning across difficulty levels
+The reward function lives in `src/open_ctf/rewards/reward.py`. To add a new signal:
+1. Add a `_new_signal_score()` method to `CTFReward`
+2. Add the weight parameter to `__init__` (weights must sum to 1.0)
+3. Add to the scoring formula in `__call__` (gate on `flag_sc` if it's a process signal)
+4. Add tests in `tests/test_rewards.py`
+5. Validate on GRPO traces: `pytest tests/test_rewards.py::TestGRPOSamples::test_grpo_readiness`
 
 ## Related Work
 
-- [BoxPwnr](https://github.com/0ca/BoxPwnr) - LLM-powered CTF solver
-- [CyBench](https://arxiv.org/abs/2408.08926) - Cybersecurity benchmark suite (40+ challenges)
-- [OpenEnv](https://huggingface.co/docs/openenv) - Open environment framework
-- [Unsloth](https://github.com/unslothai/unsloth) - Efficient fine-tuning
-- [TRL](https://github.com/huggingface/trl) - Transformer Reinforcement Learning
+- [CyBench](https://cybench.github.io/) — Cybersecurity benchmark, 40 challenges, ICLR 2025 Oral ([paper](https://arxiv.org/abs/2408.08926), [repo](https://github.com/andyzorigin/cybench))
+- [BoxPwnr](https://github.com/0ca/BoxPwnr) — LLM-powered CTF solver (our data collection engine)
+- [Unsloth](https://github.com/unslothai/unsloth) — Efficient fine-tuning with MoE Grouped GEMM
+- [TRL](https://github.com/huggingface/trl) — Transformer Reinforcement Learning (GRPOTrainer + DAPO)
+- [DeepSeek R1](https://arxiv.org/abs/2501.12948) — SFT → GRPO pipeline inspiration
+- [Dreadnode Worlds](https://dreadnode.io/blog/worlds) — "Reasoning traces are the critical delta" finding
 
 ## License
 
-MIT License - See [LICENSE](./LICENSE) for details.
+MIT License — See [LICENSE](./LICENSE) for details.
