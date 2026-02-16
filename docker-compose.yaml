@@ -1,0 +1,81 @@
+# Open CTF Environment - Docker Compose
+#
+# Usage:
+#   docker compose run --rm sft
+#   docker compose run --rm grpo
+#   docker compose run --rm merge
+#   docker compose run --rm validate
+#
+# Override model/data paths via environment or .env file.
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  volumes:
+    - ./data:/workspace/data
+    - ./outputs:/workspace/outputs
+    - ./configs:/workspace/configs
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  shm_size: "64g"
+
+services:
+  sft:
+    <<: *common
+    command: >
+      open-ctf-train sft
+        --model ${MODEL:-unsloth/GLM-4.7-Flash}
+        --data /workspace/data/${SFT_DATA:-sample/sft_sample.jsonl}
+        --output /workspace/outputs/sft
+        --config /workspace/configs/training.yaml
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+
+  grpo:
+    <<: *common
+    command: >
+      open-ctf-train grpo
+        --model ${GRPO_MODEL:-/workspace/outputs/sft/final}
+        --data /workspace/data/${GRPO_DATA:-sample/grpo_sample.jsonl}
+        --output /workspace/outputs/grpo
+        --config /workspace/configs/training.yaml
+    environment:
+      - OPEN_CTF_NO_UNSLOTH=1
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+
+  merge:
+    <<: *common
+    command: >
+      open-ctf-train merge
+        --adapter ${ADAPTER:-/workspace/outputs/grpo/final}
+        --base-model ${MODEL:-unsloth/GLM-4.7-Flash}
+        --output /workspace/outputs/merged
+        --config /workspace/configs/training.yaml
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+
+  validate:
+    <<: *common
+    command: open-ctf-validate
+
+  export:
+    <<: *common
+    command: >
+      open-ctf-export
+        --adapter ${ADAPTER:-/workspace/outputs/sft/final}
+        --base-model ${MODEL:-unsloth/GLM-4.7-Flash}
+        --output /workspace/outputs/model.gguf
+        --quant ${QUANT:-Q4_K_M}
+    volumes:
+      - ./data:/workspace/data
+      - ./outputs:/workspace/outputs
+      - ./configs:/workspace/configs
+      - ./models:/workspace/models

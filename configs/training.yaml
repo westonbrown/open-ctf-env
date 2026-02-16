@@ -1,0 +1,53 @@
+# Open CTF Training Configuration
+# ================================
+# Used by: open-ctf-train (src/open_ctf/cli/train.py)
+
+model:
+  name: "unsloth/GLM-4.7-Flash"
+  max_seq_length: 8192
+  # GLM-4.7-Flash is MoE - 4-bit QLoRA NOT supported for MoE models.
+  # Use BF16 LoRA (~60GB VRAM). Set to true only for dense models.
+  load_in_4bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  # Unsloth GLM-4.7-Flash example uses: q_proj, k_proj, v_proj, o_proj,
+  # gate_proj, up_proj, down_proj, out_proj. Router layers excluded by default.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - out_proj
+  use_rslora: true
+
+sft:
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+
+grpo:
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  beta: 0.001
+  loss_type: dapo
+  num_generations: 4
+  max_completion_length: 4096
+
+output:
+  save_steps: 50
+  logging_steps: 1
+  report_to: wandb

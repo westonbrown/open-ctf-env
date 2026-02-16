@@ -67,13 +67,14 @@ venv.bak/
 Thumbs.db
 
 # Project specific
-# references/ (Uncomment to exclude external repos if using submodules)
-# benchmarks/ (Uncomment to exclude benchmarks if using submodules)
+references/        # External repos (users clone BoxPwnr here)
+benchmarks/        # Challenge benchmarks (users clone XBow here)
+targets/           # Agent trace outputs (created by demo/agent runs)
 outputs/
 # *.jsonl (Keep data)
 checkpoints/
 *.ckpt
 *.pt
 *.bin
-scripts/train/training_data/sessions/
-scripts/train/*.jsonl
+models/
+*.gguf

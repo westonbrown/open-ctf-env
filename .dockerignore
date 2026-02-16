@@ -1,0 +1,53 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+build/
+dist/
+
+# References (large external repo)
+references/
+
+# Training outputs (mounted at runtime)
+outputs/
+checkpoints/
+models/
+*.gguf
+*.ckpt
+*.pt
+*.bin
+
+# Data (mounted at runtime)
+data/
+
+# Documentation and benchmarks (not needed in image)
+docs/
+benchmarks/
+
+# Environment files
+.env
+env.example
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+.tox/
+
+# Lock file
+uv.lock
