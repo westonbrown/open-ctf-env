@@ -1,0 +1,66 @@
+# DGX Spark (GB10) Training Configuration
+# =========================================
+# Reduced GRPO params to fit in 120GB unified memory.
+# SFT and LoRA settings inherited from training.yaml.
+
+model:
+  name: "unsloth/GLM-4.7-Flash"
+  max_seq_length: 4096
+  load_in_4bit: false
+
+lora:
+  r: 64
+  alpha: 64
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+sft:
+  epochs: 3
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+
+grpo:
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  beta: 0.0
+  loss_type: dapo
+  # Memory budget (GB10 unified 120GB):
+  #   Model weights: ~60GB  |  Framework/OS: ~10GB  |  Available: ~48GB
+  #   KV cache (4 gen × 4096 tokens): ~1.8GB
+  #   Training (gradients, optimizer, activations): ~15GB
+  #   Headroom: ~32GB
+  #
+  # Previous config (num_gen=2, max_compl=512) used only ~9GB of 48GB
+  # available — massive underutilization. All completions clipped at 512
+  # (clipped_ratio=1.0), zero learning signal.
+  num_generations: 4
+  max_completion_length: 4096
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: "batch"
+  # gpu_memory_utilization: Only used by Unsloth vLLM fast_inference path.
+  # Irrelevant when running with OPEN_CTF_NO_UNSLOTH=1 (HF generate).
+  # For Unsloth: model ~60GB, so 0.3 × 120GB = 36GB for KV cache is safe.
+  gpu_memory_utilization: 0.3
+
+output:
+  save_steps: 25
+  logging_steps: 1
+  report_to: none

@@ -1,21 +1,22 @@
 """Combined CTF reward function for GRPO training.
 
 Scoring components (6 signals, sum to 1.0 + penalty):
-  - Flag capture (0.50): metadata.success > exact match > pattern match
-  - Efficiency (0.30): Fewer steps = higher reward, **gated on flag capture**
-  - Progression (0.05): RECON→ENUM→EXPLOIT phase ordering, **gated on flag capture**
-  - Exploration (0.05): Novel tool usage weighted toward early trajectory
-  - Uniqueness (0.05): Command diversity (repeated commands = stuck)
-  - Format compliance (0.05): Valid tool call structure
+  - Flag capture (0.20): metadata.success > exact match > pattern match
+  - Efficiency (0.25): Fewer steps = higher reward, **ungated** for GRPO signal
+  - Progression (0.15): RECON→ENUM→EXPLOIT phase ordering, **ungated**
+  - Exploration (0.10): Novel tool usage weighted toward early trajectory
+  - Uniqueness (0.10): Command diversity (repeated commands = stuck)
+  - Format compliance (0.20): Valid tool call structure
   - Hallucination penalty: -0.10 for false flag submissions (structural)
 
 Design principles:
+  - **Offline-GRPO compatible**: In GRPO, the model generates completions without
+    interacting with a real environment. The model can never produce the exact
+    ground_truth_flag, so flag_score rarely exceeds 0.1. Efficiency, progression,
+    format, exploration, and uniqueness are ALL ungated to provide meaningful
+    gradient signal regardless of flag capture.
   - **Principle of least action**: Flag (boundary condition) + efficiency (shortest
-    path) are the only ground-truth-verified signals. Together they encode "reach
-    the goal via the shortest path."
-  - **Process gating**: Efficiency and progression are multiplied by flag_score so
-    only successful traces receive credit for speed and phase ordering. Prevents
-    rewarding quitting early (efficiency) or cycling through phases (progression).
+    path) encode "reach the goal via the shortest path."
   - **No regex in process signals**: Progression uses set-based binary lookup (not
     regex pattern matching). Uniqueness, exploration, and format use structural
     analysis (command deduplication, position weighting, JSON parsing).
@@ -94,12 +95,12 @@ class CTFReward:
 
     def __init__(
         self,
-        flag_weight: float = 0.50,
-        efficiency_weight: float = 0.30,
-        progression_weight: float = 0.05,
-        exploration_weight: float = 0.05,
-        uniqueness_weight: float = 0.05,
-        format_weight: float = 0.05,
+        flag_weight: float = 0.20,
+        efficiency_weight: float = 0.25,
+        progression_weight: float = 0.15,
+        exploration_weight: float = 0.10,
+        uniqueness_weight: float = 0.10,
+        format_weight: float = 0.20,
         hallucination_penalty: float = 0.10,
         noise_range: float = 0.05,
         seed: Optional[int] = None,
@@ -176,12 +177,15 @@ class CTFReward:
                 meta_success = metadata_list[idx].get("success")
 
             flag_sc = self._flag_score(text, gt_flag, meta_success)
-            # Progression and efficiency are gated on flag_sc:
-            # only reward process quality when the outcome is good.
+            # All components ungated for offline GRPO:
+            # Model generates completions without environment interaction,
+            # so flag_sc rarely exceeds 0.1. Gating efficiency/progression
+            # on flag_sc starves the gradient signal (85% of weight → 0).
+            # Flag capture still provides a bonus when it occurs.
             score = (
                 self.flag_weight * flag_sc
-                + self.efficiency_weight * self._efficiency_score(len(tool_calls), opt_steps) * flag_sc
-                + self.progression_weight * self._progression_score(tool_calls) * flag_sc
+                + self.efficiency_weight * self._efficiency_score(len(tool_calls), opt_steps)
+                + self.progression_weight * self._progression_score(tool_calls)
                 + self.exploration_weight * self._exploration_score(tool_calls)
                 + self.uniqueness_weight * self._uniqueness_score(tool_calls)
                 + self.format_weight * self._format_score(tool_calls)
@@ -314,7 +318,10 @@ class CTFReward:
         return ""
 
     def _efficiency_score(self, actual_steps: int, optimal_steps: Optional[int]) -> float:
-        """min(optimal / actual, 1.0). Returns 0.5 (neutral) without metadata."""
+        """min(optimal / actual, 1.0). Returns 0.5 (neutral) without metadata.
+
+        Ungated: provides gradient signal in offline GRPO even without flag capture.
+        """
         if optimal_steps is None:
             return 0.5  # Neutral score when metadata unavailable
         if actual_steps == 0:

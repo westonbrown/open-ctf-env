@@ -5,7 +5,7 @@ Uses TRL GRPOTrainer with:
   - beta=0.0 (no KL penalty, pure DAPO)
   - num_generations=8 for better group reward estimation
   - max_completion_length=4096 for full CTF trajectories
-  - FP16 precision (better for RL per Unsloth docs)
+  - BF16 precision (avoids Half/BFloat16 dtype mismatch on Blackwell GB10)
   - reward_funcs=[fn] (list, not bare function)
   - GRPOConfig passed via ``args=`` (not ``config=``)
   - Unsloth vLLM fast inference when available (UNSLOTH_VLLM_STANDBY=1)
@@ -39,19 +39,60 @@ def _set_moe_backend():
         logger.info("Set UNSLOTH_MOE_BACKEND=grouped_mm (GB10 safe default)")
 
 
-def _load_model_unsloth(model_path, max_seq_length, load_in_4bit, lora_cfg):
-    """Load model via Unsloth FastLanguageModel (faster, optimized kernels)."""
+def _patch_grouped_mm_dtype():
+    """Patch Unsloth's grouped_mm to cast inputs to weight dtype.
+
+    Fixes: RuntimeError: expected mat1 and mat2 to have the same dtype,
+    but got: float != c10::BFloat16
+
+    Root cause: During GRPO generation, hidden states can arrive as float32
+    (from router softmax or autocast context) but MoE base weights are bfloat16.
+    Unsloth's ``_grouped_mm_with_backward_fix`` passes both directly to
+    ``torch._grouped_mm`` with no dtype check.  The LoRA weight path in the
+    same file *does* cast (``.to(permuted_input.dtype)``), but the base weight
+    path does not.  This patch adds the missing cast.
+
+    See: unsloth_zoo/temporary_patches/moe_utils.py line ~73
+    See: https://github.com/unslothai/unsloth/issues/3506
+    """
+    try:
+        import unsloth_zoo.temporary_patches.moe_utils as moe_utils
+
+        _original = moe_utils._grouped_mm_with_backward_fix
+
+        def _dtype_safe_grouped_mm(inputs, weight, offsets):
+            if inputs.dtype != weight.dtype:
+                inputs = inputs.to(weight.dtype)
+            return _original(inputs, weight, offsets)
+
+        moe_utils._grouped_mm_with_backward_fix = _dtype_safe_grouped_mm
+        logger.info("Patched _grouped_mm_with_backward_fix for dtype safety")
+    except (ImportError, AttributeError) as e:
+        logger.debug("Could not patch grouped_mm (Unsloth not loaded): %s", e)
+
+
+def _load_model_unsloth(model_path, max_seq_length, load_in_4bit, lora_cfg,
+                        grpo_cfg=None):
+    """Load model via Unsloth FastLanguageModel (faster, optimized kernels).
+
+    Uses BF16 dtype to avoid the Half/BFloat16 mismatch bug that affects
+    Unsloth GRPO on Blackwell GB10 (previously seen with FP16).  The
+    gpu_memory_utilization is read from grpo_cfg to allow DGX-safe values.
+    """
     _set_moe_backend()
     from unsloth import FastLanguageModel
     from peft import PeftModel
 
+    gpu_mem_util = (grpo_cfg or {}).get("gpu_memory_utilization", 0.6)
+    logger.info("Unsloth fast_inference gpu_memory_utilization=%.2f", gpu_mem_util)
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path,
         max_seq_length=max_seq_length,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         load_in_4bit=load_in_4bit,
         fast_inference=True,
-        gpu_memory_utilization=0.6,
+        gpu_memory_utilization=gpu_mem_util,
     )
 
     if isinstance(model, PeftModel):
@@ -81,14 +122,14 @@ def _load_model_hf(model_path, max_seq_length, load_in_4bit, lora_cfg):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     kwargs = {
-        "torch_dtype": torch.float16,
+        "torch_dtype": torch.bfloat16,
         "trust_remote_code": True,
         "attn_implementation": "sdpa",
     }
     if load_in_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
@@ -180,12 +221,19 @@ def train_grpo(
     max_seq_length = model_cfg.get("max_seq_length", 8192)
     load_in_4bit = model_cfg.get("load_in_4bit", True)
 
+    # --- Patch Unsloth MoE dtype bug (must run before any forward pass) --
+    # Unsloth patches TRL at import time in containers that have it installed.
+    # The MoE kernel patches are active even if we fall back to HF model loading.
+    # Apply our dtype fix whenever the Unsloth MoE module is importable.
+    _patch_grouped_mm_dtype()
+
     # --- Model + LoRA ---------------------------------------------------
     use_unsloth = os.environ.get("OPEN_CTF_NO_UNSLOTH", "").lower() not in ("1", "true")
     if use_unsloth:
         try:
             model, tokenizer = _load_model_unsloth(
-                model_path, max_seq_length, load_in_4bit, lora_cfg
+                model_path, max_seq_length, load_in_4bit, lora_cfg,
+                grpo_cfg=grpo_cfg,
             )
             logger.info("Loaded model via Unsloth")
         except (ImportError, RuntimeError, ValueError, OSError) as e:
@@ -247,7 +295,7 @@ def train_grpo(
         warmup_steps=warmup_steps,
         logging_steps=output_cfg.get("logging_steps", 1),
         save_steps=output_cfg.get("save_steps", 50),
-        fp16=True,
+        bf16=True,
         optim="adamw_8bit",
         seed=42,
         report_to=report_to,

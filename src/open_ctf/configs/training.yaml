@@ -44,6 +44,9 @@ grpo:
   warmup_ratio: 0.10
   beta: 0.0
   loss_type: dapo
+  # Default: 8 generations, 4096 completions (cloud H200).
+  # DGX Spark (GB10, 120GB): use num_generations=2, max_completion_length=512
+  # via env overrides or --config pointing to a DGX-specific yaml.
   num_generations: 8
   max_completion_length: 4096
   max_grad_norm: 0.1
@@ -51,7 +54,9 @@ grpo:
   weight_decay: 0.1
   # "batch" uses batch-level std with group-level mean — more robust than "group"
   scale_rewards: "batch"
-  # GRPO uses FP16 (set in code) — better gradient stability for RL
+  # gpu_memory_utilization for Unsloth vLLM fast inference.
+  # Cloud (H200): 0.6.  DGX Spark (GB10): 0.3 (model uses ~60GB of 120GB).
+  gpu_memory_utilization: 0.6
 
 output:
   save_steps: 50
