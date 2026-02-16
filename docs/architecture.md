@@ -99,8 +99,8 @@ sequenceDiagram
     Conv->>Split: ChatML JSONL (all traces)
 
     Note over Split: Success → SFT<br/>Multi-turn + flag → GRPO<br/>Cross-reference flags
-    Split->>SFT: sft_boxpwnr.jsonl
-    Split->>GRPO: grpo_boxpwnr.jsonl
+    Split->>SFT: sft.jsonl
+    Split->>GRPO: grpo.jsonl
 
     Note over SFT: Unsloth FastLanguageModel<br/>LoRA r=64, BF16<br/>Packing enabled
     SFT->>GRPO: SFT checkpoint (merged)
@@ -446,7 +446,7 @@ graph TB
 
 ## Configuration Files
 
-### `configs/training.yaml`
+### `src/open_ctf/configs/training.yaml`
 
 Central configuration for both training stages:
 
@@ -476,7 +476,7 @@ grpo:
   num_generations: 4
 ```
 
-### `configs/challenges.yaml`
+### `src/open_ctf/configs/challenges.yaml`
 
 Challenge definitions for evaluation. Maps challenge IDs to vulnerability types, difficulty, platforms.
 
@@ -568,5 +568,5 @@ graph TB
 
 1. Install platform support in `references/boxpwnr/`
 2. Add platform to `agent/runner.py` `_get_platform()`
-3. Update challenge format in `configs/challenges.yaml`
+3. Update challenge format in `src/open_ctf/configs/challenges.yaml`
 4. Document in `docs/deployment.md`

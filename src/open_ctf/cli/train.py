@@ -5,13 +5,13 @@ Usage:
     # SFT
     open-ctf-train sft \\
         --model unsloth/GLM-4.7-Flash \\
-        --data data/sample/sft_sample.jsonl \\
+        --data data/sft.jsonl \\
         --output outputs/sft
 
     # GRPO (requires SFT model)
     open-ctf-train grpo \\
         --model outputs/sft/final \\
-        --data data/sample/grpo_sample.jsonl \\
+        --data data/grpo.jsonl \\
         --output outputs/grpo
 
     # Merge LoRA adapter into base weights
@@ -41,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONFIG = Path(__file__).resolve().parent.parent.parent.parent / "configs" / "training.yaml"
+DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "training.yaml"
 
 
 def load_config(path: Path) -> dict:
@@ -167,7 +167,7 @@ def main() -> None:
         "--config",
         type=Path,
         default=DEFAULT_CONFIG,
-        help="Path to training YAML config (default: configs/training.yaml)",
+        help="Path to training YAML config (default: src/open_ctf/configs/training.yaml)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

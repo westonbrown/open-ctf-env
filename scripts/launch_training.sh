@@ -16,10 +16,10 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # Defaults (override via environment variables)
 # -----------------------------------------------------------------------
 MODEL="${MODEL:-unsloth/GLM-4.7-Flash}"
-SFT_DATA="${SFT_DATA:-$ROOT_DIR/data/sample/sft_sample.jsonl}"
-GRPO_DATA="${GRPO_DATA:-$ROOT_DIR/data/sample/grpo_sample.jsonl}"
+SFT_DATA="${SFT_DATA:-$ROOT_DIR/data/sft.jsonl}"
+GRPO_DATA="${GRPO_DATA:-$ROOT_DIR/data/grpo.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/outputs}"
-CONFIG="${CONFIG:-$ROOT_DIR/configs/training.yaml}"
+CONFIG="${CONFIG:-$ROOT_DIR/src/open_ctf/configs/training.yaml}"
 
 SFT_ONLY=false
 GRPO_ONLY=false

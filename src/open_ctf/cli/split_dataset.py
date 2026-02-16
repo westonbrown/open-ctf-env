@@ -4,8 +4,8 @@
 Usage:
     open-ctf split --input data/converted.jsonl
     open-ctf split --input data/converted.jsonl \\
-        --sft-output data/sft_boxpwnr.jsonl \\
-        --grpo-output data/grpo_boxpwnr.jsonl \\
+        --sft-output data/sft.jsonl \\
+        --grpo-output data/grpo.jsonl \\
         --max-grpo-tokens 32768
 """
 
@@ -28,13 +28,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--sft-output",
-        default="data/sft_boxpwnr.jsonl",
-        help="Output path for SFT dataset (default: data/sft_boxpwnr.jsonl)",
+        default="data/sft.jsonl",
+        help="Output path for SFT dataset (default: data/sft.jsonl)",
     )
     parser.add_argument(
         "--grpo-output",
-        default="data/grpo_boxpwnr.jsonl",
-        help="Output path for GRPO dataset (default: data/grpo_boxpwnr.jsonl)",
+        default="data/grpo.jsonl",
+        help="Output path for GRPO dataset (default: data/grpo.jsonl)",
     )
     parser.add_argument(
         "--max-grpo-tokens",

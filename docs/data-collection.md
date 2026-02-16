@@ -4,7 +4,7 @@ This guide shows how to collect **real training data** from BoxPwnr agent traces
 
 ## Overview
 
-The sample data (`data/sample/*.jsonl`) contains only 20 SFT and 16 GRPO examples for testing the pipeline. For production training, you need to collect hundreds or thousands of traces by running BoxPwnr against CyBench's 40 professional CTF challenges.
+To train a production model, collect hundreds or thousands of traces by running BoxPwnr against CyBench's 40 professional CTF challenges.
 
 **Pipeline:**
 ```

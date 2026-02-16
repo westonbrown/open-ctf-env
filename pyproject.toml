@@ -10,7 +10,7 @@ authors = [
 ]
 
 dependencies = [
-    "transformers>=5.0.0",
+    "transformers>=5.1.0",
     "trl>=0.28.0",
     "datasets>=2.0.0",
     "peft>=0.14.0",
@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-train = ["torch>=2.4.0", "unsloth>=2024.12", "wandb"]
+train = ["torch>=2.4.0", "unsloth>=2026.2.1", "wandb"]
 agent = ["litellm"]
 dev = ["pytest", "ruff"]
 

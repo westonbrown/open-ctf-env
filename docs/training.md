@@ -54,8 +54,8 @@ open-ctf-convert \
 ```bash
 open-ctf-split \
     --input data/sft_train.jsonl \
-    --sft-output data/sft_boxpwnr.jsonl \
-    --grpo-output data/grpo_boxpwnr.jsonl \
+    --sft-output data/sft.jsonl \
+    --grpo-output data/grpo.jsonl \
     --max-grpo-tokens 32768
 ```
 
@@ -94,7 +94,7 @@ SFT teaches the model domain knowledge, tool schemas, and reasoning patterns.
 ```bash
 open-ctf-train sft \
     --model unsloth/GLM-4.7-Flash \
-    --data data/sft_boxpwnr.jsonl \
+    --data data/sft.jsonl \
     --output outputs/sft
 ```
 
@@ -106,7 +106,7 @@ bash scripts/launch_training.sh --sft-only
 
 ### Configuration
 
-Edit `configs/training.yaml`:
+Edit `src/open_ctf/configs/training.yaml`:
 
 ```yaml
 model:
@@ -152,7 +152,7 @@ GRPO optimizes for flag capture efficiency using the CTF reward function.
 ```bash
 open-ctf-train grpo \
     --model outputs/sft/final \
-    --data data/grpo_boxpwnr.jsonl \
+    --data data/grpo.jsonl \
     --output outputs/grpo
 ```
 

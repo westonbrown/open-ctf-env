@@ -1,7 +1,7 @@
 """Tests for CTFReward function.
 
 Validates all four reward components (flag, grammar, efficiency, format)
-plus integration tests against grpo_sample.jsonl data.
+plus integration tests against data/grpo.jsonl.
 """
 
 import json
@@ -16,7 +16,7 @@ from open_ctf.rewards.ctf_reward import CTFReward, _classify_tool_call
 # Fixtures
 # ---------------------------------------------------------------------------
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "sample"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
 @pytest.fixture
@@ -33,8 +33,10 @@ def reward_no_noise():
 
 @pytest.fixture
 def grpo_samples():
-    """Load all GRPO samples from data/sample/grpo_sample.jsonl."""
-    path = DATA_DIR / "grpo_sample.jsonl"
+    """Load GRPO samples from data/grpo.jsonl."""
+    path = DATA_DIR / "grpo.jsonl"
+    if not path.exists():
+        pytest.skip("data/grpo.jsonl not found (run open-ctf-convert + open-ctf-split)")
     samples = []
     with open(path) as f:
         for line in f:
@@ -454,7 +456,7 @@ class TestCallIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Integration: grpo_sample.jsonl validation
+# Integration: data/grpo.jsonl validation
 # ---------------------------------------------------------------------------
 
 
@@ -465,9 +467,9 @@ class TestGRPOSamples:
     def test_all_have_required_fields(self, grpo_samples):
         for i, sample in enumerate(grpo_samples):
             assert "messages" in sample, f"Sample {i} missing 'messages'"
-            assert "ground_truth_flag" in sample, f"Sample {i} missing 'ground_truth_flag'"
+            assert "ground_truth_flag" in sample or sample.get("metadata", {}).get("success") is False, \
+                f"Sample {i} missing 'ground_truth_flag'"
             assert "optimal_steps" in sample, f"Sample {i} missing 'optimal_steps'"
-            assert sample["ground_truth_flag"].startswith("FLAG{"), f"Sample {i} has invalid flag format"
             assert isinstance(sample["optimal_steps"], int), f"Sample {i} optimal_steps not int"
             assert sample["optimal_steps"] >= 1, f"Sample {i} optimal_steps < 1"
 

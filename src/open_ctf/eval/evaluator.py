@@ -6,7 +6,7 @@ human-readable markdown summary table.
 
 Usage (programmatic):
     from open_ctf.eval import ModelEvaluator
-    ev = ModelEvaluator(model="ollama/glm-4.7-flash", challenges_yaml="configs/challenges.yaml")
+    ev = ModelEvaluator(model="ollama/glm-4.7-flash")
     report = ev.run_all()
     ev.save(report, "outputs/eval")
 
@@ -25,7 +25,7 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_PACKAGE_DIR = Path(__file__).resolve().parent.parent  # src/open_ctf/
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ class ModelEvaluator:
     def __init__(
         self,
         model: str = "openrouter/openai/gpt-oss-120b",
-        challenges_yaml: str = "configs/challenges.yaml",
+        challenges_yaml: str = str(_PACKAGE_DIR / "configs" / "challenges.yaml"),
         platform: str = "xbow",
         strategy: str = "chat_tools",
         max_turns: int = 50,
@@ -116,7 +116,7 @@ class ModelEvaluator:
         """
         yaml_path = Path(self.challenges_yaml)
         if not yaml_path.is_absolute():
-            yaml_path = PROJECT_ROOT / yaml_path
+            yaml_path = _PACKAGE_DIR / yaml_path
 
         if not yaml_path.exists():
             raise FileNotFoundError(f"Challenges config not found: {yaml_path}")

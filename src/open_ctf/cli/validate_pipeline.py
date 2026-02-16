@@ -50,27 +50,19 @@ def main() -> None:
     SRC_DIR = OCE_ROOT / "src"
     DATA_DIR = OCE_ROOT / "data"
 
-    # Also check sample data if main data doesn't exist
-    SAMPLE_DIR = DATA_DIR / "sample"
-
     # -------------------------------------------------------------------
     # 1. Data files
     # -------------------------------------------------------------------
     _section("1. DATA FILES")
 
     data_checks = [
-        ("SFT BoxPwnr", DATA_DIR / "sft_boxpwnr.jsonl"),
-        ("GRPO BoxPwnr", DATA_DIR / "grpo_boxpwnr.jsonl"),
-        ("SFT Sample", SAMPLE_DIR / "sft_sample.jsonl"),
-        ("GRPO Sample", SAMPLE_DIR / "grpo_sample.jsonl"),
+        ("SFT", DATA_DIR / "sft.jsonl"),
+        ("GRPO", DATA_DIR / "grpo.jsonl"),
     ]
 
     for label, fpath in data_checks:
         if not fpath.exists():
-            if "Sample" in label:
-                _warn(f"{label}: Not found at {fpath}", warnings)
-            else:
-                _warn(f"{label}: Not found at {fpath.name} (expected after data conversion)", warnings)
+            _warn(f"{label}: Not found at {fpath.name} (run open-ctf-convert + open-ctf-split)", warnings)
             continue
 
         with open(fpath) as f:
@@ -185,7 +177,7 @@ def main() -> None:
         except py_compile.PyCompileError as e:
             _fail(f"{label}: Syntax error -> {e}", errors)
 
-    config_file = OCE_ROOT / "configs" / "training.yaml"
+    config_file = SRC_DIR / "open_ctf" / "configs" / "training.yaml"
     if config_file.exists():
         import yaml
 
@@ -195,9 +187,9 @@ def main() -> None:
         required_sections = ["model", "lora", "sft", "grpo", "output"]
         for s in required_sections:
             if s in cfg:
-                _ok(f"configs/training.yaml: '{s}' section present")
+                _ok(f"training.yaml: '{s}' section present")
             else:
-                _fail(f"configs/training.yaml: Missing '{s}' section", errors)
+                _fail(f"training.yaml: Missing '{s}' section", errors)
 
         grpo = cfg.get("grpo", {})
         if grpo.get("beta", 1.0) <= 0.01:
@@ -210,7 +202,7 @@ def main() -> None:
         else:
             _warn(f"GRPO loss_type={grpo.get('loss_type', 'missing')} (should be dapo)", warnings)
     else:
-        _fail("configs/training.yaml: Not found", errors)
+        _fail("training.yaml: Not found", errors)
 
     launch_script = OCE_ROOT / "scripts" / "launch_training.sh"
     if launch_script.exists():
@@ -312,18 +304,18 @@ def main() -> None:
         except py_compile.PyCompileError as e:
             _fail(f"{label}: Syntax error -> {e}", errors)
 
-    challenges_file = OCE_ROOT / "configs" / "challenges.yaml"
+    challenges_file = SRC_DIR / "open_ctf" / "configs" / "challenges.yaml"
     if challenges_file.exists():
         import yaml
         with open(challenges_file) as f:
             data = yaml.safe_load(f) or {}
         challenges = data.get("challenges", [])
         if challenges:
-            _ok(f"configs/challenges.yaml: {len(challenges)} challenges defined")
+            _ok(f"challenges.yaml: {len(challenges)} challenges defined")
         else:
-            _warn("configs/challenges.yaml: No challenges defined", warnings)
+            _warn("challenges.yaml: No challenges defined", warnings)
     else:
-        _warn("configs/challenges.yaml: Not found", warnings)
+        _warn("challenges.yaml: Not found", warnings)
 
     # -------------------------------------------------------------------
     # 8. Agent runner

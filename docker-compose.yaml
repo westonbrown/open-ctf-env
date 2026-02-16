@@ -15,7 +15,7 @@ x-common: &common
   volumes:
     - ./data:/workspace/data
     - ./outputs:/workspace/outputs
-    - ./configs:/workspace/configs
+    - ./src/open_ctf/configs:/workspace/configs
   deploy:
     resources:
       reservations:
@@ -31,7 +31,7 @@ services:
     command: >
       open-ctf-train sft
         --model ${MODEL:-unsloth/GLM-4.7-Flash}
-        --data /workspace/data/${SFT_DATA:-sample/sft_sample.jsonl}
+        --data /workspace/data/${SFT_DATA:-sft.jsonl}
         --output /workspace/outputs/sft
         --config /workspace/configs/training.yaml
     environment:
@@ -43,7 +43,7 @@ services:
     command: >
       open-ctf-train grpo
         --model ${GRPO_MODEL:-/workspace/outputs/sft/final}
-        --data /workspace/data/${GRPO_DATA:-sample/grpo_sample.jsonl}
+        --data /workspace/data/${GRPO_DATA:-grpo.jsonl}
         --output /workspace/outputs/grpo
         --config /workspace/configs/training.yaml
     environment:
@@ -77,5 +77,5 @@ services:
     volumes:
       - ./data:/workspace/data
       - ./outputs:/workspace/outputs
-      - ./configs:/workspace/configs
+      - ./src/open_ctf/configs:/workspace/configs
       - ./models:/workspace/models

@@ -80,10 +80,15 @@ open-ctf-agent \
 ### Convert Traces to Training Data
 
 ```bash
+# Convert and split traces
 open-ctf-convert \
     --input targets/ \
-    --output data/sft_train.jsonl \
-    --success-only --dedup
+    --output data/all_traces.jsonl \
+    --output-failure data/failed_traces.jsonl \
+    --dedup
+
+cat data/all_traces.jsonl data/failed_traces.jsonl > data/combined.jsonl
+open-ctf-split --input data/combined.jsonl
 ```
 
 ### Train a Model
@@ -92,13 +97,13 @@ open-ctf-convert \
 # SFT stage
 open-ctf-train sft \
     --model unsloth/GLM-4.7-Flash \
-    --data data/sft_train.jsonl \
+    --data data/sft.jsonl \
     --output outputs/sft
 
 # GRPO stage (after SFT)
 open-ctf-train grpo \
     --model outputs/sft/final \
-    --data data/grpo_train.jsonl \
+    --data data/grpo.jsonl \
     --output outputs/grpo
 ```
 

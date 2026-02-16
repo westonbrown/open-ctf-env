@@ -9,13 +9,13 @@
 # Run SFT:
 #   docker run --gpus all -v ./data:/workspace/data -v ./outputs:/workspace/outputs \
 #       open-ctf-env open-ctf-train sft --model unsloth/GLM-4.7-Flash \
-#       --data /workspace/data/sample/sft_sample.jsonl --output /workspace/outputs/sft
+#       --data /workspace/data/sft.jsonl --output /workspace/outputs/sft
 #
 # Run GRPO (no Unsloth):
 #   docker run --gpus all -e OPEN_CTF_NO_UNSLOTH=1 \
 #       -v ./data:/workspace/data -v ./outputs:/workspace/outputs \
 #       open-ctf-env open-ctf-train grpo --model /workspace/outputs/sft/final \
-#       --data /workspace/data/sample/grpo_sample.jsonl --output /workspace/outputs/grpo
+#       --data /workspace/data/grpo.jsonl --output /workspace/outputs/grpo
 
 FROM nvcr.io/nvidia/pytorch:25.11-py3
 
@@ -46,9 +46,8 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir "unsloth>=2026.2.1" || \
     echo "WARNING: Unsloth installation failed. Use OPEN_CTF_NO_UNSLOTH=1 for GRPO."
 
-# Copy source code and configs
+# Copy source code (configs are inside src/open_ctf/configs/)
 COPY src/ /workspace/src/
-COPY configs/ /workspace/configs/
 COPY pyproject.toml /workspace/
 
 # Install the package in editable mode

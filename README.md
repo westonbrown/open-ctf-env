@@ -30,11 +30,9 @@ Open CTF Environment provides an end-to-end pipeline:
 
 ```
 open-ctf-env/
-├── benchmarks/                  # CyBench challenges (Dockerized targets)
-├── configs/
-│   ├── training.yaml            # Training hyperparameters
-│   └── challenges.yaml          # Challenge definitions for evaluation
-├── data/                        # Training datasets
+├── data/                        # Training data (generated, gitignored)
+│   ├── sft.jsonl                # SFT dataset (successful traces)
+│   └── grpo.jsonl               # GRPO dataset (all traces + flags)
 ├── docs/
 │   ├── quickstart.md            # Installation + first run
 │   ├── training.md              # 2-stage pipeline details
@@ -55,6 +53,7 @@ open-ctf-env/
 │       │   ├── validate_pipeline.py # open-ctf-validate
 │       │   └── export_gguf.py   # open-ctf-export
 │       ├── agent/               # BoxPwnr agent runner
+│       ├── configs/             # Training + challenge YAML configs
 │       ├── data/                # Data processing
 │       │   ├── converter.py     # Lossless BoxPwnr trace converter
 │       │   └── splitter.py      # SFT/GRPO dataset splitter
@@ -133,41 +132,41 @@ open-ctf-agent \
     --model ollama/qwen3:8b
 ```
 
-### 4. Collect Real Training Data (Optional)
+### 4. Generate Training Data
 
-The `data/sample/` directory contains minimal data (20 SFT + 16 GRPO samples) for testing the pipeline. For production training, collect hundreds of traces from CyBench:
+Convert BoxPwnr traces into SFT and GRPO datasets:
 
 ```bash
-# Run BoxPwnr against CyBench challenges
-cd references/boxpwnr
-uv run boxpwnr --platform cybench \
-    --target "[Very Easy] Dynastic" \
-    --model gpt-4o \
-    --max-cost 2.0
-
-# Convert traces to training data
-cd ../..
+# Convert raw traces (from BoxPwnr-Traces repo or your own runs)
 open-ctf-convert \
-    --input targets/ \
-    --output data/sft_train.jsonl \
-    --success-only \
+    --input /path/to/BoxPwnr-Traces \
+    --output data/all_traces.jsonl \
+    --output-failure data/failed_traces.jsonl \
     --dedup
+
+# Merge and split into SFT + GRPO
+cat data/all_traces.jsonl data/failed_traces.jsonl > data/combined.jsonl
+open-ctf-split \
+    --input data/combined.jsonl \
+    --sft-output data/sft.jsonl \
+    --grpo-output data/grpo.jsonl
 ```
 
-**📖 See [Data Collection Guide](docs/data-collection.md) for complete workflows, batch collection, and cost optimization.**
+See [Data Collection Guide](docs/data-collection.md) for collecting your own traces with BoxPwnr.
 
 ### 5. Train a Model
 
 ```bash
-# Test the pipeline with sample data
 open-ctf-train sft \
     --model unsloth/GLM-4.7-Flash \
-    --data data/sample/sft_sample.jsonl \
-    --output outputs/sft_test
+    --data data/sft.jsonl \
+    --output outputs/sft
 
-# For production training, use your collected data:
-# open-ctf-train sft --data data/sft_train.jsonl --output outputs/sft
-# open-ctf-train grpo --model outputs/sft/final --data data/grpo_train.jsonl --output outputs/grpo
+# GRPO (reinforcement learning stage)
+open-ctf-train grpo \
+    --model outputs/sft/final \
+    --data data/grpo.jsonl \
+    --output outputs/grpo
 ```
 
 ### 6. Deploy
@@ -194,6 +193,19 @@ ollama run ctf-agent
 # or with options:
 ./scripts/demo/run_demo.sh --challenge sqli-login-1 --model ollama/qwen3:8b
 ```
+
+## Training Data
+
+Data is generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) using `open-ctf-convert` + `open-ctf-split`. The JSONL files are gitignored (83MB total).
+
+| File | Traces | Size | Description |
+|------|--------|------|-------------|
+| `data/sft.jsonl` | 441 | 37MB | Successful solves (SFT demonstrations) |
+| `data/grpo.jsonl` | 779 | 46MB | All traces with cross-referenced flags (GRPO RL) |
+
+**Source platforms:** HTB (518), PicoCTF (393), PortSwigger (358), XBOW (322), CyBench (142), HackBench (3)
+
+Each trace is a full multi-turn conversation with tool calls preserved in ChatML format. GRPO traces include `ground_truth_flag` and `optimal_steps` for reward computation.
 
 ## CLI Commands
 
@@ -251,7 +263,7 @@ graph LR
 
 ### Training Configuration
 
-Edit `configs/training.yaml`:
+Edit `src/open_ctf/configs/training.yaml`:
 
 ```yaml
 model:
