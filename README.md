@@ -44,19 +44,30 @@ graph LR
 
 1. **Collect** — Run BoxPwnr against [CyBench](https://cybench.github.io/) Docker challenges (crypto, web, pwn, forensics, reverse engineering)
 2. **Convert** — Lossless trace conversion preserving all 17 native tool names
-3. **Train** — 2-stage pipeline: SFT for tool format + domain knowledge, GRPO for exploitation efficiency
+3. **Train** — 3-stage pipeline: SFT → Offline GRPO → Online GRPO
 4. **Evaluate** — Compare base vs fine-tuned on CyBench challenge suite
 5. **Deploy** — Export to GGUF for local inference on DGX Spark or any GPU
+
+### Offline vs Online GRPO
+
+The pipeline uses GRPO in two complementary modes:
+
+**Offline GRPO** — The model generates completions from static prompts without interacting with a live environment. Rewards come from the CTF reward function scoring the generated text against `ground_truth_flag` and `optimal_steps` from the dataset. This is fast (vLLM-accelerated generation) and stable, but the model never sees real tool output — it learns to *plan* exploits, not *execute* them.
+
+**Online GRPO** — The model generates completions *and* executes tool calls against a live CTF challenge via the OpenEnv server. TRL's `tools=` parameter routes `shell_command`, `python_code`, and `submit_flag` calls to the environment, which returns real stdout/stderr. The model learns from actual execution feedback — commands that fail, outputs that reveal information, flags that verify. This closes the plan-execute gap that offline training leaves open.
+
+Running both in sequence (offline first, then online) gives the model a strong prior on tool format and attack methodology before exposing it to the noisy, slow feedback loop of real environments.
 
 ## Results
 
 > Training in progress — results will be published before the [un]prompted talk (March 3-4, 2026).
 
-| Model | CyBench Solve Rate | Avg Steps | Notes |
-|-------|-------------------|-----------|-------|
-| GLM-4.7-Flash (base) | TBD | TBD | Baseline |
-| GLM-4.7-Flash (SFT) | TBD | TBD | After SFT on 441 expert traces |
-| GLM-4.7-Flash (SFT + GRPO) | TBD | TBD | After GRPO with CTF reward |
+| Model | Solve Rate | Avg Steps | Avg Tokens | Avg Time | False Flags |
+|-------|-----------|-----------|------------|----------|-------------|
+| GLM-4.7-Flash (base) | TBD | TBD | TBD | TBD | TBD |
+| + SFT | TBD | TBD | TBD | TBD | TBD |
+| + Offline GRPO | TBD | TBD | TBD | TBD | TBD |
+| + Online GRPO | TBD | TBD | TBD | TBD | TBD |
 
 *For context: Claude Sonnet 4.5 achieves ~76.5% on CyBench. No open-weight model under 100B has published CyBench results.*
 
@@ -177,31 +188,22 @@ Each trace is a full multi-turn conversation (avg 74 messages, up to 454) with s
 
 ## Reward Function
 
-The CTF reward for GRPO training uses **6 signals + 1 penalty**, validated on all 779 GRPO traces. Process signals (efficiency, progression) are **gated on flag capture** — only successful traces receive credit for methodology, preventing the model from learning "good process theater" without actual exploitation.
+The CTF reward for GRPO training uses **6 signals + 1 penalty**. All process signals are **ungated** — they provide gradient signal in offline GRPO where the model generates completions without environment interaction and rarely captures the exact flag. Flag capture still provides a bonus when it occurs.
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
-| **Flag Capture** | 0.50 | `metadata.success` > exact match > pattern match (0.1) |
-| **Efficiency** | 0.30 | `min(optimal / actual, 1.0)` — gated on flag |
-| **Progression** | 0.05 | RECON → ENUM → EXPLOIT phase ordering — gated on flag |
-| **Exploration** | 0.05 | Novel tool usage weighted toward early trajectory |
-| **Uniqueness** | 0.05 | Command diversity (detects stuck loops) |
-| **Format** | 0.05 | Valid tool call JSON structure |
+| **Flag Capture** | 0.20 | `metadata.success` > exact match > pattern match (0.1) |
+| **Efficiency** | 0.25 | `min(optimal / actual, 1.0)` |
+| **Format** | 0.20 | Valid tool call JSON structure |
+| **Progression** | 0.15 | RECON → ENUM → EXPLOIT phase ordering |
+| **Exploration** | 0.10 | Novel tool usage weighted toward early trajectory |
+| **Uniqueness** | 0.10 | Command diversity (detects stuck loops) |
 | **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag |
 
 **Design principles:**
-- **No regex in process signals.** Progression uses set-based binary lookup on 60+ command names (not regex pattern matching). Classification covers 90.6% of shell commands in the dataset.
+- **No regex in process signals.** Progression uses set-based binary lookup on 60+ command names. Classification covers 90.6% of shell commands in the dataset.
 - **`metadata.success` is authoritative.** BoxPwnr's platform validation signal overrides string matching in both directions.
 - **Noise injection (+-0.05)** guarantees variance for GRPO gradients.
-
-**GRPO readiness (validated on 779 traces):**
-
-| Check | Value | Target | Status |
-|-------|-------|--------|--------|
-| Success-failure gap | 0.853 | > 0.50 | Pass |
-| Failure mean | 0.058 | < 0.20 | Pass |
-| Variance | 0.183 | > 0.02 | Pass |
-| 0 high-scoring failures | 0 | 0 | Pass |
 
 ## Training Configuration
 
@@ -233,38 +235,36 @@ grpo:
 ```
 
 **Hardware notes:**
-- SFT runs on DGX Spark GB10 (~60GB VRAM for BF16 LoRA, `UNSLOTH_MOE_BACKEND=grouped_mm`)
-- GRPO requires cloud H200/H100 (DGX Spark unified memory can't hold model + vLLM KV cache simultaneously)
-- Deployment runs anywhere — Q4_K_M GGUF fits in ~15GB
+- SFT + GRPO: Cloud H100/H200 recommended. DGX Spark GB10 works for SFT only (use `training_dgx.yaml`)
+- Deployment: Q4_K_M GGUF fits in ~15GB — runs on any GPU including DGX Spark
 
 ## Project Structure
 
 ```
 open-ctf-env/
-├── data/                        # Training data (generated, gitignored)
+├── data/                        # Training data (generated)
 │   ├── sft.jsonl                # 441 successful traces
 │   └── grpo.jsonl               # 779 traces with flags
-├── docs/
-│   ├── quickstart.md
-│   ├── training.md              # 2-stage pipeline details
-│   ├── deployment.md
-│   ├── data-collection.md       # Collecting traces with BoxPwnr
-│   └── architecture.md
-├── scripts/
-│   ├── launch_training.sh       # End-to-end training launcher
-│   └── demo/run_demo.sh
+├── docs/                        # Guides (quickstart, training, deployment, etc.)
+├── Dockerfile                   # Container build
 ├── src/open_ctf/
 │   ├── cli/                     # 7 CLI entry points
 │   ├── agent/                   # BoxPwnr agent runner
-│   ├── configs/                 # training.yaml + challenges.yaml
+│   ├── configs/                 # training.yaml, training_dgx.yaml
 │   ├── data/                    # Trace converter + dataset splitter
 │   ├── formatters/              # Qwen3, Devstral, GLM-4 formatters
 │   │   └── tool_registry.py     # 17 BoxPwnr tool definitions
 │   ├── rewards/reward.py        # CTFReward (6 signals + penalty)
 │   ├── training/                # SFT + GRPO with Unsloth/HF fallback
+│   │   ├── grpo.py              # GRPO trainer (offline + OpenEnv tools= mode)
+│   │   └── tools.py             # TRL tool wrappers for live environment
 │   ├── eval/                    # CyBench evaluation harness
-│   └── envs/                    # Gymnasium RL interface
-├── tests/test_rewards.py        # 68 tests (unit + GRPO readiness)
+│   └── envs/
+│       ├── gym_env.py           # Gymnasium RL interface
+│       └── openenv/             # OpenEnv server + client (online GRPO)
+├── tests/
+│   ├── test_rewards.py          # Reward function tests
+│   └── test_openenv.py          # OpenEnv integration tests
 └── references/boxpwnr/          # BoxPwnr agent framework
 ```
 
@@ -282,41 +282,38 @@ open-ctf-env/
 
 ## Roadmap
 
-### Phase 1: Foundation (Done)
-- [x] BoxPwnr agent integration with 17 native security tools
+### Phase 1: Pipeline + Infrastructure (Done)
 - [x] Lossless trace converter (tool-calling + chat-command formats)
-- [x] 2-stage training pipeline: SFT (Unsloth + TRL) + GRPO (DAPO loss)
-- [x] Multi-signal CTF reward function (6 signals + hallucination penalty)
-- [x] Model-specific formatters (Qwen3, Devstral, GLM-4)
-- [x] GGUF export pipeline
-- [x] CyBench challenge configs
-- [x] Validation pipeline (`open-ctf-validate`)
 - [x] Training data: 441 SFT + 779 GRPO traces from BoxPwnr across 6 platforms
-- [x] Reward function validated on all 779 GRPO traces (gap 0.85, 0 reward hacking)
+- [x] 3-stage training pipeline: SFT + offline GRPO + online GRPO (Unsloth + TRL)
+- [x] Multi-signal CTF reward function (6 signals + hallucination penalty)
+- [x] OpenEnv server + TRL `tools=` integration for online GRPO with live environments
+- [x] TRL prefix-preserving patch for GLM-4.7-Flash chat template
+- [x] Model-specific formatters (Qwen3, Devstral, GLM-4)
+- [x] BoxPwnr agent integration with 17 native security tools
+- [x] CyBench challenge configs
+- [x] GGUF export pipeline
+- [x] Validation pipeline (`open-ctf-validate`)
 
-### Phase 2: Baseline + Train + Evaluate (In Progress — Target: March 3)
+### Phase 2: Train + Evaluate + Release (In Progress — Target: March 3)
+
+**Train**
+- [ ] SFT on cloud H100/H200 — data: 441 historical BoxPwnr success traces (BF16 LoRA, 3 epochs)
+- [ ] Offline GRPO on cloud H100/H200 — data: 779 historical BoxPwnr traces with cross-referenced flags (DAPO, 8 generations, vLLM)
+- [ ] Online GRPO on cloud H100/H200 — data: live CyBench challenges via OpenEnv `tools=` mode, model generates and executes against real targets
+- [ ] Rejection sampling: use online-GRPO model to generate new traces, filter by success, retrain SFT
+- [ ] Curriculum learning: order challenges by difficulty across training
+
+**Evaluate** — metrics: solve rate, avg steps to flag, avg tokens generated, wall-clock time, tool call success rate, false flag submissions
 - [ ] Baseline GLM-4.7-Flash (base) on CyBench challenge subset
-- [ ] SFT training on DGX Spark (BF16 LoRA, `grouped_mm` MoE backend)
-- [ ] GRPO training on cloud H200 (DAPO loss, 8 generations)
-- [ ] Evaluate fine-tuned model on same CyBench challenges
-- [ ] Analyze failure modes, refine reward weights if needed
-- [ ] Retrain GRPO if reward adjustments are significant
+- [ ] Evaluate base vs SFT vs offline-GRPO vs online-GRPO on same challenges
+- [ ] Scale evaluation to full CyBench 40-challenge suite
+
+**Release**
 - [ ] Export final model to GGUF, validate on DGX Spark
-- [ ] Record WandB training curves for talk slides
-- [ ] Publish results table (base vs SFT vs SFT+GRPO)
-
-### Phase 3: Release (Target: March 3)
-- [ ] Upload fine-tuned GLM-4.7-Flash weights to HuggingFace
-- [ ] Publish training configs and reward function
+- [ ] Publish results table (solve rate, avg steps, avg tokens, time per challenge)
+- [ ] Upload fine-tuned weights to HuggingFace
 - [ ] Tag v1.0.0 release
-
-### Phase 4: Self-Improvement (Post-Conference)
-- [ ] Rejection sampling: use GRPO model to generate better traces, retrain
-- [ ] GRPO with live CyBench environment rewards (online RL)
-- [ ] Curriculum learning across difficulty levels
-- [ ] Investigate GDPO for multi-reward normalization
-- [ ] Investigate GiGPO for step-level credit at CTF anchor states
-- [ ] Scale to full CyBench 40-challenge suite
 
 ## BoxPwnr Tools
 
@@ -357,9 +354,8 @@ open-ctf-validate
 The reward function lives in `src/open_ctf/rewards/reward.py`. To add a new signal:
 1. Add a `_new_signal_score()` method to `CTFReward`
 2. Add the weight parameter to `__init__` (weights must sum to 1.0)
-3. Add to the scoring formula in `__call__` (gate on `flag_sc` if it's a process signal)
+3. Add to the scoring formula in `__call__`
 4. Add tests in `tests/test_rewards.py`
-5. Validate on GRPO traces: `pytest tests/test_rewards.py::TestGRPOSamples::test_grpo_readiness`
 
 ## Related Work
 

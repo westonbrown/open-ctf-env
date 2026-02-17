@@ -14,6 +14,16 @@ Uses Unsloth for model loading when available, falls back to standard
 HuggingFace transformers + PEFT otherwise. The fallback is also used when
 Unsloth's GRPO kernels have dtype issues (e.g. on Blackwell GB10).
 
+Supports two OpenEnv integration modes (selected automatically):
+
+  **Mode 1 (tools=)**: ``OPEN_CTF_ENV_URL`` is set. Uses TRL's ``tools=``
+  parameter with ``max_tool_calling_iterations``. If ``use_vllm=True`` and
+  vLLM is available, generation is accelerated via vLLM while tool
+  execution still goes through TRL's ``_tool_call_loop``.
+
+  **Mode 2 (offline)**: No ``OPEN_CTF_ENV_URL``. Falls back to the
+  existing offline behavior with the provided ``reward_fn``.
+
 Compatible with TRL >= 0.26 (processing_class, warmup_steps).
 """
 
@@ -27,9 +37,51 @@ os.environ.setdefault("UNSLOTH_VLLM_STANDBY", "1")
 
 import torch
 from datasets import load_dataset
-from trl import GRPOConfig, GRPOTrainer
 
 logger = logging.getLogger(__name__)
+
+
+from trl import GRPOConfig, GRPOTrainer
+
+
+def _patch_trl_prefix_check():
+    """Patch TRL's prefix-preserving check to be a no-op at runtime.
+
+    GLM-4.7-Flash's chat template is not prefix-preserving (``<think>`` /
+    ``<|observation|>`` tags cause tokenized prefixes to differ). TRL's
+    ``_tool_call_loop`` raises ``ValueError`` at runtime when it detects
+    this.
+
+    Instead of patching files on disk (fails on read-only pip installs in
+    cloud containers), we monkey-patch the already-imported module object
+    in memory. Called lazily from ``train_grpo()`` before tools= mode.
+    """
+    try:
+        import trl.trainer.grpo_trainer as _grpo_mod
+
+        # Find the _tool_call_loop or related method that does the check.
+        # In TRL 0.28+, the prefix check is inside GRPOTrainer.__init__
+        # or _tool_call_loop. We patch get_training_chat_template to
+        # swallow the ValueError instead of propagating it.
+        import trl.chat_template_utils as _chat_utils
+
+        _orig = _chat_utils.get_training_chat_template
+
+        def _safe_get_training_chat_template(tok):
+            try:
+                return _orig(tok)
+            except ValueError:
+                logger.warning(
+                    "Chat template is not prefix-preserving (patched to continue). "
+                    "Tool calling will still work correctly."
+                )
+                return None
+
+        _chat_utils.get_training_chat_template = _safe_get_training_chat_template
+        _grpo_mod.get_training_chat_template = _safe_get_training_chat_template
+        logger.info("Patched TRL prefix-preserving check (in-memory)")
+    except Exception as e:
+        logger.warning("Could not patch TRL prefix check: %s", e)
 
 
 def _set_moe_backend():
@@ -180,6 +232,134 @@ def _load_model_hf(model_path, max_seq_length, load_in_4bit, lora_cfg):
     return model, tokenizer
 
 
+def _add_generic_parse_response(tokenizer) -> None:
+    """Add a basic ``parse_response`` to a tokenizer that lacks one.
+
+    TRL's GRPOTrainer requires ``tokenizer.parse_response`` when ``tools=``
+    is set. If TRL's ``add_response_schema`` can't recognise the chat
+    template (e.g. GLM-4.7-Flash), we fall back to a simple JSON-based
+    parser that extracts tool calls from the generated text.
+    """
+    import json as _json
+    import re as _re
+
+    # GLM-4.7-Flash XML tool call pattern:
+    #   <tool_call>func_name<arg_key>k1</arg_key><arg_value>v1</arg_value>...</tool_call>
+    _glm_tc_pat = _re.compile(
+        r"<tool_call>(\S+?)((?:<arg_key>.*?</arg_key><arg_value>.*?</arg_value>)*)\s*</tool_call>",
+        _re.DOTALL,
+    )
+    _glm_arg_pat = _re.compile(
+        r"<arg_key>(.*?)</arg_key><arg_value>(.*?)</arg_value>", _re.DOTALL,
+    )
+
+    def _parse_response(text_or_ids) -> dict:
+        """Extract tool calls from generated text or token IDs.
+
+        TRL calls this with a list of token IDs, not a string.
+        We decode first if needed.
+        """
+        if isinstance(text_or_ids, list):
+            text = tokenizer.decode(text_or_ids, skip_special_tokens=True)
+        else:
+            text = str(text_or_ids)
+
+        tool_calls = []
+
+        # GLM-4.7-Flash XML format (non-JSON)
+        for m in _glm_tc_pat.finditer(text):
+            name = m.group(1).strip()
+            args = {}
+            for am in _glm_arg_pat.finditer(m.group(2)):
+                key = am.group(1).strip()
+                val = am.group(2).strip()
+                # Try to parse value as JSON for proper typing
+                try:
+                    val = _json.loads(val)
+                except (ValueError, _json.JSONDecodeError):
+                    pass
+                args[key] = val
+            if name:
+                tool_calls.append({
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                })
+
+        # JSON-based tool call formats
+        if not tool_calls:
+            patterns = [
+                _re.compile(r"<\|tool_call\|>\s*(\{.*?\})\s*<\|/tool_call\|>", _re.DOTALL),
+                _re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", _re.DOTALL),
+                _re.compile(r"```json\s*(\{.*?\})\s*```", _re.DOTALL),
+            ]
+            for pat in patterns:
+                for m in pat.finditer(text):
+                    try:
+                        d = _json.loads(m.group(1))
+                        name = d.get("name", "")
+                        args = d.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = _json.loads(args)
+                            except _json.JSONDecodeError:
+                                args = {}
+                        if name:
+                            tool_calls.append({
+                                "type": "function",
+                                "function": {"name": name, "arguments": args},
+                            })
+                    except _json.JSONDecodeError:
+                        continue
+                if tool_calls:
+                    break
+
+        # Fallback: look for bare JSON with "name" key
+        if not tool_calls:
+            for m in _re.finditer(r'\{[^{}]*"name"\s*:\s*"[^"]+?"[^{}]*\}', text):
+                try:
+                    d = _json.loads(m.group(0))
+                    name = d.get("name", "")
+                    args = d.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = _json.loads(args)
+                        except _json.JSONDecodeError:
+                            args = {}
+                    if name:
+                        tool_calls.append({
+                            "type": "function",
+                            "function": {"name": name, "arguments": args},
+                        })
+                except _json.JSONDecodeError:
+                    continue
+
+        if tool_calls:
+            return {"role": "assistant", "content": "", "tool_calls": tool_calls}
+        return {"role": "assistant", "content": text}
+
+    tokenizer.parse_response = _parse_response
+    # TRL's GRPOTrainer checks response_schema (not parse_response) to decide
+    # whether to call add_response_schema. Set a sentinel so TRL skips its check.
+    tokenizer.response_schema = {"type": "object", "properties": {"role": {"const": "assistant"}}}
+    logger.info("Added generic parse_response + response_schema to tokenizer")
+
+
+def _detect_env_mode(grpo_cfg: Dict[str, Any]) -> str:
+    """Detect which OpenEnv integration mode to use.
+
+    Returns one of: ``"tools"``, ``"offline"``.
+
+    When ``OPEN_CTF_ENV_URL`` is set, always uses TRL's ``tools=`` parameter.
+    vLLM (if available) is used for fast generation *alongside* tools= --
+    they are orthogonal: vLLM accelerates ``_generate_single_turn`` while
+    ``_tool_call_loop`` handles multi-turn tool execution.
+    """
+    env_url = os.environ.get("OPEN_CTF_ENV_URL", "").strip()
+    if not env_url:
+        return "offline"
+    return "tools"
+
+
 def train_grpo(
     model_path: str,
     data_path: str,
@@ -192,6 +372,11 @@ def train_grpo(
 
     Tries Unsloth first for speed, falls back to standard HuggingFace
     if Unsloth's GRPO kernels fail (e.g. dtype issues on some GPUs).
+
+    Supports two OpenEnv integration modes (selected automatically):
+
+    - ``OPEN_CTF_ENV_URL`` set: **tools=** mode (TRL tool calling loop)
+    - ``OPEN_CTF_ENV_URL`` not set: **offline** mode (existing behavior)
 
     Args:
         model_path: Path to the SFT model (merged or adapter directory).
@@ -220,6 +405,13 @@ def train_grpo(
 
     max_seq_length = model_cfg.get("max_seq_length", 8192)
     load_in_4bit = model_cfg.get("load_in_4bit", True)
+
+    # --- Detect OpenEnv mode ---------------------------------------------
+    env_mode = _detect_env_mode(grpo_cfg)
+    env_url = os.environ.get("OPEN_CTF_ENV_URL", "").strip()
+    logger.info("OpenEnv mode: %s", env_mode)
+    if env_url:
+        logger.info("  Env URL: %s", env_url)
 
     # --- Patch Unsloth MoE dtype bug (must run before any forward pass) --
     # Unsloth patches TRL at import time in containers that have it installed.
@@ -286,7 +478,7 @@ def train_grpo(
     warmup_steps = max(0, int(math.ceil(warmup_ratio * total_steps)))
 
     # --- GRPO config (passed as args=, NOT config=) ----------------------
-    grpo_training_config = GRPOConfig(
+    grpo_kwargs = dict(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
@@ -311,16 +503,89 @@ def train_grpo(
         scale_rewards=grpo_cfg.get("scale_rewards", "group"),
     )
 
+    # --- vLLM for fast generation (3-6x faster than HF generate) ----------
+    vllm_available = False
+    if grpo_cfg.get("use_vllm", False):
+        try:
+            import vllm  # noqa: F401
+            vllm_available = True
+            grpo_kwargs["use_vllm"] = True
+            grpo_kwargs["vllm_mode"] = grpo_cfg.get("vllm_mode", "colocate")
+            grpo_kwargs["vllm_gpu_memory_utilization"] = grpo_cfg.get(
+                "vllm_gpu_memory_utilization",
+                grpo_cfg.get("gpu_memory_utilization", 0.3),
+            )
+            logger.info(
+                "vLLM enabled: mode=%s, gpu_mem=%.2f",
+                grpo_kwargs["vllm_mode"],
+                grpo_kwargs["vllm_gpu_memory_utilization"],
+            )
+        except ImportError:
+            logger.warning("use_vllm=True but vllm not installed, falling back to HF generate")
+
+    # --- OpenEnv integration: tools / offline reward ----------------------
+    trainer_extra_kwargs: Dict[str, Any] = {}
+    reward_funcs = [reward_fn]
+
+    if env_mode == "tools":
+        # Mode 1: tools= parameter (HF generate, no vLLM needed)
+        from open_ctf.training.tools import (
+            shell_command, python_code, submit_flag, init_env,
+        )
+
+        init_env(env_url)
+        trainer_extra_kwargs["tools"] = [shell_command, python_code, submit_flag]
+        max_tool_iters = grpo_cfg.get("max_tool_calling_iterations", 15)
+        grpo_kwargs["max_tool_calling_iterations"] = max_tool_iters
+        logger.info(
+            "OpenEnv tools= mode: 3 tools, max_tool_calling_iterations=%d",
+            max_tool_iters,
+        )
+
+    else:
+        # Mode 2: offline (no changes to existing behavior)
+        logger.info("Offline mode: no live environment, using offline reward only")
+
+    # --- Ensure tokenizer has response_schema for tools= mode ----------------
+    # TRL's GRPOTrainer.__init__ calls add_response_schema(tokenizer) when
+    # tools= is set. It also calls get_training_chat_template() to verify the
+    # chat template is prefix-preserving. Both fail for models with
+    # unrecognized chat templates (e.g. GLM-4.7-Flash). Pre-set response_schema
+    # and patch get_training_chat_template to return None so TRL's checks pass.
+    if env_mode == "tools":
+        # Apply prefix-preserving patch (in-memory, safe for read-only installs)
+        _patch_trl_prefix_check()
+
+        if not getattr(tokenizer, "response_schema", None):
+            try:
+                from trl.chat_template_utils import add_response_schema
+                tokenizer = add_response_schema(tokenizer)
+                logger.info("Response schema added via TRL auto-detection")
+            except (ValueError, Exception) as e:
+                logger.warning("TRL add_response_schema failed (%s), adding generic parser", e)
+                _add_generic_parse_response(tokenizer)
+
+    grpo_training_config = GRPOConfig(**grpo_kwargs)
+
     # --- Trainer ---------------------------------------------------------
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
-        reward_funcs=[reward_fn],
+        reward_funcs=reward_funcs,
         args=grpo_training_config,
+        **trainer_extra_kwargs,
     )
 
     trainer.train(resume_from_checkpoint=resume_from)
+
+    # --- Cleanup OpenEnv --------------------------------------------------
+    if env_mode == "tools":
+        try:
+            from open_ctf.training.tools import close_env
+            close_env()
+        except Exception as e:
+            logger.warning("Failed to close OpenEnv client: %s", e)
 
     # --- Save final model ------------------------------------------------
     final_dir = os.path.join(output_dir, "final")

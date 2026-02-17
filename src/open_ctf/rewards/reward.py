@@ -26,6 +26,9 @@ Design principles:
     but the flag is wrong. Catches false submissions without regex.
 
 Noise (+-0.05) is added to every reward to guarantee variance for GRPO gradients.
+
+Also provides ``env_reward_fn`` for use with TRL's OpenEnv ``tools=`` mode,
+where the environment provides rewards via ``**kwargs``.
 """
 
 import json
@@ -498,3 +501,35 @@ class CTFReward:
                     tool_calls.append({"name": name, "arguments": args or ""})
             return "\n".join(text_parts), tool_calls
         return str(completion), []
+
+
+# ---------------------------------------------------------------------------
+# OpenEnv environment reward function
+# ---------------------------------------------------------------------------
+
+
+def env_reward_fn(completions: List[Any], **kwargs: Any) -> List[float]:
+    """Extract environment rewards passed via ``**kwargs`` from a rollout.
+
+    When using TRL's ``tools=`` mode, the environment
+    reward is injected into kwargs by the rollout function.  This function
+    simply extracts and returns it.
+
+    Designed to be passed to ``GRPOTrainer(reward_funcs=[env_reward_fn])``.
+
+    Args:
+        completions: List of completions (used only for batch size).
+        **kwargs: Must contain ``env_reward`` (list of floats) when the
+            environment is active. Falls back to 0.0 per sample when
+            absent (offline mode).
+
+    Returns:
+        List of float reward values, one per completion.
+    """
+    rewards = kwargs.get("env_reward")
+    if rewards is not None:
+        return [float(r) for r in rewards]
+    return [0.0 for _ in completions]
+
+
+env_reward_fn.__name__ = "env_reward"

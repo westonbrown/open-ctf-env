@@ -50,14 +50,6 @@ open-ctf-validate
 
 This checks data format, reward functions, training scripts, tool registry, and model formatters without requiring a GPU.
 
-## Run the Demo
-
-```bash
-./scripts/demo/run_demo.sh
-```
-
-This starts a challenge, runs the agent, and shows results in one command.
-
 ## Common Workflows
 
 ### Run the Agent

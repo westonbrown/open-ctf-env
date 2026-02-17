@@ -49,15 +49,24 @@ grpo:
   # Previous config (num_gen=2, max_compl=512) used only ~9GB of 48GB
   # available — massive underutilization. All completions clipped at 512
   # (clipped_ratio=1.0), zero learning signal.
-  num_generations: 4
-  max_completion_length: 4096
+  num_generations: 2
+  # Must be large enough to hold multi-turn tool calling output.
+  # Previous 1024 caused tensor mismatch (completions were 1675 tokens).
+  # 2048 = safe compromise (doesn't OOM like 4096 did).
+  max_completion_length: 2048
   max_grad_norm: 0.1
   epsilon_high: 0.28
   weight_decay: 0.1
   scale_rewards: "batch"
-  # gpu_memory_utilization: Only used by Unsloth vLLM fast_inference path.
-  # Irrelevant when running with OPEN_CTF_NO_UNSLOTH=1 (HF generate).
-  # For Unsloth: model ~60GB, so 0.3 × 120GB = 36GB for KV cache is safe.
+  # vLLM for fast generation (3-6x faster than HF generate).
+  # TRL's native integration: model loaded once, shared between
+  # vLLM (generation) and trainer (backward pass). colocate mode
+  # required for single-GPU — no double model loading.
+  # vLLM: GLM-4.7-Flash (Glm4MoeLiteForCausalLM) not yet supported in
+  # vLLM 0.14.2 (scitrera/dgx-spark-vllm). Supported: Glm4MoeForCausalLM.
+  # Needs vLLM nightly. For now, HF generate works with prefix-preserving
+  # patch in open-ctf-grpo:v2 Dockerfile.
+  use_vllm: false
   gpu_memory_utilization: 0.3
 
 output:

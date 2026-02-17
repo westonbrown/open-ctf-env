@@ -98,12 +98,6 @@ open-ctf-train sft \
     --output outputs/sft
 ```
 
-### Full Pipeline
-
-```bash
-bash scripts/launch_training.sh --sft-only
-```
-
 ### Configuration
 
 Edit `src/open_ctf/configs/training.yaml`:
@@ -208,10 +202,11 @@ open-ctf-train merge \
 ## Full Pipeline (SFT + GRPO + Merge)
 
 ```bash
-bash scripts/launch_training.sh
+# Run each stage via CLI
+open-ctf-train sft --model unsloth/GLM-4.7-Flash --data data/sft.jsonl --output outputs/sft
+open-ctf-train merge --adapter outputs/sft --base-model unsloth/GLM-4.7-Flash --output outputs/merged
+open-ctf-train grpo --model outputs/merged --data data/grpo.jsonl --output outputs/grpo
 ```
-
-This runs SFT, then GRPO, then merges the final adapter.
 
 ## Docker Training
 

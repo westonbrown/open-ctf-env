@@ -204,12 +204,6 @@ def main() -> None:
     else:
         _fail("training.yaml: Not found", errors)
 
-    launch_script = OCE_ROOT / "scripts" / "launch_training.sh"
-    if launch_script.exists():
-        _ok(f"scripts/launch_training.sh: Found ({launch_script.stat().st_size} bytes)")
-    else:
-        _warn("scripts/launch_training.sh: Not found", warnings)
-
     # -------------------------------------------------------------------
     # 4. Tool registry
     # -------------------------------------------------------------------

@@ -1,13 +1,13 @@
-# Open CTF Training Configuration
-# ================================
+# Open CTF Training Configuration (Cloud H100/H200)
+# ==================================================
 # Used by: open-ctf-train (src/open_ctf/cli/train.py)
+# For DGX Spark (GB10): use training_dgx.yaml instead.
 
 model:
   name: "unsloth/GLM-4.7-Flash"
-  # Reduced from 8192 to 4096 for GB10 memory budget (~60GB model + training overhead)
   max_seq_length: 4096
-  # GLM-4.7-Flash is MoE - 4-bit QLoRA NOT supported for MoE models.
-  # Use BF16 LoRA (~60GB VRAM). Set to true only for dense models.
+  # GLM-4.7-Flash is MoE — 4-bit QLoRA not supported for MoE models.
+  # Use BF16 LoRA. Set to true only for dense models (e.g. Devstral).
   load_in_4bit: false
 
 lora:
@@ -27,7 +27,6 @@ lora:
 
 sft:
   epochs: 3
-  # Reduced from 2 to 1 for GB10 memory budget
   batch_size: 1
   gradient_accumulation_steps: 16
   learning_rate: 2.0e-4
@@ -52,11 +51,14 @@ grpo:
   max_grad_norm: 0.1
   epsilon_high: 0.28
   weight_decay: 0.1
-  # "batch" uses batch-level std with group-level mean — more robust than "group"
   scale_rewards: "batch"
-  # gpu_memory_utilization for Unsloth vLLM fast inference.
-  # Cloud (H200): 0.6.  DGX Spark (GB10): 0.3 (model uses ~60GB of 120GB).
+  # vLLM for fast generation (3-6x faster than HF generate).
+  # Requires model architecture supported by vLLM.
+  use_vllm: true
+  vllm_mode: colocate
   gpu_memory_utilization: 0.6
+  # OpenEnv online training: max tool-calling iterations per generation.
+  max_tool_calling_iterations: 15
 
 output:
   save_steps: 50
