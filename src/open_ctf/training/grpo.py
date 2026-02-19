@@ -528,17 +528,24 @@ def train_grpo(
     reward_funcs = [reward_fn]
 
     if env_mode == "tools":
-        # Mode 1: tools= parameter (HF generate, no vLLM needed)
-        from open_ctf.training.tools import (
-            shell_command, python_code, submit_flag, init_env,
-        )
+        # Mode 1: tools= parameter with full BoxPwnr tool set
+        from open_ctf.training.tools import get_all_tools, get_core_tools, init_env
 
         init_env(env_url)
-        trainer_extra_kwargs["tools"] = [shell_command, python_code, submit_flag]
+
+        # Use full tool set by default, or core-only if configured
+        use_core_only = grpo_cfg.get("core_tools_only", False)
+        if use_core_only:
+            tools = get_core_tools()
+        else:
+            tools = get_all_tools()
+
+        trainer_extra_kwargs["tools"] = tools
         max_tool_iters = grpo_cfg.get("max_tool_calling_iterations", 15)
         grpo_kwargs["max_tool_calling_iterations"] = max_tool_iters
         logger.info(
-            "OpenEnv tools= mode: 3 tools, max_tool_calling_iterations=%d",
+            "OpenEnv tools= mode: %d tools, max_tool_calling_iterations=%d",
+            len(tools),
             max_tool_iters,
         )
 

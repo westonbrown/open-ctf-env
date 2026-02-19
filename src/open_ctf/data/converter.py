@@ -7,8 +7,11 @@ into a unified OpenAI-compatible training format, preserving ALL native tool nam
 Supported BoxPwnr tools (preserved as-is):
     shell_command, exec_command, write_stdin, python_code, flag_found,
     read_file, grep, file_search, apply_patch, web_search,
-    tmux_send_and_read, tmux_wait_and_read, tmux_read_output, tmux_cancel_command,
     list_sessions, close_session, execute_command
+
+Legacy tmux tools are automatically mapped to PTY equivalents:
+    tmux_send_and_read → write_stdin, tmux_read_output → write_stdin,
+    tmux_wait_and_read → write_stdin, tmux_cancel_command → close_session
 """
 
 from __future__ import annotations
@@ -60,14 +63,48 @@ KNOWN_TOOLS = frozenset({
     "file_search",
     "apply_patch",
     "web_search",
-    "tmux_send_and_read",
-    "tmux_wait_and_read",
-    "tmux_read_output",
-    "tmux_cancel_command",
     "list_sessions",
     "close_session",
     "execute_command",
 })
+
+# Map known corrupt/alias tool names to canonical BoxPwnr names.
+# None = drop the tool call entirely (not a real tool).
+TOOL_NAME_ALIASES: dict[str, str | None] = {
+    # Corrupt / misspelled names
+    "Bash": "shell_command",
+    "bash": "shell_command",
+    "shell_code": "shell_command",
+    "write_kdin": "write_stdin",
+    "ls_files": "file_search",
+    "write_file": "apply_patch",
+    "TodoWrite": None,  # Claude Code artifact, not a BoxPwnr tool
+    # Legacy tmux tools → PTY equivalents
+    "tmux_send_and_read": "write_stdin",
+    "tmux_read_output": "write_stdin",
+    "tmux_wait_and_read": "write_stdin",
+    "tmux_cancel_command": "close_session",
+}
+
+
+def normalize_tool_name(name: str) -> str | None:
+    """Normalize a tool name to its canonical BoxPwnr form.
+
+    Returns:
+        Canonical name, or None if the tool should be dropped.
+    """
+    # Strip tokenization artifacts like <|channel|>json suffix
+    cleaned = re.sub(r"<\|[^|]+\|>.*$", "", name)
+    if cleaned in KNOWN_TOOLS:
+        return cleaned
+    if cleaned in TOOL_NAME_ALIASES:
+        return TOOL_NAME_ALIASES[cleaned]
+    if name in TOOL_NAME_ALIASES:
+        return TOOL_NAME_ALIASES[name]
+    if name in KNOWN_TOOLS:
+        return name
+    logger.warning("Unknown tool name '%s' — passing through unchanged", name)
+    return name
 
 # Regex for <COMMAND ...>...</COMMAND> blocks (chat-command format)
 _COMMAND_RE = re.compile(
@@ -274,15 +311,21 @@ def _convert_tool_calling_messages(messages: list[dict]) -> list[dict]:
                 new_msg["reasoning_content"] = reasoning
             new_msg["content"] = text if text else ""
 
-            # Preserve tool calls as-is (lossless)
+            # Preserve tool calls with name normalization
             if "tool_calls" in m and m["tool_calls"]:
                 new_msg["tool_calls"] = []
                 for tc in m["tool_calls"]:
+                    raw_name = tc["function"]["name"]
+                    canonical = normalize_tool_name(raw_name)
+                    if canonical is None:
+                        # Tool should be dropped (e.g. TodoWrite)
+                        logger.info("Dropping non-BoxPwnr tool call: %s", raw_name)
+                        continue
                     new_tc = {
                         "id": tc.get("id", f"call_{uuid.uuid4().hex[:12]}"),
                         "type": "function",
                         "function": {
-                            "name": tc["function"]["name"],
+                            "name": canonical,
                             "arguments": tc["function"]["arguments"],
                         },
                     }
@@ -299,20 +342,27 @@ def _convert_tool_calling_messages(messages: list[dict]) -> list[dict]:
             converted.append(new_msg)
 
         elif role == "tool":
+            # Resolve tool name (from message or look back)
+            if "name" in m:
+                resolved_name = m["name"]
+            else:
+                resolved_name = _find_tool_name(
+                    converted, m.get("tool_call_id", "")
+                )
+            # Normalize the tool response name too
+            canonical_name = normalize_tool_name(resolved_name)
+            if canonical_name is None:
+                # Skip tool responses for dropped tools
+                logger.info("Dropping tool response for non-BoxPwnr tool: %s", resolved_name)
+                continue
+
             tool_msg: dict[str, Any] = {
                 "role": "tool",
                 "content": m.get("content", ""),
+                "name": canonical_name,
             }
             if "tool_call_id" in m:
                 tool_msg["tool_call_id"] = m["tool_call_id"]
-            # Add name field (match from preceding assistant tool_call)
-            if "name" in m:
-                tool_msg["name"] = m["name"]
-            else:
-                # Look back to find the matching tool_call name
-                tool_msg["name"] = _find_tool_name(
-                    converted, m.get("tool_call_id", "")
-                )
             converted.append(tool_msg)
 
     return converted

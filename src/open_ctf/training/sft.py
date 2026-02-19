@@ -223,6 +223,32 @@ def train_sft(
                 eval_dataset = eval_dataset.remove_columns(drop)
             logger.info("Dropped columns from %s dataset: %s", ds_name, drop)
 
+    # --- Tool schemas for chat template ---------------------------------
+    # Inject formal JSON tool schemas into the chat template so the model
+    # learns native tool-call format (parameter names, types, descriptions)
+    # during SFT — not just the textual description in the system prompt.
+    # This matches what TRL's GRPOTrainer injects during GRPO (tools= param).
+    from open_ctf.training.tools import get_all_tools
+
+    _tool_fns = get_all_tools()  # Safe without init_env(): only metadata used
+    tools_for_template = None
+    try:
+        _test_msgs = [{"role": "user", "content": "test"}]
+        tokenizer.apply_chat_template(
+            _test_msgs, tools=_tool_fns, tokenize=False,
+        )
+        tools_for_template = _tool_fns
+        logger.info(
+            "Chat template supports tools= (%d tool schemas will be injected)",
+            len(_tool_fns),
+        )
+    except Exception as e:
+        logger.warning(
+            "Chat template doesn't support tools= (%s), "
+            "falling back to text-only tool descriptions",
+            e,
+        )
+
     # Build formatting_func to normalize messages at training time.
     # We do NOT use dataset.map() because _normalize_messages converts
     # tool_call arguments from JSON strings to dicts, and PyArrow can't
@@ -253,6 +279,7 @@ def train_sft(
             normalized = _normalize_messages(messages)
             text = tokenizer.apply_chat_template(
                 normalized,
+                tools=tools_for_template,
                 tokenize=False,
                 add_generation_prompt=False,
             )
