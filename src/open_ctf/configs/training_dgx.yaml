@@ -24,8 +24,8 @@ lora:
 
 sft:
   epochs: 3
-  batch_size: 1
-  gradient_accumulation_steps: 16
+  batch_size: 2
+  gradient_accumulation_steps: 8
   learning_rate: 2.0e-4
   warmup_ratio: 0.03
   weight_decay: 0.01
@@ -42,17 +42,14 @@ grpo:
   loss_type: dapo
   # Memory budget (GB10 unified 120GB):
   #   Model weights: ~60GB  |  Framework/OS: ~10GB  |  Available: ~48GB
-  #   KV cache (4 gen × 4096 tokens): ~1.8GB
-  #   Training (gradients, optimizer, activations): ~15GB
-  #   Headroom: ~32GB
+  #   KV cache (6 gen × 2048 tokens): ~2.6GB
+  #   Training (gradients, optimizer, activations): ~22GB
+  #   Headroom: ~23GB
   #
-  # Previous config (num_gen=2, max_compl=512) used only ~9GB of 48GB
-  # available — massive underutilization. All completions clipped at 512
-  # (clipped_ratio=1.0), zero learning signal.
-  num_generations: 2
-  # Must be large enough to hold multi-turn tool calling output.
-  # Previous 1024 caused tensor mismatch (completions were 1675 tokens).
-  # 2048 = safe compromise (doesn't OOM like 4096 did).
+  # Bumped generations to 6 to properly utilize GRPO advantage estimation
+  # while staying well within the ~48GB available training memory bound.
+  num_generations: 6
+  # 2048 is safe for multi-turn length while allowing 6 generations.
   max_completion_length: 2048
   max_grad_norm: 0.1
   epsilon_high: 0.28

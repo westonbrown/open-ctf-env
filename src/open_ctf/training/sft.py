@@ -93,6 +93,10 @@ def _load_model_unsloth(model_id, max_seq_length, load_in_4bit, lora_cfg):
         load_in_4bit=load_in_4bit,
     )
 
+    # If PyTorch inductor is disabled, fallback to standard gradient checkpointing
+    # to avoid the Triron FlexAttention OOM bug on Blackwell GB10
+    grad_ckpt = "unsloth" if os.environ.get("TORCH_INDUCTOR_DISABLE", "0") == "0" else True
+
     model = FastLanguageModel.get_peft_model(
         model,
         r=lora_cfg.get("r", 64),
@@ -103,8 +107,11 @@ def _load_model_unsloth(model_id, max_seq_length, load_in_4bit, lora_cfg):
             "gate_proj", "up_proj", "down_proj",
         ]),
         use_rslora=lora_cfg.get("use_rslora", False),
-        use_gradient_checkpointing="unsloth",
+        use_gradient_checkpointing=grad_ckpt,
     )
+    # Prevent fix_untrained_tokens bug on MoE / Meta tensors in Unsloth
+    if hasattr(model, "config"):
+        model.config.fix_untrained_tokens = False
     return model, tokenizer
 
 
@@ -249,42 +256,22 @@ def train_sft(
             e,
         )
 
-    # Build formatting_func to normalize messages at training time.
-    # We do NOT use dataset.map() because _normalize_messages converts
-    # tool_call arguments from JSON strings to dicts, and PyArrow can't
-    # handle the resulting mixed types across rows (e.g., timeout: 300 vs "300").
-    # Instead, normalize on-the-fly via formatting_func which returns
-    # tokenizer.apply_chat_template output directly.
-    #
-    # TRL calls formatting_func in two ways:
-    #   1. Test call: formatting_func(single_example) where single_example is
-    #      a dict like {"messages": [list of message dicts]}
-    #   2. Batch call: formatting_func(batch) where batch["messages"] is
-    #      a list of message lists
-    def _formatting_func(examples):
-        """Format messages with normalization applied at template time."""
-        raw_messages = examples["messages"]
+    # Manually map the formatting func over the dataset to create the "text" column
+    # and remove the "messages" column so TRL 0.28 does not attempt to
+    # re-apply the chat template directly.
+    def _map_messages_to_text(example):
+        normalized = _normalize_messages(example["messages"])
+        text = tokenizer.apply_chat_template(
+            normalized,
+            tools=tools_for_template,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        return {"text": text}
 
-        # Detect single vs batch: single example has messages as a list of dicts,
-        # batch has messages as a list of lists of dicts.
-        if raw_messages and isinstance(raw_messages[0], dict):
-            # Single example: raw_messages IS the message list
-            messages_list = [raw_messages]
-        else:
-            # Batch: raw_messages is a list of message lists
-            messages_list = raw_messages
-
-        texts = []
-        for messages in messages_list:
-            normalized = _normalize_messages(messages)
-            text = tokenizer.apply_chat_template(
-                normalized,
-                tools=tools_for_template,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            texts.append(text)
-        return texts
+    dataset = dataset.map(_map_messages_to_text, remove_columns=["messages"])
+    if eval_dataset:
+        eval_dataset = eval_dataset.map(_map_messages_to_text, remove_columns=["messages"])
 
     # --- Determine wandb availability -----------------------------------
     from open_ctf.training import check_wandb_available
@@ -306,8 +293,9 @@ def train_sft(
     # Packing is an Unsloth optimization - disable if using HF fallback
     enable_packing = sft_cfg.get("packing", True) and use_unsloth
 
-    # When using formatting_func, SFTTrainer expects a "text" dataset_text_field
-    # or we must set dataset_text_field=None and use formatting_func directly.
+    # Unsloth dynamically replaces SFTConfig.__init__ and defaults
+    # eos_token to "<EOS_TOKEN>" which doesn't exist in GLM-4.7-Flash
+    # vocabulary. Override explicitly with the tokenizer's real EOS token.
     training_args = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
@@ -326,22 +314,20 @@ def train_sft(
         gradient_checkpointing=True,
         eval_strategy="steps" if eval_dataset else "no",
         eval_steps=output_cfg.get("save_steps", 50) if eval_dataset else None,
-        # SFT-specific (moved from SFTTrainer init to SFTConfig in TRL 0.26)
+        dataset_text_field="text",
+        eos_token=tokenizer.eos_token,
         max_length=max_seq_length,
         packing=enable_packing,
     )
 
     # --- Trainer ---------------------------------------------------------
     # Use formatting_func to normalize messages on-the-fly during training.
-    # This avoids PyArrow serialization issues from mixed types in tool_call
-    # arguments (e.g., timeout: 300 vs "300" across different rows).
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
         eval_dataset=eval_dataset,
         args=training_args,
-        formatting_func=_formatting_func,
     )
 
     trainer.train(resume_from_checkpoint=resume_from)
