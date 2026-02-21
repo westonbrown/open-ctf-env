@@ -60,6 +60,16 @@ grpo:
   # OpenEnv online training: max tool-calling iterations per generation.
   max_tool_calling_iterations: 15
 
+reward:
+  # CTFReward weights (must sum to 1.0).
+  # Uncomment and adjust to override defaults from reward.py.
+  # flag_weight: 0.20
+  # efficiency_weight: 0.25
+  # progression_weight: 0.15
+  # format_weight: 0.20
+  # exploration_weight: 0.10
+  # uniqueness_weight: 0.10
+
 output:
   save_steps: 50
   logging_steps: 1

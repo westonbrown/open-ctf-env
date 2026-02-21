@@ -1,12 +1,12 @@
-"""Training modules for SFT and GRPO stages.
+"""Training modules for SFT, GRPO, and GEPA stages.
 
-Imports are lazy to avoid requiring all dependencies (e.g. unsloth)
+Imports are lazy to avoid requiring all dependencies (e.g. unsloth, dspy)
 when only one training stage is used.
 """
 
 import logging
 
-__all__ = ["train_sft", "train_grpo", "check_wandb_available"]
+__all__ = ["train_sft", "train_grpo", "OnlineGRPOTrainer", "run_gepa", "check_wandb_available"]
 
 logger = logging.getLogger(__name__)
 
@@ -36,4 +36,10 @@ def __getattr__(name):
     if name == "train_grpo":
         from .grpo import train_grpo
         return train_grpo
+    if name == "OnlineGRPOTrainer":
+        from .grpo import OnlineGRPOTrainer
+        return OnlineGRPOTrainer
+    if name == "run_gepa":
+        from .gepa import run_gepa
+        return run_gepa
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

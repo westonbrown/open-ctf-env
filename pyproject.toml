@@ -10,12 +10,12 @@ authors = [
 ]
 
 dependencies = [
-    "transformers>=5.0.0",
-    "trl>=0.22.0,<=0.24.0",
-    "datasets>=2.0.0",
+    "transformers>=5.0.0,!=5.1.0",
+    "trl>=0.28.0,<0.29.0",
+    "datasets>=3.0.0",
     "peft>=0.14.0",
-    "accelerate>=1.0.0",
-    "bitsandbytes>=0.44.0",
+    "accelerate>=1.4.0",
+    "bitsandbytes>=0.48.0",
     "gymnasium",
     "pydantic>=2.0.0",
     "docker",
@@ -27,6 +27,7 @@ dependencies = [
 [project.optional-dependencies]
 train = ["torch>=2.4.0", "unsloth>=2026.2.1", "wandb"]
 agent = ["litellm"]
+gepa = ["dspy-ai>=3.1.0", "gepa>=0.0.26"]
 dev = ["pytest", "ruff"]
 rl = ["colorama", "ray"]
 

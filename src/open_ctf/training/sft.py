@@ -15,8 +15,9 @@ FlashAttention 2. On Blackwell GB10 (sm_121), PyTorch SDPA with cuDNN 9.13
 is faster than FlashAttention 2.
 
 MoE model notes (GLM-4.7-Flash):
-  - 4-bit QLoRA NOT supported for MoE models (BitsAndBytes limitation)
-  - Use BF16 LoRA instead (~60GB VRAM for GLM-4.7-Flash)
+  - Standard BnB load_in_4bit only saves ~3 GB for MoE models (90% of params
+    are 3D expert tensors that BnB skips).  Post-load expert quantization
+    via quantize.py brings model from ~58 GB to ~17 GB.
   - On GB10 (Blackwell sm_121): set UNSLOTH_MOE_BACKEND=grouped_mm to avoid
     Triton shared memory OOM (99KB limit vs 104KB+ required by MoE kernels)
   - Router layers NOT targeted by LoRA (per Unsloth recommendation)
@@ -52,7 +53,7 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
         msg = dict(msg)  # shallow copy
         if "tool_calls" in msg and msg["tool_calls"]:
             tool_calls = []
-            for tc in msg["tool_calls"]:
+            for tc in list(msg["tool_calls"]):  # copy list to avoid mutating original
                 tc = dict(tc)
                 if "function" in tc:
                     func = dict(tc["function"])
@@ -69,21 +70,10 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
     return normalized
 
 
-def _set_moe_backend():
-    """Set UNSLOTH_MOE_BACKEND for GB10 compatibility if not already set.
-
-    On Blackwell GB10 (sm_121), Triton MoE kernels need >99KB shared memory
-    per thread block, exceeding the 99KB hardware limit. The 'grouped_mm'
-    backend uses torch._grouped_mm instead of Triton kernels, avoiding the OOM.
-    """
-    if "UNSLOTH_MOE_BACKEND" not in os.environ:
-        os.environ["UNSLOTH_MOE_BACKEND"] = "grouped_mm"
-        logger.info("Set UNSLOTH_MOE_BACKEND=grouped_mm (GB10 safe default)")
-
-
 def _load_model_unsloth(model_id, max_seq_length, load_in_4bit, lora_cfg):
     """Load model via Unsloth FastLanguageModel (faster, optimized kernels)."""
-    _set_moe_backend()
+    from open_ctf.training.quantize import set_moe_backend
+    set_moe_backend()
     from unsloth import FastLanguageModel
 
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -116,16 +106,25 @@ def _load_model_unsloth(model_id, max_seq_length, load_in_4bit, lora_cfg):
 
 
 def _load_model_hf(model_id, max_seq_length, load_in_4bit, lora_cfg):
-    """Load model via standard HuggingFace transformers + PEFT (slower, no Unsloth kernels)."""
+    """Load model via standard HuggingFace transformers + PEFT (slower, no Unsloth kernels).
+
+    For MoE models with load_in_4bit=True, applies post-load expert
+    quantization (BnB only quantizes nn.Linear; 3D expert tensors need
+    separate quantization via quantize.py).
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model
+
+    from open_ctf.training.quantize import (
+        find_moe_expert_param_names,
+        quantize_moe_expert_params,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     kwargs = {
         "torch_dtype": torch.bfloat16,
         "trust_remote_code": True,
-        "attn_implementation": "sdpa",
     }
     if load_in_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -137,21 +136,53 @@ def _load_model_hf(model_id, max_seq_length, load_in_4bit, lora_cfg):
 
     model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
 
+    # --- Post-load 4-bit quantization for MoE 3D expert tensors -----------
+    # BnB only quantizes nn.Linear (2D). MoE expert 3D nn.Parameter tensors
+    # are left in BF16 (~52 GB for GLM-4.7-Flash).  Quantize them post-load.
+    moe_experts_quantized = False
     if load_in_4bit:
+        expert_names = find_moe_expert_param_names(model)
+        if expert_names:
+            moe_experts_quantized = quantize_moe_expert_params(model)
+
+    # --- Prepare for k-bit training ----------------------------------------
+    # MoE models with post-load expert quantization skip
+    # prepare_model_for_kbit_training (fp32 cast causes OOM ~115 GB peak).
+    # Instead, manually enable input_require_grads.
+    if load_in_4bit and moe_experts_quantized:
+        model.enable_input_require_grads()
+        logger.info(
+            "4-bit MoE: skipped prepare_model_for_kbit_training (OOMs for MoE), "
+            "enabled input_require_grads manually"
+        )
+    elif load_in_4bit:
+        from peft import prepare_model_for_kbit_training
         model = prepare_model_for_kbit_training(model)
 
-    lora_config = LoraConfig(
-        r=lora_cfg.get("r", 64),
-        lora_alpha=lora_cfg.get("alpha", 128),
-        lora_dropout=lora_cfg.get("dropout", 0),
-        target_modules=lora_cfg.get("target_modules", [
+    # --- LoRA configuration ------------------------------------------------
+    lora_kwargs = {
+        "r": lora_cfg.get("r", 64),
+        "lora_alpha": lora_cfg.get("alpha", 128),
+        "lora_dropout": lora_cfg.get("dropout", 0),
+        "target_modules": lora_cfg.get("target_modules", [
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ]),
-        task_type="CAUSAL_LM",
-    )
+        "task_type": "CAUSAL_LM",
+    }
+    # Exclude parametrized (4-bit quantized) expert weights from LoRA
+    if moe_experts_quantized:
+        lora_kwargs["exclude_modules"] = r".*\.parametrizations\..*"
+        logger.info(
+            "MoE 4-bit LoRA: target_modules=%s (attention + shared expert only, "
+            "routed experts quantized but not LoRA'd)",
+            lora_kwargs["target_modules"],
+        )
+
+    lora_config = LoraConfig(**lora_kwargs)
     model = get_peft_model(model, lora_config)
-    model.gradient_checkpointing_enable()
+    # Don't call gradient_checkpointing_enable() here — SFTConfig handles it.
+    # Double-enable can cause issues with MoE models on some hardware.
 
     return model, tokenizer
 
@@ -293,9 +324,6 @@ def train_sft(
     # Packing is an Unsloth optimization - disable if using HF fallback
     enable_packing = sft_cfg.get("packing", True) and use_unsloth
 
-    # Unsloth dynamically replaces SFTConfig.__init__ and defaults
-    # eos_token to "<EOS_TOKEN>" which doesn't exist in GLM-4.7-Flash
-    # vocabulary. Override explicitly with the tokenizer's real EOS token.
     training_args = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
@@ -311,17 +339,24 @@ def train_sft(
         optim="adamw_8bit",
         seed=42,
         report_to=report_to,
-        gradient_checkpointing=True,
+        gradient_checkpointing=sft_cfg.get("gradient_checkpointing", True),
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         eval_strategy="steps" if eval_dataset else "no",
         eval_steps=output_cfg.get("save_steps", 50) if eval_dataset else None,
         dataset_text_field="text",
-        eos_token=tokenizer.eos_token,
         max_length=max_seq_length,
         packing=enable_packing,
+        # Force single-process dataset mapping to avoid pickle errors with
+        # transformers 5.0's ConfigModuleInstance (not pickle-serializable).
+        dataset_num_proc=1,
     )
+    # Unsloth's _backwards_compatible_trainer can re-instantiate SFTConfig and
+    # inject eos_token="<EOS_TOKEN>" which doesn't exist in GLM-4.7-Flash vocab.
+    # We set it here anyway; the Dockerfile also patches TRL's sft_trainer.py
+    # to fall back to tokenizer.eos_token instead of crashing.
+    training_args.eos_token = tokenizer.eos_token
 
     # --- Trainer ---------------------------------------------------------
-    # Use formatting_func to normalize messages on-the-fly during training.
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,

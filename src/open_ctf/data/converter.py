@@ -488,8 +488,11 @@ def _extract_flag(stats: dict[str, Any] | None, messages: list[dict]) -> str | N
         if flag:
             return flag
 
-    # Scan messages for <FLAG>...</FLAG>
+    # Scan assistant messages for <FLAG>...</FLAG>
+    # (skip user/system messages — they contain the template placeholder)
     for m in messages:
+        if m.get("role") != "assistant":
+            continue
         content = m.get("content", "")
         if isinstance(content, list):
             for item in content:

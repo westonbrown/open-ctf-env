@@ -12,6 +12,20 @@ Full BoxPwnr tool set (13 tools, organized by tier):
   Tier 3 — Meta:       flag_found, submit_flag, web_search,
                         list_sessions, close_session
 
+Episode management
+------------------
+TRL's ``_tool_call_loop`` processes all ``num_generations`` completions
+for a prompt against the **same** environment server.  To prevent
+cross-contamination:
+
+1. ``mark_step_begin()`` — called by ``OnlineGRPOTrainer`` at the start of
+   each batch.  Resets the environment and clears episode-done state.
+2. ``_episode_done`` flag — once ``flag_found()`` returns success for
+   *any* generation, subsequent tool calls return an early-exit string
+   instead of hitting the server.  This prevents gen 0's flag submission
+   from corrupting the environment state that gen 1-3 are still using
+   for reconnaissance.
+
 Usage::
 
     from open_ctf.training.tools import get_all_tools, init_env
@@ -19,19 +33,16 @@ Usage::
     init_env("http://localhost:8000")
     tools = get_all_tools()  # returns list of callables for TRL
 
-    trainer = GRPOTrainer(
+    trainer = OnlineGRPOTrainer(
         model=model,
         tools=tools,
         reward_funcs=[reward_fn],
         args=GRPOConfig(max_tool_calling_iterations=15),
     )
-
-The environment client is a module-level singleton initialized by
-``init_env(base_url)``.  Each training step should call ``reset_env()``
-to start a fresh episode.
 """
 
 import logging
+import threading
 from typing import Optional
 
 import requests
@@ -45,6 +56,27 @@ logger = logging.getLogger(__name__)
 _base_url: Optional[str] = None
 _session: Optional[requests.Session] = None
 _episode_id: Optional[str] = None
+
+# Episode lifecycle tracking (managed by OnlineGRPOTrainer).
+# Per-thread state via threading.local() to prevent leaks across
+# generations in multi-threaded GRPO (TRL uses ThreadPoolExecutor).
+_thread_local = threading.local()
+
+
+def _get_episode_done() -> bool:
+    return getattr(_thread_local, "episode_done", False)
+
+
+def _set_episode_done(value: bool) -> None:
+    _thread_local.episode_done = value
+
+
+def _get_step_count() -> int:
+    return getattr(_thread_local, "step_count", 0)
+
+
+def _set_step_count(value: int) -> None:
+    _thread_local.step_count = value
 
 
 def init_env(base_url: str) -> None:
@@ -97,6 +129,28 @@ def close_env() -> None:
     _session = None
     _episode_id = None
     logger.info("OpenEnv client closed")
+
+
+def mark_step_begin(challenge_id: Optional[str] = None) -> None:
+    """Reset environment and clear episode state for a new training step.
+
+    Called by ``OnlineGRPOTrainer`` before each batch's tool-call loop.
+    Ensures all ``num_generations`` completions start against a fresh
+    environment, and clears the done flag so tool calls are routed to the
+    server.
+
+    Args:
+        challenge_id: Optional challenge to load on reset.
+    """
+    _set_episode_done(False)
+    _set_step_count(0)
+    reset_env(challenge_id)
+    logger.debug("Episode reset — step_begin (challenge=%s)", challenge_id)
+
+
+def is_episode_done() -> bool:
+    """Return whether the current episode's flag has been found."""
+    return _get_episode_done()
 
 
 def get_last_step_info() -> dict:
@@ -375,8 +429,22 @@ def close_session(session_id: str) -> str:
 
 
 def _step(tool_name: str, arguments: dict) -> str:
-    """Send a tool call to the OpenEnv server and return the output string."""
+    """Send a tool call to the OpenEnv server and return the output string.
+
+    Episode-aware: once ``flag_found`` succeeds in *any* generation, all
+    further tool calls short-circuit with a done message.  This prevents
+    cross-contamination between generations that share the same server.
+    """
+    # Short-circuit after flag has been submitted successfully.
+    # Other generations' tool calls return early without touching the env.
+    if _get_episode_done():
+        return (
+            "[EPISODE COMPLETE] The flag has already been submitted and "
+            "verified. No further actions are needed."
+        )
+
     _ensure_initialized()
+    _set_step_count(_get_step_count() + 1)
     resp = _post("/step", {"action": {
         "tool_name": tool_name,
         "arguments": arguments,
@@ -384,6 +452,16 @@ def _step(tool_name: str, arguments: dict) -> str:
     obs = resp.get("observation", {})
     stdout = obs.get("stdout", "")
     stderr = obs.get("stderr", "")
+    done = obs.get("done", False) or resp.get("done", False)
+
+    # Detect successful flag submission
+    if done or (tool_name == "flag_found" and "correct" in stdout.lower()):
+        _set_episode_done(True)
+        logger.info(
+            "Episode done after %d steps (flag submitted via %s)",
+            _get_step_count(), tool_name,
+        )
+
     if stderr:
         return f"{stdout}\n[stderr] {stderr}"
     return stdout

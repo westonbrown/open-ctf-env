@@ -3,8 +3,7 @@
 Uses TRL GRPOTrainer with:
   - DAPO loss with asymmetric clipping (epsilon_high=0.28)
   - beta=0.0 (no KL penalty, pure DAPO)
-  - num_generations=8 for better group reward estimation
-  - max_completion_length=4096 for full CTF trajectories
+  - num_generations for group reward estimation
   - BF16 precision (avoids Half/BFloat16 dtype mismatch on Blackwell GB10)
   - reward_funcs=[fn] (list, not bare function)
   - GRPOConfig passed via ``args=`` (not ``config=``)
@@ -14,17 +13,20 @@ Uses Unsloth for model loading when available, falls back to standard
 HuggingFace transformers + PEFT otherwise. The fallback is also used when
 Unsloth's GRPO kernels have dtype issues (e.g. on Blackwell GB10).
 
-Supports two OpenEnv integration modes (selected automatically):
+Supports two training modes (selected automatically):
 
-  **Mode 1 (tools=)**: ``OPEN_CTF_ENV_URL`` is set. Uses TRL's ``tools=``
-  parameter with ``max_tool_calling_iterations``. If ``use_vllm=True`` and
-  vLLM is available, generation is accelerated via vLLM while tool
-  execution still goes through TRL's ``_tool_call_loop``.
+  **Mode 1 — online (tools=)**: ``OPEN_CTF_ENV_URL`` is set. Uses
+  ``OnlineGRPOTrainer`` (subclass of TRL's ``GRPOTrainer``) with TRL's
+  ``tools=`` parameter and ``max_tool_calling_iterations``. The trainer
+  resets the environment before each batch and tracks episode completion
+  so that ``num_generations > 1`` works safely. vLLM colocate mode
+  accelerates generation while the tool-call loop handles multi-turn
+  execution against the live environment.
 
-  **Mode 2 (offline)**: No ``OPEN_CTF_ENV_URL``. Falls back to the
-  existing offline behavior with the provided ``reward_fn``.
+  **Mode 2 — offline**: No ``OPEN_CTF_ENV_URL``. Uses vanilla
+  ``GRPOTrainer`` with the provided ``reward_fn`` for offline scoring.
 
-Compatible with TRL >= 0.26 (processing_class, warmup_steps).
+Compatible with TRL >= 0.28 (tools=, max_tool_calling_iterations).
 """
 
 import logging
@@ -45,24 +47,27 @@ from trl import GRPOConfig, GRPOTrainer
 
 
 def _patch_trl_prefix_check():
-    """Patch TRL's prefix-preserving check to be a no-op at runtime.
+    """Patch TRL's prefix-preserving checks to be lenient at runtime.
 
     GLM-4.7-Flash's chat template is not prefix-preserving (``<think>`` /
-    ``<|observation|>`` tags cause tokenized prefixes to differ). TRL's
-    ``_tool_call_loop`` raises ``ValueError`` at runtime when it detects
-    this.
+    ``<|observation|>`` tags cause tokenized prefixes to differ). TRL checks
+    this in TWO places:
 
-    Instead of patching files on disk (fails on read-only pip installs in
-    cloud containers), we monkey-patch the already-imported module object
-    in memory. Called lazily from ``train_grpo()`` before tools= mode.
+    1. ``GRPOTrainer.__init__`` via ``get_training_chat_template()`` — we
+       patch that function to swallow the ValueError.
+    2. ``GRPOTrainer._tool_call_loop`` at line ~107 — after each tool-call
+       iteration, TRL re-tokenizes the prompt+completion+tool and compares
+       the prompt prefix tokens. If they differ, it raises ValueError.
+       We monkey-patch ``_tool_call_loop`` to turn this into a warning.
+
+    Both patches are applied in-memory (safe for read-only pip installs).
+    Called lazily from ``train_grpo()`` before tools= mode.
     """
     try:
+        import inspect
         import trl.trainer.grpo_trainer as _grpo_mod
 
-        # Find the _tool_call_loop or related method that does the check.
-        # In TRL 0.28+, the prefix check is inside GRPOTrainer.__init__
-        # or _tool_call_loop. We patch get_training_chat_template to
-        # swallow the ValueError instead of propagating it.
+        # --- Patch 1: get_training_chat_template (init-time check) --------
         import trl.chat_template_utils as _chat_utils
 
         _orig = _chat_utils.get_training_chat_template
@@ -79,16 +84,90 @@ def _patch_trl_prefix_check():
 
         _chat_utils.get_training_chat_template = _safe_get_training_chat_template
         _grpo_mod.get_training_chat_template = _safe_get_training_chat_template
-        logger.info("Patched TRL prefix-preserving check (in-memory)")
+
+        # --- Patch 2: _tool_call_loop (runtime prefix comparison) ---------
+        # TRL 0.28 line ~107: raises ValueError if re-tokenized prompt IDs
+        # don't match original prompt_ids. For GLM-4.7-Flash, the
+        # <|observation|> tag causes a ~2 token mismatch. We replace the
+        # ValueError raise with a warning + prompt_ids fixup so the rest
+        # of the tool loop continues normally.
+        _orig_src = inspect.getsource(_grpo_mod.GRPOTrainer._tool_call_loop)
+
+        # Remove the raise ValueError block and replace with a warning +
+        # prompt_ids fixup (update prompt_ids to match re-tokenized prefix).
+        _old_check = (
+            '                if prompt_ids[idx_with_tool] != pct[: len(prompt_ids[idx_with_tool])]:\n'
+            '                    raise ValueError(\n'
+            '                        "The chat template is not prefix-preserving. '
+            'Please update it to use a prefix-preserving "\n'
+            '                        "format."\n'
+            '                    )'
+        )
+        _new_check = (
+            '                if prompt_ids[idx_with_tool] != pct[: len(prompt_ids[idx_with_tool])]:\n'
+            '                    import logging as _log\n'
+            '                    _log.getLogger("open_ctf.training.grpo").warning(\n'
+            '                        "Prefix mismatch in _tool_call_loop (expected for GLM-4.7-Flash). "\n'
+            '                        "Fixing up prompt_ids to match re-tokenized prefix."\n'
+            '                    )\n'
+            '                    # Fix: update prompt_ids to match the re-tokenized prefix\n'
+            '                    prompt_ids[idx_with_tool] = pct[: len(prompt_ids[idx_with_tool])]'
+        )
+
+        if _old_check in _orig_src:
+            _patched_src = _orig_src.replace(_old_check, _new_check)
+            # Compile and replace the method
+            _ns = {}
+            # Need to dedent from class method to function level
+            import textwrap
+            _patched_src = textwrap.dedent(_patched_src)
+            exec(compile(_patched_src, "<prefix-patch>", "exec"), _grpo_mod.__dict__, _ns)
+            _grpo_mod.GRPOTrainer._tool_call_loop = _ns["_tool_call_loop"]
+            logger.info("Patched _tool_call_loop: prefix check replaced with fixup")
+        else:
+            logger.warning(
+                "Could not find prefix check pattern in _tool_call_loop source. "
+                "The check may have changed in this TRL version."
+            )
+
+        # --- Patch 3: _compute_loss tool_mask shape mismatch ------------------
+        # TRL 0.28 bug: when tool calling extends the completion beyond
+        # max_completion_length, tool_mask (actual seq length) doesn't match
+        # completion_mask (padded to max_completion_length). The completion_mask
+        # is a local var in _compute_loss, so we truncate tool_mask to
+        # max_completion_length before the original method runs.
+        _orig_compute_loss = _grpo_mod.GRPOTrainer._compute_loss
+
+        def _patched_compute_loss(self, model, inputs):
+            if "tool_mask" in inputs:
+                tool_mask = inputs["tool_mask"]
+                max_clen = getattr(self.args, "max_completion_length", None)
+                if max_clen and tool_mask.shape[-1] != max_clen:
+                    if tool_mask.shape[-1] > max_clen:
+                        inputs["tool_mask"] = tool_mask[:, :max_clen]
+                    else:
+                        pad = torch.zeros(
+                            tool_mask.shape[0],
+                            max_clen - tool_mask.shape[-1],
+                            dtype=tool_mask.dtype,
+                            device=tool_mask.device,
+                        )
+                        inputs["tool_mask"] = torch.cat([tool_mask, pad], dim=-1)
+            return _orig_compute_loss(self, model, inputs)
+
+        _grpo_mod.GRPOTrainer._compute_loss = _patched_compute_loss
+        logger.info("Patched _compute_loss: tool_mask shape alignment")
+
+        logger.info("Patched TRL prefix-preserving checks (init + runtime)")
     except Exception as e:
         logger.warning("Could not patch TRL prefix check: %s", e)
 
 
+
 def _set_moe_backend():
     """Set UNSLOTH_MOE_BACKEND for GB10 compatibility if not already set."""
-    if "UNSLOTH_MOE_BACKEND" not in os.environ:
-        os.environ["UNSLOTH_MOE_BACKEND"] = "grouped_mm"
-        logger.info("Set UNSLOTH_MOE_BACKEND=grouped_mm (GB10 safe default)")
+    from open_ctf.training.quantize import set_moe_backend
+    set_moe_backend()
 
 
 def _patch_grouped_mm_dtype():
@@ -121,6 +200,95 @@ def _patch_grouped_mm_dtype():
         logger.info("Patched _grouped_mm_with_backward_fix for dtype safety")
     except (ImportError, AttributeError) as e:
         logger.debug("Could not patch grouped_mm (Unsloth not loaded): %s", e)
+
+
+def _patch_vllm_sync_weights_for_parametrized(trainer):
+    """Patch vLLM sync_weights to skip parametrized (4-bit quantized) params.
+
+    After ``replace_parameter_4bit``, MoE expert param names change from
+    ``mlp.experts.gate_up_proj`` to
+    ``mlp.experts.parametrizations.gate_up_proj.original``.
+    vLLM's model doesn't recognize these names, causing KeyError during
+    ``sync_weights()``.
+
+    Since these expert weights are frozen (no LoRA), they never change between
+    training and generation steps — skipping them in sync is safe.
+
+    Approach: replace ``sync_weights`` with a wrapper that reimplements the
+    non-FSDP PEFT branch with parametrized params filtered out. This avoids
+    monkey-patching ``named_parameters`` on the model class.
+    """
+    vllm_gen = getattr(trainer, "vllm_generation", None)
+    if vllm_gen is None:
+        return
+
+    from peft import PeftModel
+
+    def _patched_sync():
+        model = vllm_gen.model
+        accelerator = vllm_gen.accelerator
+
+        # Only handle our specific case: PEFT, no FSDP, no DeepSpeed ZeRO-3,
+        # colocate mode. Fall back to original for anything else.
+        deepspeed_plugin = accelerator.state.deepspeed_plugin
+        zero3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+        if zero3 or vllm_gen.is_fsdp_enabled or vllm_gen.mode != "colocate":
+            logger.warning(
+                "vLLM sync patch: unsupported config (FSDP=%s, ZeRO3=%s, mode=%s), "
+                "falling back to original sync_weights",
+                vllm_gen.is_fsdp_enabled, zero3, vllm_gen.mode,
+            )
+            return _original_sync()
+
+        if not isinstance(model, PeftModel):
+            return _original_sync()
+
+        # Merge LoRA adapters before syncing
+        model.merge_adapter()
+
+        llm_model = (
+            vllm_gen.llm.llm_engine.model_executor.driver_worker
+            .model_runner.model
+        )
+        skipped = 0
+        synced = 0
+        for name, param in model.named_parameters():
+            # Skip parametrized (4-bit quantized) expert weights
+            if "parametrizations" in name:
+                skipped += 1
+                continue
+
+            # Strip PEFT prefix (same logic as TRL's sync_weights)
+            name = name.removeprefix("base_model.model.").replace(
+                ".base_layer", ""
+            )
+            # Skip PEFT-only layers (already merged)
+            if model.prefix in name:
+                continue
+            if "original_module" in name:
+                continue
+            name = vllm_gen._fix_param_name_to_vllm(
+                name, extra_prefixes=["modules_to_save.default."]
+            )
+
+            llm_model.load_weights([(name, param.data)])
+            synced += 1
+
+        # Unmerge adapters for continued training
+        model.unmerge_adapter()
+
+        # Reset vLLM KV cache
+        vllm_gen.llm.reset_prefix_cache()
+
+        logger.debug(
+            "vLLM sync: synced=%d params, skipped=%d parametrized", synced, skipped
+        )
+
+    _original_sync = vllm_gen.sync_weights
+    vllm_gen.sync_weights = _patched_sync
+    logger.info(
+        "Patched vLLM sync_weights: skipping parametrized (4-bit MoE) params"
+    )
 
 
 def _load_model_unsloth(model_path, max_seq_length, load_in_4bit, lora_cfg,
@@ -166,19 +334,47 @@ def _load_model_unsloth(model_path, max_seq_length, load_in_4bit, lora_cfg,
     return model, tokenizer
 
 
-def _load_model_hf(model_path, max_seq_length, load_in_4bit, lora_cfg):
-    """Load model via standard HuggingFace transformers + PEFT."""
+def _find_moe_expert_param_names(model) -> list:
+    """Detect 3D+ nn.Parameter tensors that BnB skips. Delegates to quantize.py."""
+    from open_ctf.training.quantize import find_moe_expert_param_names
+    return find_moe_expert_param_names(model)
+
+
+def _quantize_moe_expert_params(model, quant_type=None,
+                                 compress_statistics=None):
+    """Quantize 3D MoE expert nn.Parameter tensors. Delegates to quantize.py."""
+    from open_ctf.training.quantize import quantize_moe_expert_params
+    return quantize_moe_expert_params(model, quant_type, compress_statistics)
+
+
+def _load_model_hf(model_path, max_seq_length, load_in_4bit, lora_cfg,
+                    load_in_8bit=False):
+    """Load model via standard HuggingFace transformers + PEFT.
+
+    Supports three quantization modes for MoE models:
+
+    - **BF16** (default): Full precision, ~60 GB for GLM-4.7-Flash.
+    - **8-bit** (``load_in_8bit=True``): ~30 GB. Skips
+      ``prepare_model_for_kbit_training`` to avoid OOM from fp32 cast.
+    - **4-bit** (``load_in_4bit=True``): ~18 GB. BnB quantizes
+      ``nn.Linear`` layers normally, then ``_quantize_moe_expert_params``
+      handles the fused 3D expert tensors that BnB skips.
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from peft import LoraConfig, get_peft_model, PeftModel, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model, PeftModel
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     kwargs = {
         "torch_dtype": torch.bfloat16,
         "trust_remote_code": True,
-        "attn_implementation": "sdpa",
     }
-    if load_in_4bit:
+    if load_in_8bit:
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+        logger.info("Loading model in 8-bit (saves ~30GB VRAM vs BF16)")
+    elif load_in_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
@@ -188,12 +384,37 @@ def _load_model_hf(model_path, max_seq_length, load_in_4bit, lora_cfg):
 
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
 
+    # --- Post-load 4-bit quantization for MoE 3D expert tensors -----------
+    # BnB only quantizes nn.Linear (2D). Transformers v5 MoE models store
+    # experts as fused 3D nn.Parameter which BnB skips, leaving them in
+    # BF16 (~52 GB for GLM-4.7-Flash). Quantize them post-load.
+    moe_experts_quantized = False
+    moe_expert_param_names = []
     if load_in_4bit:
+        moe_expert_param_names = _find_moe_expert_param_names(model)
+        if moe_expert_param_names:
+            moe_experts_quantized = _quantize_moe_expert_params(model)
+
+    # --- Prepare for k-bit training ----------------------------------------
+    # All MoE quantized paths skip prepare_model_for_kbit_training because
+    # it casts non-quantized params to fp32, causing OOM (~115 GB peak).
+    # Instead, manually enable input_require_grads (gradient checkpointing
+    # is handled by GRPOConfig).
+    if load_in_8bit or (load_in_4bit and moe_experts_quantized):
+        model.enable_input_require_grads()
+        quant_label = "8-bit" if load_in_8bit else "4-bit MoE"
+        logger.info(
+            "%s: skipped prepare_model_for_kbit_training (OOMs for MoE), "
+            "enabled input_require_grads manually", quant_label
+        )
+    elif load_in_4bit:
+        # Non-MoE 4-bit: standard path
+        from peft import prepare_model_for_kbit_training
         model = prepare_model_for_kbit_training(model)
 
-    # Check if this is already a PEFT model (adapter checkpoint)
+    # --- LoRA configuration ------------------------------------------------
     if not isinstance(model, PeftModel):
-        lora_config = LoraConfig(
+        lora_kwargs = dict(
             r=lora_cfg.get("r", 64),
             lora_alpha=lora_cfg.get("alpha", 128),
             lora_dropout=lora_cfg.get("dropout", 0),
@@ -203,9 +424,28 @@ def _load_model_hf(model_path, max_seq_length, load_in_4bit, lora_cfg):
             ]),
             task_type="CAUSAL_LM",
         )
-        model = get_peft_model(model, lora_config)
 
-    model.gradient_checkpointing_enable()
+        # For quantized MoE: LoRA targets attention + shared expert
+        # via target_modules only.  The routed expert 3D tensors are
+        # quantized for memory savings but NOT LoRA'd — this follows
+        # Unsloth's recommendation for MoE models and avoids the
+        # parametrization name mismatch (replace_parameter_4bit wraps
+        # params, changing their names in named_parameters()).
+        #
+        # Exclude BnB parametrization sub-modules from target_modules
+        # scan to avoid accidental matches on parametrization wrappers.
+        if moe_experts_quantized:
+            lora_kwargs["exclude_modules"] = r".*\.parametrizations\..*"
+            logger.info(
+                "MoE 4-bit LoRA: target_modules=%s (attention + shared expert only, "
+                "routed experts quantized but not LoRA'd)",
+                lora_kwargs["target_modules"],
+            )
+
+        lora_config = LoraConfig(**lora_kwargs)
+        model = get_peft_model(model, lora_config)
+    # Don't call gradient_checkpointing_enable() here — GRPOConfig handles it.
+    # Double-enable can cause issues with MoE models on some hardware.
 
     # Unsloth patches TRL's GRPOTrainer at import time in containers that
     # have Unsloth pre-installed. The patched trainer calls model.for_training()
@@ -360,6 +600,86 @@ def _detect_env_mode(grpo_cfg: Dict[str, Any]) -> str:
     return "tools"
 
 
+class OnlineGRPOTrainer(GRPOTrainer):
+    """GRPOTrainer with per-batch environment resets for online RL.
+
+    Solves the episode management gap in TRL's ``tools=`` feature:
+
+    1. **Per-batch reset** — ``_tool_call_loop`` is wrapped to call
+       ``mark_step_begin()`` before processing, giving all
+       ``num_generations`` completions a clean environment.
+    2. **Done protection** — once any generation triggers ``done`` (e.g.
+       flag submission, task completion), ``tools.py`` short-circuits
+       subsequent tool calls so later generations don't corrupt state.
+    3. **Logging** — emits tool-call and episode statistics per step.
+
+    With ``num_generations > 1``, generations within a batch still share
+    the same server process.  Read-only operations are safe; stateful
+    operations may interfere, but the done flag prevents the worst case.
+    For full isolation, use a multi-episode server (future work).
+    """
+
+    def __init__(self, *args, challenge_id: Optional[str] = None,
+                 kv_cache_dtype: Optional[str] = None, **kwargs):
+        self._challenge_id = challenge_id
+        # Inject FP8 KV cache dtype into vLLM engine BEFORE parent creates it.
+        # GRPOConfig doesn't expose kv_cache_dtype; we monkey-patch vllm.LLM
+        # to inject the kwarg during colocate engine creation. This halves KV
+        # cache memory with negligible quality impact for tool-calling.
+        _unpatch = None
+        if kv_cache_dtype:
+            _unpatch = self._patch_vllm_kv_dtype(kv_cache_dtype)
+        super().__init__(*args, **kwargs)
+        if _unpatch:
+            _unpatch()
+
+    @staticmethod
+    def _patch_vllm_kv_dtype(dtype: str):
+        """Monkey-patch vllm.LLM.__init__ to inject kv_cache_dtype.
+
+        Returns an unpatch callable (or None if vLLM not available).
+        """
+        try:
+            import vllm
+            _orig_init = vllm.LLM.__init__
+
+            def _patched_init(self_llm, *a, **kw):
+                kw.setdefault("kv_cache_dtype", dtype)
+                return _orig_init(self_llm, *a, **kw)
+
+            vllm.LLM.__init__ = _patched_init
+            logger.info("Patched vLLM LLM to use kv_cache_dtype=%s", dtype)
+
+            def _unpatch():
+                vllm.LLM.__init__ = _orig_init
+
+            return _unpatch
+        except ImportError:
+            return None
+
+    def _tool_call_loop(self, *args, **kwargs):
+        """Wrap parent's tool-call loop with environment reset.
+
+        Uses ``*args, **kwargs`` to stay compatible across TRL versions
+        (the internal signature of ``_tool_call_loop`` changed between
+        0.26 → 0.27 → 0.28).
+        """
+        from open_ctf.training.tools import mark_step_begin
+
+        mark_step_begin(self._challenge_id)
+        result = super()._tool_call_loop(*args, **kwargs)
+
+        # Log tool call stats from this batch
+        # result is a tuple; last two elements are tool_call_count and
+        # tool_failure_count (TRL 0.28+).
+        if isinstance(result, tuple) and len(result) >= 6:
+            tc_count, tc_fail = result[-2], result[-1]
+            logger.info(
+                "Tool loop done: %d calls, %d failures", tc_count, tc_fail,
+            )
+        return result
+
+
 def train_grpo(
     model_path: str,
     data_path: str,
@@ -405,6 +725,7 @@ def train_grpo(
 
     max_seq_length = model_cfg.get("max_seq_length", 8192)
     load_in_4bit = model_cfg.get("load_in_4bit", True)
+    load_in_8bit = model_cfg.get("load_in_8bit", False)
 
     # --- Detect OpenEnv mode ---------------------------------------------
     env_mode = _detect_env_mode(grpo_cfg)
@@ -434,7 +755,8 @@ def train_grpo(
 
     if not use_unsloth:
         model, tokenizer = _load_model_hf(
-            model_path, max_seq_length, load_in_4bit, lora_cfg
+            model_path, max_seq_length, load_in_4bit, lora_cfg,
+            load_in_8bit=load_in_8bit,
         )
         logger.info("Loaded model via HuggingFace transformers + PEFT")
 
@@ -443,6 +765,8 @@ def train_grpo(
 
     # GRPOTrainer requires a "prompt" column. Extract the system + user
     # messages from the full trajectory as the prompt.
+    # Some BoxPwnr traces lack a "user" message (challenge is in system prompt).
+    # TRL requires the prompt to end with role "user", so inject a fallback.
     def _extract_prompt(example):
         messages = example["messages"]
         prompt_msgs = []
@@ -453,13 +777,31 @@ def train_grpo(
                 prompt_msgs.append(clean_msg)
             else:
                 break  # Stop at first assistant/tool message
+        # TRL's apply_chat_template requires last message to be "user"
+        if not prompt_msgs or prompt_msgs[-1]["role"] != "user":
+            challenge = example.get("metadata", {}).get("challenge", "")
+            user_content = (
+                f"Solve the CTF challenge{f': {challenge}' if challenge else ''}. "
+                "Find and capture the flag."
+            )
+            prompt_msgs.append({"role": "user", "content": user_content})
         example["prompt"] = prompt_msgs
         return example
 
     dataset = dataset.map(_extract_prompt)
     if "messages" in dataset.column_names:
         dataset = dataset.remove_columns(["messages"])
+    # Extract metadata.success into a top-level column before dropping metadata.
+    # CTFReward uses this as the authoritative signal for flag capture scoring.
     if "metadata" in dataset.column_names:
+        def _extract_success(example):
+            meta = example.get("metadata")
+            if isinstance(meta, dict):
+                example["success"] = meta.get("success")
+            else:
+                example["success"] = None
+            return example
+        dataset = dataset.map(_extract_success)
         dataset = dataset.remove_columns(["metadata"])
 
     # --- Determine wandb availability -----------------------------------
@@ -575,7 +917,10 @@ def train_grpo(
     grpo_training_config = GRPOConfig(**grpo_kwargs)
 
     # --- Trainer ---------------------------------------------------------
-    trainer = GRPOTrainer(
+    # Use OnlineGRPOTrainer for tools= mode (handles episode resets + done
+    # tracking); fall back to vanilla GRPOTrainer for offline mode.
+    TrainerCls = OnlineGRPOTrainer if env_mode == "tools" else GRPOTrainer
+    trainer_init_kwargs = dict(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
@@ -583,6 +928,19 @@ def train_grpo(
         args=grpo_training_config,
         **trainer_extra_kwargs,
     )
+    if TrainerCls is OnlineGRPOTrainer:
+        # Pass challenge_id for per-batch resets (extracted from data if available)
+        trainer_init_kwargs["challenge_id"] = grpo_cfg.get("challenge_id")
+        # FP8 KV cache dtype (applied after vLLM engine creation)
+        kv_dtype = grpo_cfg.get("vllm_kv_cache_dtype")
+        if kv_dtype:
+            trainer_init_kwargs["kv_cache_dtype"] = kv_dtype
+    trainer = TrainerCls(**trainer_init_kwargs)
+
+    # Patch vLLM sync_weights to skip parametrized (4-bit MoE) params.
+    # Must be called AFTER trainer init (vllm_generation is created in __init__).
+    if vllm_available:
+        _patch_vllm_sync_weights_for_parametrized(trainer)
 
     trainer.train(resume_from_checkpoint=resume_from)
 

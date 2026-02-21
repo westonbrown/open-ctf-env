@@ -578,6 +578,11 @@ def create_app(
     async def list_tools() -> Dict[str, Any]:
         return {"tools": env.tools, "count": len(env.tools)}
 
+    @app.post("/close")
+    async def close(request: Dict[str, Any] = Body(default={})) -> Dict[str, str]:
+        env._sessions.close_all()
+        return {"status": "closed"}
+
     return app
 
 

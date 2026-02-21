@@ -187,7 +187,9 @@ class CTFReward:
             # Flag capture still provides a bonus when it occurs.
             score = (
                 self.flag_weight * flag_sc
-                + self.efficiency_weight * self._efficiency_score(len(tool_calls), opt_steps)
+                + self.efficiency_weight * self._efficiency_score(
+                    len(tool_calls), opt_steps, flag_found=(flag_sc >= 1.0),
+                )
                 + self.progression_weight * self._progression_score(tool_calls)
                 + self.exploration_weight * self._exploration_score(tool_calls)
                 + self.uniqueness_weight * self._uniqueness_score(tool_calls)
@@ -320,16 +322,25 @@ class CTFReward:
 
         return ""
 
-    def _efficiency_score(self, actual_steps: int, optimal_steps: Optional[int]) -> float:
+    def _efficiency_score(
+        self, actual_steps: int, optimal_steps: Optional[int],
+        flag_found: bool = False,
+    ) -> float:
         """min(optimal / actual, 1.0). Returns 0.5 (neutral) without metadata.
 
-        Ungated: provides gradient signal in offline GRPO even without flag capture.
+        Gated by a minimum step threshold: submissions with fewer than 3 steps
+        receive 0.0 to prevent single-step garbage from earning high efficiency.
+        Non-flag completions are capped at 0.3 to avoid rewarding short but
+        wrong submissions.
         """
         if optimal_steps is None:
             return 0.5  # Neutral score when metadata unavailable
-        if actual_steps == 0:
-            return 0.0
-        return min(optimal_steps / actual_steps, 1.0)
+        if actual_steps < 3:
+            return 0.0  # Prevent single-step garbage from gaming efficiency
+        raw = min(optimal_steps / actual_steps, 1.0)
+        if not flag_found:
+            return min(raw, 0.3)  # Cap efficiency credit for non-flag completions
+        return raw
 
     def _format_score(self, tool_calls: List[Dict[str, str]]) -> float:
         """Score based on valid structured tool calls (not string matching)."""
@@ -340,12 +351,18 @@ class CTFReward:
         for tc in tool_calls:
             # Valid tool call has both a name and parseable arguments
             if tc["name"] and tc["arguments"]:
-                try:
-                    json.loads(tc["arguments"])
+                args = tc["arguments"]
+                # In online mode TRL passes arguments as dicts already;
+                # in offline mode they arrive as JSON strings.
+                if isinstance(args, dict):
                     valid += 1
-                except (json.JSONDecodeError, TypeError):
-                    # Arguments present but not valid JSON
-                    valid += 0.5
+                else:
+                    try:
+                        json.loads(args)
+                        valid += 1
+                    except (json.JSONDecodeError, TypeError):
+                        # Arguments present but not valid JSON
+                        valid += 0.5
         return min(valid / len(tool_calls), 1.0)
 
     def _progression_score(self, tool_calls: List[Dict[str, str]]) -> float:

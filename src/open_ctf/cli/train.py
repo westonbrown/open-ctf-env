@@ -2,17 +2,24 @@
 """Open CTF training CLI.
 
 Usage:
-    # SFT
+    # Stage 1: SFT
     open-ctf-train sft \\
         --model unsloth/GLM-4.7-Flash \\
         --data data/sft.jsonl \\
         --output outputs/sft
 
-    # GRPO (requires SFT model)
+    # Stage 2: GRPO (requires SFT model)
     open-ctf-train grpo \\
         --model outputs/sft/final \\
         --data data/grpo.jsonl \\
         --output outputs/grpo
+
+    # Stage 3: GEPA prompt optimization (no weight updates)
+    open-ctf-train gepa \\
+        --model openai/ctf-agent \\
+        --data data/grpo.jsonl \\
+        --output outputs/gepa \\
+        --reflection-model anthropic/claude-sonnet-4-20250514
 
     # Merge LoRA adapter into base weights
     open-ctf-train merge \\
@@ -30,11 +37,13 @@ from pathlib import Path
 os.environ.setdefault("UNSLOTH_VLLM_STANDBY", "1")
 
 # Unsloth MUST be imported before trl/transformers/peft for patching to work.
-# Optional: allows running on systems without Unsloth (e.g. clean PyTorch containers).
-try:
-    import unsloth  # noqa: F401
-except ImportError:
-    pass
+# Skip when OPEN_CTF_NO_UNSLOTH=1 to avoid Unsloth's TRL wrapping which causes
+# pickle errors with transformers 5.0's ConfigModuleInstance on GLM-4.7-Flash.
+if os.environ.get("OPEN_CTF_NO_UNSLOTH", "").lower() not in ("1", "true"):
+    try:
+        import unsloth  # noqa: F401
+    except ImportError:
+        pass
 
 import yaml
 
@@ -85,7 +94,15 @@ def cmd_grpo(args: argparse.Namespace) -> None:
     from open_ctf.training.grpo import train_grpo
 
     config = load_config(args.config)
-    reward_fn = CTFReward()
+    reward_cfg = config.get("reward", {})
+    reward_kwargs = {}
+    for key in (
+        "flag_weight", "efficiency_weight", "progression_weight",
+        "format_weight", "exploration_weight", "uniqueness_weight",
+    ):
+        if key in reward_cfg:
+            reward_kwargs[key] = float(reward_cfg[key])
+    reward_fn = CTFReward(**reward_kwargs)
 
     train_grpo(
         model_path=args.model,
@@ -94,6 +111,25 @@ def cmd_grpo(args: argparse.Namespace) -> None:
         config=config,
         reward_fn=reward_fn,
         resume_from=args.resume,
+    )
+
+
+def cmd_gepa(args: argparse.Namespace) -> None:
+    """Run GEPA prompt optimization (Stage 3, after SFT + GRPO)."""
+    from open_ctf.training.gepa import run_gepa
+
+    config = load_config(args.config)
+
+    run_gepa(
+        model_id=args.model,
+        data_path=args.data,
+        output_dir=args.output,
+        config=config,
+        reflection_model=args.reflection_model,
+        budget=args.budget,
+        val_data_path=args.val_data,
+        max_samples=args.max_samples,
+        env_url=args.env_url,
     )
 
 
@@ -191,6 +227,30 @@ def main() -> None:
     grpo_parser.add_argument("--output", required=True, help="Output directory")
     grpo_parser.add_argument("--resume", default=None, help="Resume from checkpoint")
     grpo_parser.set_defaults(func=cmd_grpo)
+
+    # -- gepa -------------------------------------------------------------
+    gepa_parser = subparsers.add_parser(
+        "gepa",
+        help="Optimize system prompt with GEPA (Stage 3, no weight updates)",
+    )
+    gepa_parser.add_argument("--model", required=True, help="LLM model id for dspy.LM")
+    gepa_parser.add_argument("--data", required=True, help="Path to GRPO JSONL data (challenges)")
+    gepa_parser.add_argument("--output", required=True, help="Output directory for optimized prompt")
+    gepa_parser.add_argument("--val-data", default=None, help="Validation JSONL (separate from train)")
+    gepa_parser.add_argument(
+        "--reflection-model", default=None,
+        help="Strong LLM for GEPA reflection (default: same as --model)",
+    )
+    gepa_parser.add_argument(
+        "--budget", choices=["light", "medium", "heavy"], default="medium",
+        help="GEPA budget preset (default: medium)",
+    )
+    gepa_parser.add_argument("--max-samples", type=int, default=None, help="Max training examples")
+    gepa_parser.add_argument(
+        "--env-url", default=None,
+        help="OpenEnv server URL for online mode (default: offline with stub tools)",
+    )
+    gepa_parser.set_defaults(func=cmd_gepa)
 
     # -- merge ------------------------------------------------------------
     merge_parser = subparsers.add_parser("merge", help="Merge LoRA adapter into base")
