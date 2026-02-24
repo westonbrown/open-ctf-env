@@ -31,27 +31,31 @@ flowchart LR
     end
 
     subgraph train["3. Fine-Tune"]
-        sft["SFT\nFormat + Domain"] --> merge["Merge LoRA"]
-        merge --> grpo["Online GRPO\nLive Tool Execution"]
+        direction TB
+        sft["Stage 1: SFT\n(LlamaFactory)"] --> merge["Merge LoRA"]
+        merge --> grpo["Stage 2: Online GRPO\n(SkyRL + ToolExecutor)"]
+        grpo --> gepa["Stage 3: GEPA\n(DSPy, no weight updates)"]
     end
 
-    subgraph optimize["4. Prompt Optimize"]
-        grpo_out["Trained Model"] --> gepa["GEPA\nPrompt Evolution"]
-        gepa --> prompt["Optimized\nSystem Prompt"]
-    end
-
-    subgraph deploy["5. Evaluate + Deploy"]
+    subgraph deploy["4. Evaluate + Deploy"]
         eval_model["Fine-Tuned\nCTF Agent"] --> eval_bench["CyBench Eval"]
         eval_model --> export["GGUF Export"]
     end
 
-    collect --> convert --> train
-    grpo --> optimize --> deploy
+    collect --> convert --> train --> deploy
 ```
 
 The same scaffold (BoxPwnr) runs both the baseline and fine-tuned models against identical challenges. The only variable is the model weights -- architecture, tools, and evaluation harness are held constant.
 
-**Online GRPO** uses TRL's `tools=` parameter to execute tool calls against a live OpenEnv server during training. The model generates tool calls, the environment executes them (shell commands, Python code, file operations), and the CTF reward function scores the full trajectory. vLLM colocate mode accelerates generation 3-6x over HuggingFace generate.
+## 3-Stage Training Pipeline
+
+| Stage | Framework | What It Does | Weight Updates |
+|-------|-----------|--------------|----------------|
+| **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) | Supervised fine-tuning on expert traces (LoRA). YAML-driven, 11 native tool formats, packing, DeepSpeed ZeRO. | Yes |
+| **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online reinforcement learning with live tool execution via ToolExecutor. Async Ray-based, vLLM inference, DAPO sampling. | Yes |
+| **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection -- no weight updates. Pareto-based candidate selection. Outperforms GRPO by ~6% with 4-35x fewer rollouts. | No |
+
+**Online GRPO** executes tool calls via the built-in ToolExecutor during training. The model generates tool calls, the ToolExecutor runs them directly as subprocesses (shell commands, Python code, file operations), and the CTF reward function scores the full trajectory. No HTTP server required -- SkyRL's per-worker process isolation makes the former HTTP layer redundant.
 
 ## Baseline Results
 
@@ -99,25 +103,32 @@ GLM-4.7-Flash Q8_0 (30B MoE, ~3.6B active) evaluated on [CyBench](https://cybenc
 
 ### Setup
 
-**Option A: Local Install**
 ```bash
 git clone https://github.com/westonbrown/open-ctf-env.git
 cd open-ctf-env
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install -e ".[dev,train]"
+
+# Install core + SFT dependencies
+pip install -e ".[sft]"
+
+# Or for GRPO (requires Ray + SkyRL)
+pip install git+https://github.com/SkyRL-Team/SkyRL-Train.git
+pip install -e ".[grpo]"
+
+# Or for GEPA
+pip install -e ".[gepa]"
 
 # Setup BoxPwnr for trace collection
 git clone https://github.com/0ca/BoxPwnr.git references/boxpwnr
 ```
 
-**Option B: Docker (Recommended for DGX/GPU servers)**
+**Docker (Recommended for DGX/GPU servers)**
 ```bash
-git clone https://github.com/westonbrown/open-ctf-env.git
-cd open-ctf-env
-docker build -t open-ctf-env:latest .
-```
+# SFT Builder (LlamaFactory + merge + export support)
+docker build -t open-ctf:sft --target sft -f docker/Dockerfile .
 
-The Docker image includes vLLM (compiled for Blackwell GB10), TRL 0.28+, Unsloth, and all training dependencies.
+# GRPO Builder (SkyRL + Ray + vLLM)
+docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
+```
 
 ### Generate Training Data
 
@@ -140,28 +151,28 @@ open-ctf-split \
 ### Train
 
 ```bash
-# Stage 1: SFT (tool format + domain knowledge)
+# Stage 1: SFT via LlamaFactory
 open-ctf-train sft \
-    --model unsloth/GLM-4.7-Flash \
+    --model THUDM/GLM-4.7-Flash \
     --data data/sft.jsonl \
-    --output outputs/sft
+    --output outputs/sft \
+    --config configs/llamafactory/glm47_flash.yaml
 
 # Merge LoRA adapter into base
 open-ctf-train merge \
     --adapter outputs/sft/final \
+    --base-model THUDM/GLM-4.7-Flash \
     --output outputs/sft-merged
 
-# Stage 2: Online GRPO (live tool execution via OpenEnv)
-# Start the environment server, then train with tools=
-OPEN_CTF_ENV_URL=http://localhost:8100 \
+# Stage 2: GRPO via SkyRL
 open-ctf-train grpo \
     --model outputs/sft-merged \
     --data data/grpo.jsonl \
     --output outputs/grpo \
-    --config src/open_ctf/configs/training_dgx.yaml
+    --config configs/skyrl/glm47_flash.yaml
 ```
 
-During online GRPO, the model generates tool calls that are executed against the OpenEnv server in real-time. The `OnlineGRPOTrainer` resets the environment before each batch and tracks episode completion across `num_generations`.
+During online GRPO, the model generates tool calls that are executed locally by the `ToolExecutor` (subprocess per env worker). SkyRL handles distributing the simulation environments alongside the vLLM engine across Ray workers.
 
 ### Evaluate
 
@@ -221,22 +232,17 @@ The CTF reward for GRPO training uses **6 signals + 1 penalty**:
 
 All process signals are ungated -- they provide gradient signal regardless of flag capture.
 
-## Training Configuration
+## Model-Agnostic Design
 
-Edit `src/open_ctf/configs/training_dgx.yaml`. Key settings:
+Models are configured via YAML files, not hardcoded. The pipeline supports both dense and MoE architectures:
 
-| Parameter | SFT | GRPO |
-|-----------|-----|------|
-| Model | `unsloth/GLM-4.7-Flash` | SFT merged output |
-| LoRA rank | 64 | 64 |
-| Learning rate | 2e-4 | 5e-6 |
-| Epochs | 3 | 1 |
-| Loss | Cross-entropy | DAPO |
-| Packing | Yes (3x throughput) | N/A |
-| vLLM colocate | N/A | Yes (3-6x faster) |
-| KV cache dtype | N/A | FP8 (halves cache memory) |
-| Tool iterations | N/A | 15 max per generation |
-| Generations | N/A | 4 per prompt |
+| Model | Architecture | SFT Config | GRPO Config | Notes |
+|-------|-------------|------------|-------------|-------|
+| **Nanbeige4.1-3B** | Dense (LlamaForCausalLM) | `nanbeige_3b.yaml` | `nanbeige_3b.yaml` | Default test model, fast iteration |
+| **GLM-4.7-Flash** | MoE (30B, 3.6B active) | `glm47_flash.yaml` | `glm47_flash.yaml` | Production target, batch_size=1 for MoE |
+| **Devstral-Small-2-24B** | Dense (Mistral) | `devstral_24b.yaml` | (generated) | Dense alternative |
+
+To add a new model: create `configs/llamafactory/<model>.yaml` and `configs/skyrl/<model>.yaml`.
 
 ## GEPA Prompt Optimization (Stage 3)
 
@@ -276,26 +282,25 @@ GEPA produces an optimized system prompt at `outputs/gepa/optimized_prompt.txt` 
 
 ## Architecture
 
-### Online GRPO Training Loop
+### Online GRPO Training Loop (SkyRL)
 
 ```
-OnlineGRPOTrainer (extends TRL GRPOTrainer)
+SkyRL BasePPOExp
     |
-    +-- _tool_call_loop() override
+    +-- Ray Data / Worker Distribution
     |       |
-    |       +-- mark_step_begin()    # Reset environment
-    |       +-- super()._tool_call_loop()
-    |       |       |
-    |       |       +-- vLLM generate  # Fast inference
-    |       |       +-- parse tool calls
-    |       |       +-- execute via tools.py  # HTTP to OpenEnv
-    |       |       +-- append results
-    |       |       +-- repeat (max 15 iterations)
+    |       +-- vLLM Generator Phase
+    |       |       |-- Execute prompt prefix caching
+    |       |       |-- Generate till EOS or tool call
     |       |
-    |       +-- log statistics
+    |       +-- Environment Phase (OpenCTFTextEnv)
+    |       |       |-- parse tool calls
+    |       |       |-- execute via ToolExecutor (Subprocess)
+    |       |       |-- append results (max 50 iterations)
+    |       |
+    |       +-- CTFReward scores full trajectory
     |
-    +-- CTFReward scores full trajectory
-    +-- DAPO policy gradient update
+    +-- DAPO Policy Gradient Phase (FSDP2)
 ```
 
 ### Project Structure
@@ -312,15 +317,14 @@ open-ctf-env/
 │   ├── data/                    # Trace converter + dataset splitter
 │   │   ├── converter.py         # BoxPwnr -> ChatML (lossless, 13 tools)
 │   │   └── splitter.py          # Success -> SFT, All -> GRPO
-│   ├── envs/openenv/            # OpenEnv server (live tool execution)
-│   │   ├── server.py            # HTTP server with 13 tool handlers
-│   │   └── models.py            # Action, Observation, State dataclasses
+│   ├── envs/
+│   │   └── skyrl/               # SkyRL Gym integration
+│   │       └── openctf_env.py   # BaseTextEnv subclass with live tools
 │   ├── rewards/reward.py        # CTFReward (6 signals + penalty)
 │   └── training/
-│       ├── sft.py               # SFTTrainer (Unsloth + HF fallback)
-│       ├── grpo.py              # OnlineGRPOTrainer (TRL tools= + vLLM)
-│       ├── gepa.py              # GEPA prompt optimizer (DSPy + ReAct)
-│       └── tools.py             # 13 TRL tool wrappers with episode mgmt
+│       ├── sft.py               # SFT via LlamaFactory
+│       ├── grpo.py              # Online GRPO via SkyRL
+│       └── gepa.py              # GEPA prompt optimizer (DSPy + ReAct)
 ├── scripts/
 │   ├── run_cybench_benchmark.py # Full CyBench benchmark runner
 │   └── spawn_all_cybench.py     # Docker setup for all 40 challenges
@@ -334,7 +338,7 @@ open-ctf-env/
 
 ## BoxPwnr Tool Set
 
-Training data, the reward function, the OpenEnv server, and the TRL tool wrappers all share the same 13-tool vocabulary. Every tool the model learns during SFT is available for live execution during online GRPO.
+Training data, the reward function, the ToolExecutor, and the environment logic all share the same 13-tool vocabulary. Every tool the model learns during SFT is available for live execution during online GRPO.
 
 | Tier | Tools | Description |
 |------|-------|-------------|
@@ -362,15 +366,14 @@ Training data, the reward function, the OpenEnv server, and the TRL tool wrapper
 ### Phase 1: Pipeline + Infrastructure (Done)
 - [x] Lossless trace converter (tool-calling + chat-command formats)
 - [x] Training data: 1,120 SFT + 1,369 GRPO traces from BoxPwnr across 8 platforms
-- [x] 2-stage training pipeline: SFT + Online GRPO with live tool execution
+- [x] SFT Training with LlamaFactory
 - [x] Multi-signal CTF reward function (6 signals + hallucination penalty)
-- [x] OnlineGRPOTrainer with per-batch environment resets and episode tracking
-- [x] OpenEnv HTTP server with 13 BoxPwnr tool handlers
-- [x] TRL prefix-preserving patch for GLM-4.7-Flash
+- [x] Online GRPO Training with SkyRL (Ray + vLLM)
+- [x] OpenCTF Gym Environment with direct Subprocess ToolExecutor
 - [x] CyBench benchmark runner with per-challenge metrics
 - [x] GGUF export pipeline
 - [x] Validation pipeline (`open-ctf-validate`)
-- [x] Unified Dockerfile with vLLM + TRL 0.28 + Unsloth for DGX Spark
+- [x] Unified Dockerfile separated into stages (SFT / GRPO)
 
 ### Phase 2: Baseline + Train + Evaluate (In Progress)
 
