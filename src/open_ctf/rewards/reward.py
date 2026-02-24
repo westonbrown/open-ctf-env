@@ -1,39 +1,43 @@
-"""Combined CTF reward function for GRPO training.
+"""CTF reward function for online GRPO training.
 
-Scoring components (6 signals, sum to 1.0 + penalty):
-  - Flag capture (0.20): metadata.success > exact match > pattern match
-  - Efficiency (0.25): Fewer steps = higher reward, **ungated** for GRPO signal
-  - Progression (0.15): RECON→ENUM→EXPLOIT phase ordering, **ungated**
-  - Exploration (0.10): Novel tool usage weighted toward early trajectory
-  - Uniqueness (0.10): Command diversity (repeated commands = stuck)
-  - Format compliance (0.20): Valid tool call structure
-  - Hallucination penalty: -0.10 for false flag submissions (structural)
+Physics-inspired scoring (8 signals, sum to 1.0 + penalty):
+  - Flag capture (0.20): Boundary condition -- did the trajectory reach the goal?
+  - Efficiency (0.20): Principle of least action -- shortest path to the goal.
+  - Progression (0.12): Phase space ordering -- RECON->ENUM->EXPLOIT trajectory.
+  - Exploration (0.08): Exponentially-decayed novelty -- early diversity > late.
+  - Uniqueness (0.08): Information entropy -- repeated observations carry zero bits.
+  - Format compliance (0.15): Signal fidelity -- valid instrument readings only.
+  - Recovery (0.07): Resilience -- trajectory pivots after stuck runs.
+  - Cognitive (0.10): Words-per-action -- optimal reasoning density (~42 WPA).
+  - Hallucination penalty: Energy loss -- false claims reverse trajectory progress.
 
 Design principles:
-  - **Offline-GRPO compatible**: In GRPO, the model generates completions without
-    interacting with a real environment. The model can never produce the exact
-    ground_truth_flag, so flag_score rarely exceeds 0.1. Efficiency, progression,
-    format, exploration, and uniqueness are ALL ungated to provide meaningful
-    gradient signal regardless of flag capture.
-  - **Principle of least action**: Flag (boundary condition) + efficiency (shortest
-    path) encode "reach the goal via the shortest path."
-  - **No regex in process signals**: Progression uses set-based binary lookup (not
-    regex pattern matching). Uniqueness, exploration, and format use structural
-    analysis (command deduplication, position weighting, JSON parsing).
-  - **metadata.success is authoritative in both directions**: True = solved,
-    False = not solved (blocks exact-match fallback).
-  - **Anti-hallucination**: Structural penalty when ``flag_found`` tool is called
-    but the flag is wrong. Catches false submissions without regex.
+  - **Principle of least action**: Flag (boundary condition) + efficiency (path
+    integral) encode "reach the goal via the shortest path."
+  - **Exponential temporal discounting**: Exploration uses gamma^t decay
+    (gamma=0.95). Earlier novel tool use carries exponentially more signal.
+  - **Information specificity**: Only known CTF instruments carry signal.
+    Set-based lookup, no regex.
+  - **Entropy-scaled format**: Format modulated by uniqueness (information
+    density). Repetitive tool spam earns less.
+  - **Recovery as resilience**: Stuck runs (2+ consecutive same action) are
+    not penalized, but pivoting out of them is rewarded. Uses action
+    fingerprints (tool name + binary name for shell wrappers), no regex.
+  - **Cognitive efficiency**: Words-per-action peaks at ~42. Underthinking
+    (WPA < 10) and severe overthinking (WPA > 80) are penalized.
+  - **Anti-hallucination (energy loss)**: Wrong flag submission zeroes ALL
+    process signals. Total kinetic energy lost.
+  - **Online**: environment verification ("Correct! Flag verified") is authoritative.
 
 Noise (+-0.05) is added to every reward to guarantee variance for GRPO gradients.
 
-Also provides ``env_reward_fn`` for use with TRL's OpenEnv ``tools=`` mode,
-where the environment provides rewards via ``**kwargs``.
 """
 
+import collections
 import json
 import random
 import re
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 # Placeholder flag strings that should not be used for matching.
@@ -73,43 +77,85 @@ _EXPLOIT_BINARIES = frozenset({
 })
 # Tool names (not shell commands) that map directly to phases.
 _TOOL_NAME_PHASES = {
-    "web_search": "recon",
-    "read_file": "enum", "grep": "enum", "file_search": "enum",
-    "python_code": "exploit", "apply_patch": "exploit",
+    "web_search": "recon", "WebFetch": "recon",
+    "read_file": "enum", "Read": "enum", "read": "enum",
+    "grep": "enum", "file_search": "enum",
+    "python_code": "exploit", "python3_code": "exploit",
+    "apply_patch": "exploit", "Write": "exploit", "Edit": "exploit",
     "flag_found": "flag",
 }
 
+# ---------------------------------------------------------------------------
+# Known instrument registry -- information specificity filter.
+#
+# Includes all phase-classified tools + shell/exec wrappers + session
+# management + orchestration tools found in real BoxPwnr traces.
+# ---------------------------------------------------------------------------
+_KNOWN_TOOL_NAMES = frozenset(
+    set(_TOOL_NAME_PHASES.keys())
+    | {"shell_command", "exec_command", "execute_command", "shell", "bash",
+       "Bash", "write_stdin", "tmux_send_keys", "tmux_create_session",
+       "tmux_read_output",
+       # Session/orchestration (no phase, but still known instruments)
+       "close_session", "list_sessions", "update_plan",
+       "Task", "TaskOutput", "TaskStop"}
+)
+
+# Shell wrapper tool names (used for action fingerprinting in recovery).
+_SHELL_WRAPPERS = frozenset({
+    "shell_command", "exec_command", "execute_command", "shell", "bash", "Bash",
+})
+
 
 class CTFReward:
-    """Combined CTF reward for GRPO training.
+    """CTF reward for online GRPO training.
 
-    Designed to be passed directly to ``GRPOTrainer(reward_funcs=[reward])``.
+    Compatible with both SkyRL (via OpenCTFTextEnv) and TRL-style trainers.
 
-    The ``__call__`` signature matches TRL's expectation:
+    The ``__call__`` signature matches the standard expectation:
         reward_fn(completions, prompts=None, **kwargs) -> list[float]
 
-    Extra metadata (``ground_truth_flag``, ``optimal_steps``, ``metadata``)
-    is forwarded via ``**kwargs`` by the trainer when the dataset contains
-    those columns.
+    Extra metadata (``ground_truth_flag``, ``optimal_steps``) is forwarded
+    via ``**kwargs`` by the trainer when the dataset contains those columns.
     """
 
-    # GRPOTrainer accesses reward_func.__name__ for logging.
+    # Trainers may access reward_func.__name__ for logging.
     __name__ = "ctf_reward"
+
+    # GDPO (Group-Decoupled Policy Optimization) buffer
+    _gdpo_stats: Dict[str, collections.deque] = {
+        "flag": collections.deque(maxlen=256),
+        "efficiency": collections.deque(maxlen=256),
+        "progression": collections.deque(maxlen=256),
+        "exploration": collections.deque(maxlen=256),
+        "uniqueness": collections.deque(maxlen=256),
+        "format": collections.deque(maxlen=256),
+        "recovery": collections.deque(maxlen=256),
+        "cognitive": collections.deque(maxlen=256),
+        "hallucination": collections.deque(maxlen=256),
+    }
+    _gdpo_lock = threading.Lock()
 
     def __init__(
         self,
         flag_weight: float = 0.20,
-        efficiency_weight: float = 0.25,
-        progression_weight: float = 0.15,
-        exploration_weight: float = 0.10,
-        uniqueness_weight: float = 0.10,
-        format_weight: float = 0.20,
+        efficiency_weight: float = 0.20,
+        progression_weight: float = 0.12,
+        exploration_weight: float = 0.08,
+        uniqueness_weight: float = 0.08,
+        format_weight: float = 0.15,
+        recovery_weight: float = 0.07,
+        cognitive_weight: float = 0.10,
         hallucination_penalty: float = 0.10,
         noise_range: float = 0.05,
+        exploration_gamma: float = 0.95,
         seed: Optional[int] = None,
+        use_gdpo: bool = False,
     ) -> None:
+        """Initialize reward configuration."""
         total = (flag_weight + efficiency_weight + progression_weight
-                 + exploration_weight + uniqueness_weight + format_weight)
+                 + exploration_weight + uniqueness_weight + format_weight
+                 + recovery_weight + cognitive_weight)
         if abs(total - 1.0) > 1e-6:
             raise ValueError(
                 f"Reward weights must sum to 1.0, got {total:.4f}"
@@ -120,8 +166,12 @@ class CTFReward:
         self.exploration_weight = exploration_weight
         self.uniqueness_weight = uniqueness_weight
         self.format_weight = format_weight
+        self.recovery_weight = recovery_weight
+        self.cognitive_weight = cognitive_weight
         self.hallucination_penalty = hallucination_penalty
         self.noise_range = noise_range
+        self.exploration_gamma = exploration_gamma
+        self.use_gdpo = use_gdpo
         self._rng = random.Random(seed)
 
     # ------------------------------------------------------------------
@@ -153,10 +203,9 @@ class CTFReward:
         optimal_steps_list: List[Optional[int]] = kwargs.get(
             "optimal_steps", [None] * n
         )
-        # metadata.success is the authoritative signal from BoxPwnr's
-        # platform.validate_flag(). Extract from nested metadata dicts.
-        metadata_list: List[Optional[Dict]] = kwargs.get("metadata", [None] * n)
-        success_list: List[Optional[bool]] = kwargs.get("success", [None] * n)
+        metadata_list: List[Optional[Dict[str, Any]]] = kwargs.get(
+            "metadata", [None] * n
+        )
 
         rewards: List[float] = []
         for idx, completion in enumerate(completions):
@@ -171,30 +220,97 @@ class CTFReward:
                 if idx < len(optimal_steps_list)
                 else None
             )
-            # Resolve metadata.success: try top-level 'success' first,
-            # then fall back to nested metadata dict
-            meta_success = None
-            if idx < len(success_list) and success_list[idx] is not None:
-                meta_success = bool(success_list[idx])
-            elif idx < len(metadata_list) and isinstance(metadata_list[idx], dict):
-                meta_success = metadata_list[idx].get("success")
+            meta = (
+                metadata_list[idx]
+                if idx < len(metadata_list)
+                else None
+            )
+            metadata_success = (
+                meta.get("success") if isinstance(meta, dict) else None
+            )
+            task_category = (
+                meta.get("task_category", "web") if isinstance(meta, dict) else "web"
+            )
 
-            flag_sc = self._flag_score(text, gt_flag, meta_success)
-            # All components ungated for offline GRPO:
-            # Model generates completions without environment interaction,
-            # so flag_sc rarely exceeds 0.1. Gating efficiency/progression
-            # on flag_sc starves the gradient signal (85% of weight → 0).
-            # Flag capture still provides a bonus when it occurs.
+            flag_sc = self._flag_score(text, gt_flag, metadata_success=metadata_success)
+
+            # Compute process signals (all ungated for dual-mode support).
+            eff_sc = self._efficiency_score(
+                len(tool_calls), opt_steps, flag_found=(flag_sc >= 1.0),
+            )
+            prog_sc = self._progression_score(tool_calls)
+            expl_sc = self._exploration_score(tool_calls)
+            uniq_sc = self._uniqueness_score(tool_calls)
+            fmt_sc = self._format_score(tool_calls)
+            hall_sc = self._hallucination_score(tool_calls, flag_sc, gt_flag)
+            recov_sc = self._recovery_score(tool_calls)
+            cog_sc = self._cognitive_score(text, tool_calls)
+
+            # Entropy-scaled format: modulate format by information density.
+            # Low uniqueness = low entropy = less format credit.
+            info_density = max(uniq_sc, 0.5) if tool_calls else 0.0
+            fmt_effective = fmt_sc * info_density
+
+            # Hallucination as energy loss: wrong flag submission zeroes
+            # ALL process signals. Total kinetic energy lost.
+            if hall_sc < 0:
+                fmt_effective = 0.0
+                expl_sc = 0.0
+                prog_sc = 0.0
+                recov_sc = 0.0
+                cog_sc = 0.0
+
+            raw_signals = {
+                "flag": flag_sc,
+                "efficiency": eff_sc,
+                "progression": prog_sc,
+                "exploration": expl_sc,
+                "uniqueness": uniq_sc,
+                "format": fmt_effective,
+                "recovery": recov_sc,
+                "cognitive": cog_sc,
+                "hallucination": hall_sc,
+            }
+
+            if self.use_gdpo:
+                with self._gdpo_lock:
+                    normalized_signals = {}
+                    for k, v in raw_signals.items():
+                        self._gdpo_stats[k].append(v)
+                        history = list(self._gdpo_stats[k])
+                        if len(history) > 1:
+                            mean_val = sum(history) / len(history)
+                            variance = sum((x - mean_val) ** 2 for x in history) / len(history)
+                            std_val = (variance ** 0.5) + 1e-4
+                            normalized_signals[k] = (v - mean_val) / std_val
+                        else:
+                            normalized_signals[k] = v - 0.5  # Rough center if no history
+            else:
+                normalized_signals = raw_signals
+
+            # Dynamic weight redistribution: 
+            # Non-web challenges don't follow RECON->ENUM->EXPLOIT.
+            current_prog_weight = self.progression_weight
+            current_cog_weight = self.cognitive_weight
+            current_eff_weight = self.efficiency_weight
+
+            if str(task_category).lower() in ("crypto", "rev", "forensics"):
+                # Disable strict progression and redistribute its weight
+                redistribute = current_prog_weight
+                current_prog_weight = 0.0
+                current_cog_weight += redistribute * 0.5
+                current_eff_weight += redistribute * 0.5
+
             score = (
-                self.flag_weight * flag_sc
-                + self.efficiency_weight * self._efficiency_score(
-                    len(tool_calls), opt_steps, flag_found=(flag_sc >= 1.0),
-                )
-                + self.progression_weight * self._progression_score(tool_calls)
-                + self.exploration_weight * self._exploration_score(tool_calls)
-                + self.uniqueness_weight * self._uniqueness_score(tool_calls)
-                + self.format_weight * self._format_score(tool_calls)
-                + self._hallucination_score(tool_calls, flag_sc)
+                self.flag_weight * normalized_signals["flag"]
+                + current_eff_weight * normalized_signals["efficiency"]
+                + current_prog_weight * normalized_signals["progression"]
+                + self.exploration_weight * normalized_signals["exploration"]
+                + self.uniqueness_weight * normalized_signals["uniqueness"]
+                + self.format_weight * normalized_signals["format"]
+                + self.recovery_weight * normalized_signals["recovery"]
+                + current_cog_weight * normalized_signals["cognitive"]
+                + normalized_signals["hallucination"]
             )
 
             # Guarantee variance for GRPO
@@ -207,38 +323,52 @@ class CTFReward:
     # Component scorers
     # ------------------------------------------------------------------
 
+    # Verification strings emitted by ToolExecutor flag_found handler.
+    _FLAG_VERIFIED = "Correct! Flag verified"
+    _FLAG_REJECTED = "Incorrect submission"
+
     def _flag_score(
         self,
         text: str,
         ground_truth: Optional[str],
         metadata_success: Optional[bool] = None,
     ) -> float:
-        """Score flag capture. metadata.success is authoritative in both directions.
+        """Score flag capture (online mode).
 
         Priority order:
-          1. metadata.success=True  -> 1.0 (platform confirmed solve)
-          2. metadata.success=False -> 0.0 or 0.1 (platform says no solve;
-             skip exact match, only allow partial pattern credit)
-          3. metadata.success=None  -> exact match > pattern > 0.0
+          0. metadata_success override (platform/environment confirmation)
+          1. Environment verification signal in tool response text
+             ("Correct! Flag verified" -> 1.0, "Incorrect submission" -> 0.0)
+          2. Exact match against ground_truth_flag -> 1.0
+          3. Pattern match: FLAG{<alphanumeric>} -> 0.1
+          4. No flag -> 0.0
         """
-        # 1. Authoritative positive: platform confirmed solve
+        # 0. Metadata success override: authoritative platform signal.
+        # metadata.success=True → environment confirmed solve (even without
+        # flag text in completion). metadata.success=False → only pattern credit.
         if metadata_success is True:
             return 1.0
-
-        # 2. Authoritative negative: platform says not solved.
-        #    Don't fall through to exact match (flag may appear in text
-        #    without being properly submitted, or may be system prompt text).
         if metadata_success is False:
             if re.search(r"FLAG\{[a-zA-Z0-9_-]+\}", text):
                 return 0.1
             return 0.0
 
-        # 3. No metadata — use string matching as fallback.
+        # 1. Environment verification: ToolExecutor responds with
+        #    "Correct! Flag verified: <flag>" on success, or
+        #    "Incorrect submission: <flag>" on failure. This is the
+        #    strongest signal (environment-verified).
+        if self._FLAG_VERIFIED in text:
+            return 1.0
+        if self._FLAG_REJECTED in text:
+            # Environment explicitly rejected — wrong flag was submitted.
+            return 0.0
+
+        # 2. Exact match against ground truth (fallback when env signal absent).
         #    Skip placeholder flags and flags containing template text.
         if ground_truth and self._is_real_flag(ground_truth) and ground_truth in text:
             return 1.0
 
-        # 4. Pattern match: FLAG{<alphanumeric>} (excludes FLAG{...})
+        # 3. Pattern match: FLAG{<alphanumeric>} (excludes FLAG{...})
         if re.search(r"FLAG\{[a-zA-Z0-9_-]+\}", text):
             return 0.1
 
@@ -252,7 +382,6 @@ class CTFReward:
         if flag in _FLAG_PLACEHOLDERS:
             return False
         # Detect template text that was accidentally captured as ground_truth_flag
-        # (e.g., multiline strings containing "content_of_flag_here")
         if "content_of_flag_here" in flag:
             return False
         return True
@@ -260,14 +389,8 @@ class CTFReward:
     def _uniqueness_score(self, tool_calls: List[Dict[str, str]]) -> float:
         """Score command diversity (0.0 - 1.0). No regex.
 
-        Measures the ratio of unique commands to total commands.
-        Successful traces have ~97% unique commands (each step tries
-        something new). Failed traces repeat ~30% of commands (stuck
-        in loops). Correlation with success: r=0.381 (3.7x better
-        than the regex-based grammar score it replaces).
-
-        Returns 0.0 for no tool calls, 0.5 for tool calls without
-        extractable commands (neutral).
+        Information entropy: ratio of unique commands to total commands.
+        Returns 0.0 for no tool calls, 0.5 for non-extractable commands.
         """
         if not tool_calls:
             return 0.0
@@ -316,7 +439,7 @@ class CTFReward:
             elif isinstance(args, str):
                 return args.strip()
         except (json.JSONDecodeError, TypeError):
-            # Not JSON — use raw string
+            # Not JSON -- use raw string
             if isinstance(args_str, str):
                 return args_str.strip()
 
@@ -326,15 +449,15 @@ class CTFReward:
         self, actual_steps: int, optimal_steps: Optional[int],
         flag_found: bool = False,
     ) -> float:
-        """min(optimal / actual, 1.0). Returns 0.5 (neutral) without metadata.
+        """Principle of least action: min(optimal / actual, 1.0).
 
-        Gated by a minimum step threshold: submissions with fewer than 3 steps
-        receive 0.0 to prevent single-step garbage from earning high efficiency.
-        Non-flag completions are capped at 0.3 to avoid rewarding short but
-        wrong submissions.
+        Returns 0.0 for zero steps, 0.3 (weak prior) without metadata.
+        Non-flag completions capped at 0.3. Fewer than 3 steps = 0.0.
         """
+        if actual_steps == 0:
+            return 0.0  # No trajectory = no path integral to measure
         if optimal_steps is None:
-            return 0.5  # Neutral score when metadata unavailable
+            return 0.3  # Weak prior: trajectory exists but unmeasured
         if actual_steps < 3:
             return 0.0  # Prevent single-step garbage from gaming efficiency
         raw = min(optimal_steps / actual_steps, 1.0)
@@ -343,17 +466,26 @@ class CTFReward:
         return raw
 
     def _format_score(self, tool_calls: List[Dict[str, str]]) -> float:
-        """Score based on valid structured tool calls (not string matching)."""
+        """Signal fidelity: valid instrument readings from known tools only.
+
+        Scoring per known tool call:
+          - Valid JSON args: 1.0
+          - Invalid JSON args: 0.5 (partial signal, learning)
+          - Unknown tool name: 0.0 (no signal)
+        """
         if not tool_calls:
             return 0.0
 
         valid = 0
+        known_count = 0
         for tc in tool_calls:
-            # Valid tool call has both a name and parseable arguments
-            if tc["name"] and tc["arguments"]:
+            name = tc.get("name", "")
+            if not self._is_known_tool(name):
+                continue
+
+            known_count += 1
+            if tc["arguments"]:
                 args = tc["arguments"]
-                # In online mode TRL passes arguments as dicts already;
-                # in offline mode they arrive as JSON strings.
                 if isinstance(args, dict):
                     valid += 1
                 else:
@@ -361,16 +493,19 @@ class CTFReward:
                         json.loads(args)
                         valid += 1
                     except (json.JSONDecodeError, TypeError):
-                        # Arguments present but not valid JSON
                         valid += 0.5
-        return min(valid / len(tool_calls), 1.0)
+
+        if known_count == 0:
+            return 0.0
+        return min(valid / known_count, 1.0)
+
+    @staticmethod
+    def _is_known_tool(name: str) -> bool:
+        """Check if a tool name is a recognized CTF instrument."""
+        return name in _KNOWN_TOOL_NAMES
 
     def _progression_score(self, tool_calls: List[Dict[str, str]]) -> float:
-        """Score RECON→ENUM→EXPLOIT phase presence and ordering.
-
-        Uses set-based binary lookup on the first token of shell commands
-        (no regex). Tool names like ``python_code`` or ``read_file`` are
-        classified directly by name.
+        """Phase space trajectory: RECON->ENUM->EXPLOIT ordering.
 
         Scoring: 0.6 for phase presence + 0.4 for correct ordering.
         """
@@ -414,13 +549,11 @@ class CTFReward:
         if name in _TOOL_NAME_PHASES:
             return _TOOL_NAME_PHASES[name]
 
-        # For shell_command / exec_command, classify by first token
-        if name in ("shell_command", "exec_command", "execute_command",
-                    "shell", "bash", "Bash"):
+        # For shell wrappers, classify by first token (binary name)
+        if name in _SHELL_WRAPPERS:
             cmd = CTFReward._extract_command(tc)
             if not cmd:
                 return None
-            # Get binary name (first token, strip path)
             first_token = cmd.split()[0].rsplit("/", 1)[-1].lower()
             if first_token in _RECON_BINARIES:
                 return "recon"
@@ -432,45 +565,166 @@ class CTFReward:
         return None
 
     def _exploration_score(self, tool_calls: List[Dict[str, str]]) -> float:
-        """Reward novel tool names weighted toward early trajectory.
+        """Exponentially-decayed novelty of known instruments.
 
-        Early exploration (trying new tools at the start) is more valuable
-        than late exploration. Score = Σ (1 - t/T) for each novel tool,
-        normalized to [0, 1]. No regex.
+        Uses gamma^t decay so earlier novel tool use carries exponentially
+        more signal than late novelty. gamma=0.95 means step 0 gets weight
+        1.0, step 10 gets 0.60, step 50 gets 0.08.
+
+        Only known CTF tool names contribute. No regex.
         """
         if not tool_calls:
             return 0.0
 
-        T = len(tool_calls)
+        gamma = self.exploration_gamma
         seen: set = set()
         score = 0.0
         max_possible = 0.0
 
         for t, tc in enumerate(tool_calls):
-            decay = 1.0 - (t / T) if T > 1 else 1.0
-            max_possible += decay
             name = tc.get("name", "")
-            if name and name not in seen:
-                seen.add(name)
-                score += decay
+            if not name:
+                continue
+
+            decay = gamma ** t
+
+            # Only known instruments contribute to exploration signal.
+            if self._is_known_tool(name):
+                max_possible += decay
+                if name not in seen:
+                    seen.add(name)
+                    score += decay
 
         return score / max_possible if max_possible > 0 else 0.0
 
-    def _hallucination_score(
-        self, tool_calls: List[Dict[str, str]], flag_sc: float
-    ) -> float:
-        """Penalty for false flag submissions. Structural, no regex.
+    def _recovery_score(self, tool_calls: List[Dict[str, str]]) -> float:
+        """Resilience: reward pivots after stuck runs.
 
-        Fires when ``flag_found`` tool was called but flag_score < 1.0,
-        meaning the submitted flag was wrong or unverified.
-        Returns a negative value (penalty) or 0.0.
+        A "stuck run" is 2+ consecutive calls with the same action
+        fingerprint (tool name + binary name for shell wrappers).
+        A "pivot" is transitioning out of a stuck run.
+
+        Returns:
+          - 0.5 (neutral) when < 3 tool calls or no stuck runs
+          - pivots / stuck_runs for traces with stuck periods
+          - 0.0 when stuck but never pivoting (worst case)
+
+        No regex. Uses first-token extraction for shell command identity.
         """
+        if len(tool_calls) < 3:
+            return 0.5  # Too short to measure
+
+        # Build action fingerprint sequence
+        actions: List[str] = []
+        for tc in tool_calls:
+            actions.append(self._action_fingerprint(tc))
+
+        if not actions:
+            return 0.5
+
+        # Count stuck runs and pivots
+        stuck_runs = 0
+        pivots = 0
+        run_length = 1
+
+        for i in range(1, len(actions)):
+            if actions[i] == actions[i - 1]:
+                run_length += 1
+            else:
+                if run_length >= 2:
+                    stuck_runs += 1
+                    pivots += 1  # Transitioned out = pivot
+                run_length = 1
+
+        # Check if trace ended in a stuck run (no pivot out)
+        if run_length >= 2:
+            stuck_runs += 1
+
+        if stuck_runs == 0:
+            return 0.5  # No stuck runs = neutral (no recovery needed)
+
+        return pivots / stuck_runs
+
+    @staticmethod
+    def _action_fingerprint(tc: Dict[str, str]) -> str:
+        """Create a fingerprint for a tool call action.
+
+        For shell wrappers, includes the binary name so that
+        shell_command("nmap") and shell_command("curl") are distinct.
+        For other tools, uses the tool name directly.
+        No regex -- uses split + rsplit for binary extraction.
+        """
+        name = tc.get("name", "")
+        if name in _SHELL_WRAPPERS:
+            cmd = CTFReward._extract_command(tc)
+            if cmd:
+                binary = cmd.split()[0].rsplit("/", 1)[-1].lower()
+                return f"{name}:{binary}"
+        return name
+
+    def _cognitive_score(self, text: str, tool_calls: List[Dict[str, str]]) -> float:
+        """Words-per-action scoring. Optimal reasoning density at ~42 WPA.
+
+        Research finding (H12): success traces average 51 WPA, failures
+        average 16 WPA. Optimal is ~42. Underthinking (< 10 WPA) strongly
+        correlates with failure. Severe overthinking (> 80 WPA) wastes
+        tokens without improving outcomes.
+
+        Returns 0.5 (neutral) when text is too short to measure (< 5 words)
+        or when there are no tool calls. No regex -- whitespace split only.
+        """
+        if not tool_calls:
+            return 0.0
+
+        words = text.split() if text else []
+        word_count = len(words)
+
+        if word_count < 5:
+            return 0.5  # Insufficient text to measure (online mode, tests)
+
+        wpa = word_count / len(tool_calls)
+
+        # Piecewise linear scoring around optimal 42 WPA
+        _OPTIMAL = 42.0
+        if wpa < 10:
+            return 0.1  # Severe underthinking
+        elif wpa <= _OPTIMAL:
+            # Linear ramp from 0.1 at WPA=10 to 1.0 at WPA=42
+            return 0.1 + 0.9 * (wpa - 10) / (_OPTIMAL - 10)
+        elif wpa <= 80:
+            # Gentle decline from 1.0 at WPA=42 to 0.5 at WPA=80
+            return 1.0 - 0.5 * (wpa - _OPTIMAL) / (80 - _OPTIMAL)
+        else:
+            # Plateau at 0.3 for extreme overthinking
+            return 0.3
+
+    def _hallucination_score(
+        self, tool_calls: List[Dict[str, str]], flag_sc: float, ground_truth: Optional[str] = None
+    ) -> float:
+        """Energy loss for false flag submissions. Structural, no regex.
+
+        When ``flag_found`` tool was called but flag_score < 1.0, the
+        trajectory has moved backward. Returns a negative penalty.
+        The caller also zeroes all process signals when this fires.
+        """
+        import difflib
+
         if flag_sc >= 1.0:
-            return 0.0  # Correct flag — no penalty
+            return 0.0  # Correct flag -- no penalty
 
         for tc in tool_calls:
-            if tc.get("name") == "flag_found":
-                return -self.hallucination_penalty
+            if tc.get("name") in ("flag_found", "submit_flag"):
+                penalty = -self.hallucination_penalty
+                
+                if ground_truth:
+                    submitted = self._extract_command(tc).strip()
+                    if submitted:
+                        similarity = difflib.SequenceMatcher(None, submitted, ground_truth).ratio()
+                        if similarity >= 0.8:
+                            # 80%+ similar (e.g., missing FLAG{} wrapper), decay the penalty by 90%
+                            penalty *= 0.1
+                
+                return penalty
 
         return 0.0
 
@@ -492,7 +746,7 @@ class CTFReward:
             # Single message dict (not wrapped in a list)
             content = completion.get("content") or ""
             tool_calls = []
-            for tc in completion.get("tool_calls", []):
+            for tc in (completion.get("tool_calls") or []):
                 func = tc.get("function", {})
                 name = func.get("name", "")
                 args = func.get("arguments", "")
@@ -509,8 +763,8 @@ class CTFReward:
                     continue
                 content = msg.get("content") or ""
                 text_parts.append(str(content))
-                for tc in msg.get("tool_calls", []):
-                    func = tc.get("function", {})
+                for tc in (msg.get("tool_calls") or []):
+                    func = tc.get("function", {}) if isinstance(tc, dict) else {}
                     name = func.get("name", "")
                     args = func.get("arguments", "")
                     if isinstance(args, dict):
@@ -519,34 +773,3 @@ class CTFReward:
             return "\n".join(text_parts), tool_calls
         return str(completion), []
 
-
-# ---------------------------------------------------------------------------
-# OpenEnv environment reward function
-# ---------------------------------------------------------------------------
-
-
-def env_reward_fn(completions: List[Any], **kwargs: Any) -> List[float]:
-    """Extract environment rewards passed via ``**kwargs`` from a rollout.
-
-    When using TRL's ``tools=`` mode, the environment
-    reward is injected into kwargs by the rollout function.  This function
-    simply extracts and returns it.
-
-    Designed to be passed to ``GRPOTrainer(reward_funcs=[env_reward_fn])``.
-
-    Args:
-        completions: List of completions (used only for batch size).
-        **kwargs: Must contain ``env_reward`` (list of floats) when the
-            environment is active. Falls back to 0.0 per sample when
-            absent (offline mode).
-
-    Returns:
-        List of float reward values, one per completion.
-    """
-    rewards = kwargs.get("env_reward")
-    if rewards is not None:
-        return [float(r) for r in rewards]
-    return [0.0 for _ in completions]
-
-
-env_reward_fn.__name__ = "env_reward"

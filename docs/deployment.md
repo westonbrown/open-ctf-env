@@ -14,15 +14,15 @@ Instructions for deploying a trained Open CTF model for inference.
 ```bash
 # Merge adapter, convert to GGUF, quantize to Q4_K_M (one command)
 open-ctf-export \
-    --adapter outputs/sft/final \
-    --base-model unsloth/GLM-4.7-Flash \
+    --adapter outputs/grpo/final \
+    --base-model Nanbeige/Nanbeige4.1-3B \
     --output models/ctf-agent-Q4_K_M.gguf \
     --quant Q4_K_M
 
 # Export without quantization (F16)
 open-ctf-export \
-    --adapter outputs/sft/final \
-    --base-model unsloth/GLM-4.7-Flash \
+    --adapter outputs/grpo/final \
+    --base-model Nanbeige/Nanbeige4.1-3B \
     --output models/ctf-agent-f16.gguf \
     --quant none
 ```
@@ -31,15 +31,16 @@ open-ctf-export \
 
 ```bash
 open-ctf-train merge \
-    --adapter outputs/sft/final \
+    --adapter outputs/grpo/final \
+    --base-model Nanbeige/Nanbeige4.1-3B \
     --output outputs/merged
 ```
 
 ## Deployment Options
 
-### Option A: DGX Spark with Ollama
+### Option A: Ollama (Recommended for Local)
 
-Best for: local development, small models (8B-30B).
+Best for: local development, small-to-medium models (3B-30B).
 
 ```bash
 # 1. Create Ollama model from GGUF
@@ -58,14 +59,9 @@ open-ctf-agent \
     --max-turns 30
 ```
 
-**DGX Spark specs:**
-- GPU: Grace Blackwell GB10, 128GB unified memory
-- Fits: BF16 models up to ~60GB, Q4_K_M up to ~120B params
-- Ollama Docker: `docker run -d --gpus all -p 11434:11434 ollama/ollama:latest`
+### Option B: llama.cpp
 
-### Option B: DGX Spark with llama.cpp
-
-Best for: maximum context, reasoning models, GGUF with `--jinja`.
+Best for: maximum context, reasoning models, GGUF with `--jinja` template support.
 
 ```bash
 # 1. Serve the model
@@ -76,23 +72,55 @@ llama-server \
     -c 32768
 
 # 2. Run the agent (from another terminal)
+OPENAI_API_BASE=http://localhost:8080/v1 \
 open-ctf-agent \
     --platform cybench \
     --target "[Very Easy] Dynastic" \
     --model openai/ctf-agent \
     --max-turns 30
-# Set OPENAI_API_BASE=http://localhost:8080/v1
 ```
 
-### Option C: RunPod H200 with vLLM
+### Option C: vLLM (Production)
 
-Best for: large models (100B+), high throughput, production inference.
+Best for: large models (24B+), high throughput, production inference.
+
+```bash
+# 1. Serve the merged model
+vllm serve outputs/merged \
+    --host 0.0.0.0 --port 8000 \
+    --max-model-len 32768 \
+    --dtype bfloat16 \
+    --gpu-memory-utilization 0.90 \
+    --trust-remote-code \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes
+
+# 2. Run the agent
+OPENAI_API_BASE=http://localhost:8000/v1 \
+open-ctf-agent \
+    --platform cybench \
+    --target "[Easy] TimeKORP" \
+    --model openai/ctf-agent \
+    --max-turns 30
+```
+
+**Tool call parser selection:**
+
+| Model Family | vLLM Parser | Notes |
+|-------------|-------------|-------|
+| Nanbeige4.1-3B, Qwen3 | `hermes` | Hermes tool format (ChatML) |
+| GLM-4.7-Flash | `glm47` | GLM4 XML tool format |
+| Devstral/Mistral | `mistral` | Mistral tool format |
+
+### Option D: RunPod H200 (Cloud)
+
+Best for: large models on cloud GPU.
 
 ```bash
 # 1. SSH to RunPod instance
 ssh root@<RUNPOD_IP>
 
-# 2. Serve the merged model
+# 2. Serve the model
 vllm serve outputs/merged \
     --host 0.0.0.0 --port 8000 \
     --max-model-len 32768 \
@@ -105,18 +133,13 @@ vllm serve outputs/merged \
 # 3. Run the agent locally (with SSH tunnel)
 ssh -L 8000:localhost:8000 root@<RUNPOD_IP>
 
+OPENAI_API_BASE=http://localhost:8000/v1 \
 open-ctf-agent \
     --platform cybench \
     --target "[Easy] TimeKORP" \
     --model openai/ctf-agent \
     --max-turns 30
-# Set OPENAI_API_BASE=http://localhost:8000/v1
 ```
-
-**RunPod H200 specs:**
-- GPU: NVIDIA H200 SXM, 141GB VRAM
-- Cost: ~$3.59/hr
-- Fits: BF16 models up to ~70B, or Q4 up to ~200B
 
 ## Quantization Options
 
@@ -133,10 +156,24 @@ open-ctf-agent \
 
 | Base Model | Params | F16 | Q4_K_M | VRAM (Q4) |
 |-----------|--------|-----|--------|-----------|
-| Qwen3-8B | 8B | 16GB | 5GB | ~8GB |
+| Nanbeige4.1-3B | 3B | 6GB | 2GB | ~4GB |
 | Devstral Small 2 | 24B | 48GB | 14GB | ~18GB |
-| GLM-4.7 Flash | 8B | 16GB | 5GB | ~8GB |
-| GPT-OSS 120B | 120B | 240GB | 67GB | ~80GB |
+| GLM-4.7-Flash | 30B MoE | 60GB | 18GB | ~22GB |
+
+## Docker Deployment
+
+```bash
+# Export via Docker
+docker compose run --rm export
+
+# Or serve the merged model directly
+docker run --gpus all -p 8000:8000 \
+    -v ./outputs/merged:/model \
+    vllm/vllm-openai:latest \
+    --model /model \
+    --max-model-len 32768 \
+    --dtype bfloat16
+```
 
 ## Troubleshooting
 
@@ -148,8 +185,7 @@ export LLAMA_CPP_DIR=$(pwd)
 ```
 
 **vLLM tool call errors:**
-Add `--tool-call-parser hermes` for Qwen-family models,
-or `--tool-call-parser mistral` for Mistral-family models.
+Add the correct `--tool-call-parser` for your model family (see table above).
 
 **Ollama context too short:**
 Always create a Modelfile with explicit `num_ctx`:
@@ -161,3 +197,6 @@ PARAMETER num_ctx 32768
 **GGUF conversion fails:**
 Ensure the merged model has all required files:
 `config.json`, `model*.safetensors`, `tokenizer.json`, `tokenizer_config.json`.
+
+**DGX Spark (GB10) vLLM issues:**
+GB10's sm_121a compute capability may not be supported by all vLLM versions. Use llama.cpp or Ollama as alternatives.

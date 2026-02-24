@@ -5,35 +5,19 @@ Transformers v5 MoE models store expert weights as fused 3D
 ``nn.Parameter`` tensors (shape: ``[num_experts, dim1, dim2]``) which
 BnB silently leaves in BF16.
 
-For GLM-4.7-Flash this means BnB ``load_in_4bit`` only saves ~3 GB
-(58 GB vs 62 GB BF16) because 90% of parameters are routed experts.
+For MoE models (e.g. GLM-4.7-Flash) this means BnB ``load_in_4bit``
+only saves ~3 GB because 90% of parameters are routed experts.
 
 This module provides post-load quantization via
 ``bitsandbytes.nn.parametrize.replace_parameter_4bit`` (requires
-bitsandbytes >= 0.48.0) to quantize those expert tensors too, bringing
-the model from ~58 GB down to ~17 GB.
-
-Used by both SFT and GRPO training stages.
+bitsandbytes >= 0.48.0) to quantize those expert tensors too.
 """
 
 import logging
-import os
 
 import torch
 
 logger = logging.getLogger(__name__)
-
-
-def set_moe_backend():
-    """Set UNSLOTH_MOE_BACKEND for GB10 compatibility if not already set.
-
-    On Blackwell GB10 (sm_121), Triton MoE kernels need >99KB shared memory
-    per thread block, exceeding the 99KB hardware limit. The 'grouped_mm'
-    backend uses torch._grouped_mm instead of Triton kernels, avoiding the OOM.
-    """
-    if "UNSLOTH_MOE_BACKEND" not in os.environ:
-        os.environ["UNSLOTH_MOE_BACKEND"] = "grouped_mm"
-        logger.info("Set UNSLOTH_MOE_BACKEND=grouped_mm (GB10 safe default)")
 
 
 def find_moe_expert_param_names(model) -> list:
@@ -67,7 +51,7 @@ def quantize_moe_expert_params(model, quant_type=None,
     Uses ``bitsandbytes.nn.parametrize.replace_parameter_4bit`` to apply
     NF4 quantization to fused expert weights post-load.
 
-    For GLM-4.7-Flash (46 MoE layers x 64 experts):
+    For large MoE models (e.g. 46 MoE layers x 64 experts):
       BF16 experts: ~52 GB  ->  4-bit experts: ~6.5 GB  =  ~45 GB saved
 
     Returns True if any parameters were quantized.

@@ -225,6 +225,13 @@ class DatasetSplitter:
                 # Keep the first flag found (they should all be the same)
                 if key not in lookup:
                     lookup[key] = flag
+                elif lookup[key] != flag:
+                    logger.warning(
+                        "Flag conflict for challenge %s: existing=%r, new=%r",
+                        key,
+                        lookup[key],
+                        flag,
+                    )
         return lookup
 
     @staticmethod

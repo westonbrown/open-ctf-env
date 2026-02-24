@@ -15,17 +15,20 @@ Get up and running with Open CTF Environment in minutes.
 git clone https://github.com/westonbrown/open-ctf-env.git
 cd open-ctf-env
 
-# Install with uv (recommended)
-uv pip install -e .
-
-# Or with pip
+# Install core only
 pip install -e .
 
-# For training with Unsloth
-uv pip install -e ".[train]"
+# For SFT training (LlamaFactory)
+pip install -e ".[sft]"
+
+# For GRPO training (SkyRL + Ray)
+pip install -e ".[grpo]"
+
+# For GEPA prompt optimization (DSPy)
+pip install -e ".[gepa]"
 
 # For agent runner
-uv pip install -e ".[agent]"
+pip install -e ".[agent]"
 ```
 
 ## Setup
@@ -83,30 +86,63 @@ cat data/all_traces.jsonl data/failed_traces.jsonl > data/combined.jsonl
 open-ctf-split --input data/combined.jsonl
 ```
 
-### Train a Model
+### Train a Model (3-Stage Pipeline)
 
 ```bash
-# SFT stage
+# Stage 1: SFT via LlamaFactory
 open-ctf-train sft \
-    --model unsloth/GLM-4.7-Flash \
+    --model Nanbeige/Nanbeige4.1-3B \
     --data data/sft.jsonl \
     --output outputs/sft
 
-# GRPO stage (after SFT)
+# Merge LoRA adapter into base model
+open-ctf-train merge \
+    --adapter outputs/sft \
+    --base-model Nanbeige/Nanbeige4.1-3B \
+    --output outputs/sft-merged
+
+# Stage 2: Online GRPO via SkyRL (requires OpenEnv server running)
+OPEN_CTF_ENV_URL=http://localhost:8100 \
 open-ctf-train grpo \
-    --model outputs/sft/final \
+    --model outputs/sft-merged \
     --data data/grpo.jsonl \
     --output outputs/grpo
+
+# Stage 3: GEPA prompt optimization (no weight updates)
+open-ctf-train gepa \
+    --model openai/ctf-agent \
+    --data data/grpo.jsonl \
+    --output outputs/gepa \
+    --reflection-model anthropic/claude-sonnet-4-20250514
 ```
 
 ### Export for Deployment
 
 ```bash
 open-ctf-export \
-    --adapter outputs/sft/final \
-    --base-model unsloth/GLM-4.7-Flash \
+    --adapter outputs/grpo/final \
+    --base-model Nanbeige/Nanbeige4.1-3B \
     --output models/ctf-agent.gguf \
     --quant Q4_K_M
+```
+
+## Docker Workflows
+
+```bash
+# Stage 1: SFT
+docker compose run --rm sft
+
+# Merge LoRA
+docker compose run --rm merge
+
+# Stage 2: Online GRPO (set OPEN_CTF_ENV_URL in .env or environment)
+docker compose run --rm grpo
+
+# Validate pipeline
+docker compose run --rm validate
+
+# Export to GGUF
+docker compose run --rm export
 ```
 
 ## Environment Variables
@@ -115,11 +151,13 @@ open-ctf-export \
 |----------|-------------|---------|
 | `OPEN_CTF_PROVIDER` | Model provider | `ollama` |
 | `OPEN_CTF_MODEL` | LLM model ID | `ollama/qwen3:8b` |
+| `OPEN_CTF_ENV_URL` | OpenEnv server URL (for GRPO) | `http://localhost:8100` |
 | `OLLAMA_HOST` | Ollama server URL | `http://localhost:11434` |
 | `OPEN_CTF_OUTPUT_DIR` | Output directory | `./outputs` |
 
 ## Next Steps
 
-- [Training Guide](training.md) - Full 2-stage pipeline details
-- [Deployment Guide](deployment.md) - Deploy trained models
-- [Architecture](architecture.md) - Module overview and data flow
+- [Training Guide](training.md) -- Full 3-stage pipeline details
+- [Deployment Guide](deployment.md) -- Deploy trained models
+- [Data Collection Guide](data-collection.md) -- Collect real training traces
+- [Architecture](architecture.md) -- Module overview and data flow

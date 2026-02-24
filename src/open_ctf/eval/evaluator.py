@@ -6,7 +6,7 @@ human-readable markdown summary table.
 
 Usage (programmatic):
     from open_ctf.eval import ModelEvaluator
-    ev = ModelEvaluator(model="ollama/glm-4.7-flash")
+    ev = ModelEvaluator(model="ollama/nanbeige4.1-3b")
     report = ev.run_all()
     ev.save(report, "outputs/eval")
 
@@ -71,7 +71,7 @@ class ModelEvaluator:
     """Run BoxPwnr solver across a challenge set and collect metrics.
 
     Args:
-        model: LLM model identifier (e.g. ``ollama/glm-4.7-flash``).
+        model: LLM model identifier (e.g. ``ollama/nanbeige4.1-3b``).
         challenges_yaml: Path to YAML file listing challenges.
         platform: Default platform for challenges (overridden per-challenge).
         strategy: BoxPwnr strategy name (``chat_tools`` or ``chat``).

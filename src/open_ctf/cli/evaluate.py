@@ -6,7 +6,7 @@ Run a model against the benchmark challenge suite and produce a report.
 Usage:
     # Evaluate a model
     open-ctf eval run \\
-        --model ollama/glm-4.7-flash \\
+        --model ollama/nanbeige4.1-3b \\
         --output outputs/eval/base
 
     # Compare base vs fine-tuned
@@ -96,6 +96,11 @@ def main() -> None:
     run_parser.add_argument("--traces-dir", default="./targets")
     run_parser.add_argument("--reasoning-effort", default="medium")
     run_parser.add_argument("--attempts", type=int, default=1)
+    run_parser.add_argument(
+        "--agent",
+        default="boxpwnr",
+        help="Agent to use: 'boxpwnr' (default) or 'custom:module.ClassName'",
+    )
     run_parser.set_defaults(func=cmd_run)
 
     # -- compare ---------------------------------------------------------

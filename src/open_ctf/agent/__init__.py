@@ -1,5 +1,7 @@
-"""BoxPwnr-based CTF agent runner for Open CTF Environment."""
+"""CTF agent interface and implementations."""
 
+from .protocol import AgentResult, CTFAgent
 from .runner import AgentRunner
+from .boxpwnr_adapter import BoxPwnrAgent
 
-__all__ = ["AgentRunner"]
+__all__ = ["AgentResult", "AgentRunner", "BoxPwnrAgent", "CTFAgent"]

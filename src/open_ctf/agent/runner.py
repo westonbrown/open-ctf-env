@@ -64,7 +64,7 @@ class AgentRunner:
     a simplified interface for the Open CTF project.
 
     Usage:
-        runner = AgentRunner(platform="xbow", model="ollama/glm-4.7-flash")
+        runner = AgentRunner(platform="xbow", model="ollama/nanbeige4.1-3b")
         runner.run(target="XBEN-003-24")
     """
 

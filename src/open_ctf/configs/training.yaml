@@ -1,20 +1,21 @@
-# Open CTF Training Configuration (Cloud H100/H200)
+# Open CTF Training Configuration
 # ==================================================
 # Used by: open-ctf-train (src/open_ctf/cli/train.py)
-# For DGX Spark (GB10): use training_dgx.yaml instead.
+#
+# Default model: Nanbeige4.1-3B (3B dense LlamaForCausalLM)
+# For GLM-4.7-Flash (30B MoE): use training_120gb_moe.yaml or training_140gb_moe.yaml.
+# For Nanbeige on DGX Spark (GB10): use training_120gb_dense.yaml for tuned memory budgets.
 
 model:
-  name: "unsloth/GLM-4.7-Flash"
-  max_seq_length: 4096
-  # GLM-4.7-Flash is MoE — 4-bit QLoRA not supported for MoE models.
-  # Use BF16 LoRA. Set to true only for dense models (e.g. Devstral).
-  load_in_4bit: false
+  name: "Nanbeige/Nanbeige4.1-3B"
+  max_seq_length: 32768
+  # QLoRA 4-bit works for dense Llama models (no MoE expert tensor workarounds needed).
+  load_in_4bit: true
 
 lora:
   r: 64
-  alpha: 64
+  alpha: 128
   dropout: 0
-  # GLM-4.7-Flash uses o_proj (not out_proj). Router layers excluded by default.
   target_modules:
     - q_proj
     - k_proj
@@ -38,26 +39,26 @@ sft:
 grpo:
   epochs: 1
   batch_size: 1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   learning_rate: 5.0e-6
   warmup_ratio: 0.10
   beta: 0.0
   loss_type: dapo
-  # Default: 8 generations, 4096 completions (cloud H200).
-  # DGX Spark (GB10, 120GB): use num_generations=2, max_completion_length=512
-  # via env overrides or --config pointing to a DGX-specific yaml.
   num_generations: 8
-  max_completion_length: 4096
+  max_completion_length: 32768
   max_grad_norm: 0.1
   epsilon_high: 0.28
   weight_decay: 0.1
-  scale_rewards: "batch"
+  scale_rewards: false
+  # Advantage estimator: rloo_n (REINFORCE Leave-One-Out, normalized).
+  # Alternatives: grpo, rloo, reinforce++, gae.
+  advantage_estimator: rloo_n
   # vLLM for fast generation (3-6x faster than HF generate).
-  # Requires model architecture supported by vLLM.
+  # LlamaForCausalLM is first-class in vLLM — no special parsers needed.
   use_vllm: true
   vllm_mode: colocate
-  gpu_memory_utilization: 0.6
-  # OpenEnv online training: max tool-calling iterations per generation.
+  gpu_memory_utilization: 0.4
+  # Online training: max tool-calling iterations per generation.
   max_tool_calling_iterations: 15
 
 reward:

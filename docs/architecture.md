@@ -1,572 +1,315 @@
 # Architecture
 
-Open CTF Environment is a 2-stage training pipeline for fine-tuning LLMs on CTF tasks using BoxPwnr agent traces.
+Open CTF Environment is a **3-stage training pipeline** for fine-tuning LLMs on CTF tasks using BoxPwnr agent traces: LlamaFactory SFT, SkyRL online GRPO, and GEPA prompt evolution.
 
 ## System Overview
 
-```mermaid
-graph TB
-    subgraph "Data Collection"
-        A[CTF Challenges<br/>CyBench/HTB/PortSwigger] --> B[BoxPwnr Agent]
-        B --> C[Raw Traces<br/>conversation.json + stats.json]
-    end
-
-    subgraph "Data Processing"
-        C --> D[BoxPwnrConverter<br/>Lossless trace conversion]
-        D --> E[ChatML JSONL<br/>17 native tools preserved]
-        E --> F[DatasetSplitter<br/>SFT/GRPO separation]
-        F --> G[SFT Dataset<br/>Successful traces]
-        F --> H[GRPO Dataset<br/>Multi-turn + ground_truth_flag]
-    end
-
-    subgraph "Training Pipeline"
-        G --> I[SFT Training<br/>Unsloth + TRL<br/>LoRA r=64]
-        I --> J[LoRA Adapter<br/>~60MB]
-        J --> K[Merge<br/>Adapter + Base]
-        K --> L[SFT Model<br/>BF16 merged]
-
-        H --> M[GRPO Training<br/>TRL GRPOTrainer<br/>CTF Reward]
-        L --> M
-        M --> N[GRPO Model<br/>Policy optimized]
-    end
-
-    subgraph "Deployment"
-        N --> O[Export<br/>llama.cpp]
-        O --> P[GGUF Q4_K_M<br/>~15GB]
-        N --> Q[vLLM Serve<br/>BF16/FP8]
-        P --> R[Ollama/llama.cpp]
-        Q --> S[API Server]
-    end
-
-    style I fill:#e1f5e1
-    style M fill:#e1f5e1
-    style O fill:#fff4e1
-    style B fill:#e1e8f5
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    3-STAGE PIPELINE                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Data Collection                                            │
+│  ├── BoxPwnr Agent → CyBench Challenges                    │
+│  ├── Raw traces: conversation.json + stats.json             │
+│  ├── BoxPwnrConverter (lossless, 8 tools preserved)         │
+│  └── DatasetSplitter → SFT + GRPO datasets                 │
+│                                                              │
+│  Stage 1: SFT (LlamaFactory)                               │
+│  ├── YAML-driven config (no Python changes per experiment)  │
+│  ├── Native tool formats (chatml/qwen, glm4_7/glm4_moe)    │
+│  ├── Sequence packing + 4D attention masks                  │
+│  ├── DeepSpeed ZeRO for multi-GPU                          │
+│  └── Output: LoRA adapter → merge → full checkpoint         │
+│                                                              │
+│  Stage 2: Online GRPO (SkyRL)                               │
+│  ├── Ray-based async trainer (FSDP2)                        │
+│  ├── vLLM inference engine (separate process)               │
+│  ├── OpenCTFTextEnv → HTTP → OpenEnv server                │
+│  ├── CTFReward (8 signals + hallucination penalty)          │
+│  └── DAPO loss, no KL penalty                               │
+│                                                              │
+│  Stage 3: GEPA (DSPy)                                       │
+│  ├── No weight updates, only system prompt evolution        │
+│  ├── Pareto-based candidate selection                       │
+│  └── ~6% better than GRPO with 4-35x fewer rollouts        │
+│                                                              │
+│  OpenEnv Server (unchanged across all stages)               │
+│  ├── FastAPI HTTP (reset/step/state/health)                 │
+│  ├── 8 tools (shell, python, files, flag submission)        │
+│  ├── Docker challenge containers                            │
+│  └── Per-session state isolation                            │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Module Structure
 
-```mermaid
-graph LR
-    subgraph "CLI Layer (src/open_ctf/cli/)"
-        CLI1[train.py<br/>sft/grpo/merge]
-        CLI2[convert_traces.py]
-        CLI3[run_agent.py]
-        CLI4[evaluate.py]
-        CLI5[validate_pipeline.py]
-        CLI6[export_gguf.py]
-        CLI7[split_dataset.py]
-    end
+```
+src/open_ctf/
+├── cli/                         # CLI entry points
+│   ├── train.py                 # open-ctf-train (sft, grpo, gepa, merge)
+│   ├── convert_traces.py        # open-ctf-convert
+│   ├── split_dataset.py         # open-ctf-split
+│   ├── evaluate.py              # open-ctf-eval
+│   ├── validate_pipeline.py     # open-ctf-validate
+│   └── export_gguf.py           # open-ctf-export
+├── configs/                     # Training YAML configs
+│   ├── training.yaml            # Default (Nanbeige4.1-3B)
+│   ├── training_120gb_dense.yaml # DGX Spark dense config
+│   ├── training_120gb_moe.yaml  # DGX Spark MoE config
+│   └── training_140gb_moe.yaml  # H200 MoE config
+├── data/
+│   ├── converter.py             # BoxPwnr trace → ChatML conversion
+│   └── splitter.py              # SFT/GRPO dataset splitting
+├── envs/openenv/
+│   ├── server.py                # FastAPI environment server
+│   └── client.py                # HTTP client for tool execution
+├── formatters/
+│   ├── base.py                  # ModelFormatter abstract base
+│   ├── qwen3.py                 # ChatML + Hermes tool format
+│   ├── glm4.py                  # GLM-4.7 observation role + tool format
+│   └── devstral.py              # Mistral INST tags + strict alternation
+├── rewards/
+│   └── reward.py                # CTFReward (8 signals + penalty)
+└── training/
+    ├── sft.py                   # LlamaFactory SFT orchestrator
+    ├── grpo.py                  # SkyRL GRPO orchestrator
+    ├── gepa.py                  # GEPA prompt optimizer (DSPy)
+    ├── step_reward.py           # CTFReward adapter for SkyRL
+    └── tools.py                 # 8 tool schemas + episode management
 
-    subgraph "Core Modules (src/open_ctf/)"
-        D1[data/<br/>converter.py<br/>splitter.py]
-        T1[training/<br/>sft.py<br/>grpo.py]
-        R1[rewards/<br/>reward.py]
-        F1[formatters/<br/>base.py<br/>qwen3/glm4/devstral]
-        A1[agent/<br/>runner.py]
-        E1[eval/<br/>evaluator.py]
-        V1[envs/<br/>gym_env.py]
-    end
+skyrl_envs/
+├── openctf_env.py               # OpenCTFTextEnv (SkyRL BaseTextEnv bridge)
+└── tool_groups.py               # Tool schema definitions for SkyRL
 
-    CLI1 --> T1
-    CLI1 --> R1
-    CLI2 --> D1
-    CLI3 --> A1
-    CLI4 --> E1
-    CLI7 --> D1
-
-    T1 --> F1
-    T1 --> R1
-    E1 --> A1
-
-    style T1 fill:#e1f5e1
-    style R1 fill:#ffe1e1
-    style D1 fill:#e1e8f5
+configs/
+├── llamafactory/                # Per-model SFT configs
+│   ├── nanbeige_3b.yaml
+│   ├── glm47_flash.yaml
+│   └── devstral_24b.yaml
+└── skyrl/                       # Per-model GRPO configs
+    ├── nanbeige_3b.yaml
+    └── glm47_flash.yaml
 ```
 
 ## Training Data Flow
 
-```mermaid
-sequenceDiagram
-    participant BP as BoxPwnr Agent
-    participant Conv as BoxPwnrConverter
-    participant Split as DatasetSplitter
-    participant SFT as SFT Trainer
-    participant GRPO as GRPO Trainer
-
-    BP->>Conv: conversation.json + stats.json
-    Note over Conv: Preserve 17 native tools<br/>Handle tool-calling + chat formats<br/>Extract reasoning, flags
-    Conv->>Split: ChatML JSONL (all traces)
-
-    Note over Split: Success → SFT<br/>Multi-turn + flag → GRPO<br/>Cross-reference flags
-    Split->>SFT: sft.jsonl
-    Split->>GRPO: grpo.jsonl
-
-    Note over SFT: Unsloth FastLanguageModel<br/>LoRA r=64, BF16<br/>Packing enabled
-    SFT->>GRPO: SFT checkpoint (merged)
-
-    Note over GRPO: TRL GRPOTrainer<br/>CTFReward (4 components)<br/>DAPO loss, beta=0.0
-    GRPO->>GRPO: Final model
+```
+BoxPwnr Agent
+    │ conversation.json + stats.json
+    ▼
+BoxPwnrConverter
+    │ Preserve 8 tool types, handle tool_calls + chat formats, extract reasoning/flags
+    ▼
+DatasetSplitter
+    │ Success → SFT, Multi-turn + flag → GRPO
+    ├─── sft.jsonl ────────────────────────► LlamaFactory SFT
+    │                                            │ LoRA adapter
+    │                                            ▼
+    │                                        Merge (PEFT)
+    │                                            │ Full checkpoint
+    └─── grpo.jsonl ───────────────────────► SkyRL Online GRPO
+                                                 │ (via OpenCTFTextEnv → OpenEnv)
+                                                 ▼
+                                            GRPO model → GEPA → Final
 ```
 
 ## CTF Reward Function
 
-```mermaid
-graph TD
-    C[Completion] --> E[Extract Tool Calls + Text]
-    E --> F1[Flag Score 0.30]
-    E --> F2[Grammar Score 0.20]
-    E --> F3[Efficiency Score 0.35]
-    E --> F4[Format Score 0.15]
+The reward function (`src/open_ctf/rewards/reward.py`) scores completions on 8 signals plus a hallucination penalty:
 
-    F1 --> M[Weighted Sum]
-    F2 --> M
-    F3 --> M
-    F4 --> M
+| Signal | Weight | What It Measures |
+|--------|--------|------------------|
+| **Flag Capture** | 0.20 | `metadata.success` > exact match > pattern match (0.1) |
+| **Efficiency** | 0.25 | `min(optimal / actual, 1.0)` steps |
+| **Format** | 0.15 | Valid tool call JSON structure |
+| **Progression** | 0.10 | RECON → ENUM → EXPLOIT phase ordering |
+| **Exploration** | 0.08 | Novel tool usage weighted toward early trajectory |
+| **Uniqueness** | 0.07 | Command diversity (detects stuck loops) |
+| **Recovery** | 0.08 | Successful pivot after errors |
+| **Cognitive** | 0.07 | Reasoning depth (words per action) |
+| **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag |
 
-    M --> N[Add Noise ±0.05]
-    N --> R[Final Reward]
-
-    subgraph "Flag Score"
-        F1A[Exact match:<br/>ground_truth_flag] --> F1B[1.0]
-        F1C[Pattern match:<br/>FLAG\{...\}] --> F1D[0.1]
-        F1E[No flag] --> F1F[0.0]
-    end
-
-    subgraph "Grammar Score"
-        F2A[Classify tools:<br/>RECON/ENUM/EXPLOIT] --> F2B[Check phase order]
-        F2B --> F2C[Presence: 0.6<br/>Order: 0.4]
-    end
-
-    subgraph "Efficiency Score"
-        F3A[optimal_steps /<br/>actual_steps] --> F3B[min(..., 1.0)]
-        F3C[No metadata] --> F3D[0.5 neutral]
-    end
-
-    subgraph "Format Score"
-        F4A[Valid tool_calls<br/>JSON structure] --> F4B[valid / total]
-    end
-
-    style F1 fill:#ffe1e1
-    style F2 fill:#e1f5e1
-    style F3 fill:#e1e8f5
-    style F4 fill:#fff4e1
-```
+All process signals are **ungated** -- they provide gradient signal regardless of flag capture. This prevents reward sparsity during early GRPO training.
 
 ## Model Formatters
 
-```mermaid
-graph TB
-    M[Model ID] --> F[ModelFormatter.from_model_id]
+Each model family has a formatter that handles chat template differences:
 
-    F -->|qwen/openthinker| Q[Qwen3Formatter]
-    F -->|glm| G[GLM4Formatter]
-    F -->|devstral/mistral| D[DevstralFormatter]
+| Formatter | Models | Template | Tool Format |
+|-----------|--------|----------|-------------|
+| `Qwen3Formatter` | Nanbeige4.1-3B, Qwen3 | ChatML (`<\|im_start\|>`) | Hermes (`<tool_call>`) |
+| `GLM4Formatter` | GLM-4.7-Flash | GLM4 (observation role) | GLM4MOE (XML function calls) |
+| `DevstralFormatter` | Devstral-Small-2-24B | Mistral (`[INST]`) | Mistral tool format |
 
-    subgraph "Qwen3Formatter"
-        Q1[ChatML format<br/>tool_calls array<br/>Hermes-style]
-    end
+`ModelFormatter.from_model_id()` auto-detects the appropriate formatter from the model name.
 
-    subgraph "GLM4Formatter"
-        G1[observation role<br/>function call format<br/>Jinja template]
-    end
+## Online RL Architecture (Stage 2: GRPO)
 
-    subgraph "DevstralFormatter"
-        D1[INST tags<br/>Strict alternation<br/>Mistral tool format]
-    end
+### SkyRL Integration
 
-    Q --> Q1
-    G --> G1
-    D --> D1
+SkyRL runs GRPO with Ray actors for async training:
 
-    Q1 --> T[format_messages]
-    G1 --> T
-    D1 --> T
+1. **Generator** (Ray actor): vLLM inference engine produces N completions per prompt.
+2. **Environment** (`OpenCTFTextEnv`): Each generation gets its own env instance.
+   - `init(prompt)` → POST `/reset` to OpenEnv
+   - `step(action)` → Parse tool calls from LLM text → POST `/step` to OpenEnv → Compute reward
+   - `close()` → POST `/close` to OpenEnv
+3. **Trainer** (Ray actor): FSDP2 computes GRPO loss, updates policy weights.
+4. **Placement**: `colocate_all: true` (default) offloads weights to CPU between gen/train. Eliminates weight sync issues for MoE.
 
-    T --> O[Model-native text<br/>Ready for tokenization]
+### OpenEnv Server
+
+FastAPI server providing Gym-style tool execution:
+
+- `POST /reset` → Reset episode, close PTY sessions
+- `POST /step` → Execute tool, return observation + reward + done
+- `POST /state` → Current environment state
+- `GET /health` → Health check
+
+### Tool Set
+
+8 tools shared across training data, reward function, and OpenEnv:
+
+| Tier | Tools | Description |
+|------|-------|-------------|
+| **Execution** | `shell_command`, `python_code` | Shell scripts, Python exploits |
+| **File Ops** | `read_file`, `grep`, `file_search`, `apply_patch` | Read, search, modify files |
+| **Meta** | `flag_found`, `web_search` | Flag submission, CVE lookup |
+
+## Configuration Architecture
+
+### Layered Configs
+
+```
+src/open_ctf/configs/training.yaml        ← Default (Nanbeige4.1-3B, model-agnostic)
+src/open_ctf/configs/training_120gb_dense.yaml ← DGX Spark tuned for dense models
+src/open_ctf/configs/training_120gb_moe.yaml   ← DGX Spark tuned for MoE
+src/open_ctf/configs/training_140gb_moe.yaml   ← H200 tuned for MoE (production)
+
+configs/llamafactory/<model>.yaml          ← LlamaFactory SFT per-model config
+configs/skyrl/<model>.yaml                 ← SkyRL GRPO per-model config
 ```
 
-## Training Execution Flow
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant CLI as open-ctf-train
-    participant SFT as train_sft
-    participant GRPO as train_grpo
-    participant US as Unsloth
-    participant TRL as TRL Trainer
-    participant HF as HuggingFace
-
-    U->>CLI: open-ctf-train sft
-    CLI->>SFT: Load config + data
-
-    alt Unsloth Available
-        SFT->>US: _set_moe_backend()
-        Note over US: UNSLOTH_MOE_BACKEND=grouped_mm
-        SFT->>US: FastLanguageModel.from_pretrained
-        SFT->>US: get_peft_model (LoRA)
-        US->>TRL: SFTTrainer + SFTConfig
-    else Unsloth Unavailable
-        SFT->>HF: AutoModelForCausalLM
-        SFT->>HF: PEFT LoraConfig + get_peft_model
-        SFT->>HF: Add for_training/for_inference stubs
-        HF->>TRL: SFTTrainer + SFTConfig
-    end
-
-    TRL->>SFT: Training complete
-    SFT->>CLI: Return adapter path
-
-    U->>CLI: open-ctf-train grpo
-    CLI->>GRPO: Load SFT model + GRPO data
-
-    alt Unsloth Available
-        GRPO->>US: _set_moe_backend()
-        GRPO->>US: Load model
-    else OPEN_CTF_NO_UNSLOTH=1
-        GRPO->>HF: Load with stubs
-    end
-
-    GRPO->>TRL: GRPOTrainer + CTFReward
-    TRL->>GRPO: Training complete
-    GRPO->>CLI: Return final model
-```
-
-## Hardware Compatibility
-
-```mermaid
-graph TB
-    subgraph "DGX Spark GB10 (ARM64)"
-        GB1[128GB Unified Memory]
-        GB2[Blackwell sm_121a]
-        GB3[99KB Shared Mem Limit]
-    end
-
-    subgraph "Container Requirements"
-        C1[ARM64 Architecture<br/>NOT AMD64]
-        C2[Unsloth 2026.2.1+<br/>Transformers 5.0+<br/>TRL 0.28+]
-        C3[CUDA 12.1/13.0<br/>Triton 3.6+]
-    end
-
-    subgraph "Training Configuration"
-        T1[UNSLOTH_MOE_BACKEND=<br/>grouped_mm]
-        T2[load_in_4bit=False<br/>Use BF16 LoRA]
-        T3[LoRA r=64, alpha=64<br/>target: attn+FFN layers]
-        T4[Router layers excluded]
-    end
-
-    GB3 -.->|Workaround| T1
-    GB2 -.->|Requires| C3
-    GB1 -.->|Enables| T2
-
-    C1 --> D1[unsloth-blackwell:v3<br/>20.5GB, ARM64]
-    C2 --> D1
-    C3 --> D1
-
-    T1 --> D1
-    T2 --> D1
-    T3 --> D1
-    T4 --> D1
-
-    D1 --> R[Training Works<br/>~60GB VRAM used]
-
-    style GB3 fill:#ffe1e1
-    style T1 fill:#e1f5e1
-    style D1 fill:#e1e8f5
-    style R fill:#d4edda
-```
-
-## Evaluation Pipeline
-
-```mermaid
-graph LR
-    subgraph "Model Serving"
-        M1[Trained Model] --> S1[vLLM Server]
-        M1 --> S2[Ollama]
-        M1 --> S3[llama.cpp]
-    end
-
-    subgraph "Challenge Setup"
-        C1[CyBench Benchmark] --> D1[Docker Compose Up]
-        D1 --> T1[Target Running]
-    end
-
-    subgraph "Evaluation"
-        S1 --> E1[ModelEvaluator]
-        S2 --> E1
-        S3 --> E1
-        T1 --> E1
-
-        E1 --> R1[AgentRunner]
-        R1 --> BP[BoxPwnr Solver]
-        BP --> O1[Trace Output]
-    end
-
-    subgraph "Metrics"
-        O1 --> M2[Solve Rate]
-        O1 --> M3[Avg Turns]
-        O1 --> M4[Avg Time]
-        O1 --> M5[Flag Found %]
-    end
-
-    M2 --> CM[Compare Reports]
-    M3 --> CM
-    M4 --> CM
-    M5 --> CM
-
-    style E1 fill:#e1f5e1
-    style CM fill:#fff4e1
-```
-
-## BoxPwnr Tool Categories
-
-```mermaid
-graph TD
-    T[BoxPwnr Tools<br/>17 native tools] --> C1[Shell Execution]
-    T --> C2[Interactive Sessions]
-    T --> C3[Tmux Control]
-    T --> C4[File Operations]
-    T --> C5[Code Execution]
-    T --> C6[Results]
-
-    C1 --> T1[shell_command<br/>execute_command]
-    C2 --> T2[exec_command<br/>write_stdin]
-    C3 --> T3[tmux_send_and_read<br/>tmux_wait_and_read<br/>tmux_read_output<br/>tmux_cancel_command]
-    C4 --> T4[read_file<br/>grep<br/>file_search<br/>apply_patch]
-    C5 --> T5[python_code]
-    C6 --> T6[flag_found<br/>web_search<br/>list_sessions<br/>close_session]
-
-    style T fill:#e1e8f5
-    style C1 fill:#ffe1e1
-    style C3 fill:#e1f5e1
-    style C5 fill:#fff4e1
-```
-
-## Skill Grammar (Reward Component)
-
-```mermaid
-graph LR
-    subgraph "Phase Classification"
-        TC[Tool Call] --> CL{Classify}
-        CL -->|nmap, masscan,<br/>rustscan, ping| R[RECON]
-        CL -->|gobuster, ffuf,<br/>feroxbuster, nikto| EN[ENUM]
-        CL -->|sqlmap, hydra,<br/>python_code,<br/>msfconsole| EX[EXPLOIT]
-    end
-
-    subgraph "Grammar Scoring"
-        R --> SEQ{Check Sequence}
-        EN --> SEQ
-        EX --> SEQ
-
-        SEQ -->|RECON before ENUM| P1[+0.2]
-        SEQ -->|ENUM before EXPLOIT| P2[+0.2]
-        SEQ -->|All 3 phases present| P3[+0.6]
-
-        P1 --> SUM[Sum<br/>max 1.0]
-        P2 --> SUM
-        P3 --> SUM
-    end
-
-    style R fill:#e1e8f5
-    style EN fill:#e1f5e1
-    style EX fill:#ffe1e1
-```
-
-## Hardware Requirements
-
-```mermaid
-graph TB
-    subgraph "Supported Hardware"
-        H1[DGX Spark GB10<br/>128GB unified<br/>ARM64]
-        H2[H100 SXM<br/>80GB VRAM<br/>AMD64]
-        H3[H200 SXM<br/>141GB VRAM<br/>AMD64]
-        H4[A100 80GB<br/>80GB VRAM<br/>AMD64]
-    end
-
-    subgraph "Model Sizing"
-        M1[GLM-4.7-Flash<br/>30B MoE<br/>~60GB BF16 LoRA]
-        M2[Qwen3-8B<br/>8B dense<br/>~24GB 4-bit LoRA]
-        M3[Devstral-2-123B<br/>123B dense<br/>Requires multi-GPU]
-    end
-
-    H1 -->|Fits| M1
-    H1 -->|Fits| M2
-    H2 -->|Fits| M1
-    H2 -->|Fits| M2
-    H3 -->|Fits| M1
-    H3 -->|Fits| M2
-    H3 -->|Fits| M3
-
-    M1 -.->|Special config| C1[UNSLOTH_MOE_BACKEND=<br/>grouped_mm]
-    M1 -.->|No 4-bit| C2[load_in_4bit=False]
-
-    style H1 fill:#e1f5e1
-    style M1 fill:#fff4e1
-    style C1 fill:#ffe1e1
-```
-
-## Key Design Decisions
-
-### 1. Lossless Trace Conversion
-
-**Problem**: Early converters collapsed all tools to a single `shell` tool, losing fine-grained capability data.
-
-**Solution**: BoxPwnrConverter preserves all 17 native tool names, handles both structured `tool_calls` and chat-command `<COMMAND>` formats, and extracts reasoning from multi-part content.
-
-### 2. Dual-Backend Training
-
-**Problem**: Unsloth has known issues on some platforms (GB10 GRPO dtype bug, Triton shared memory limits).
-
-**Solution**: Both `sft.py` and `grpo.py` implement dual loading:
-- **Path A**: Try Unsloth with `grouped_mm` backend (fast, optimized)
-- **Path B**: Fall back to HuggingFace transformers + PEFT (slower, always works)
-- Controlled via `OPEN_CTF_NO_UNSLOTH=1` environment variable
-
-### 3. Model-Specific Formatters
-
-**Problem**: Different model families (Qwen, GLM, Mistral) have incompatible chat templates and tool-calling conventions.
-
-**Solution**: `ModelFormatter` abstract base with auto-detection factory. Each subclass handles:
-- Role token mapping (e.g., GLM's `<|observation|>` for tool results)
-- Tool call serialization (structured arrays vs inline function calls)
-- Reasoning tag placement (interleaved vs separate)
-
-### 4. MoE-Aware Configuration
-
-**Problem**: MoE models have unique constraints:
-- No 4-bit quantization support (BitsAndBytes limitation)
-- Triton MoE kernels exceed GB10 shared memory limit (99KB vs 104KB+ needed)
-- Router layer fine-tuning can destabilize training
-
-**Solution**:
-- Auto-detect MoE models, enforce BF16 LoRA
-- Set `UNSLOTH_MOE_BACKEND=grouped_mm` to use `torch._grouped_mm` (no Triton)
-- Exclude router layers from LoRA target_modules
-- Document memory requirements (60GB for GLM-4.7-Flash)
-
-## Configuration Files
-
-### `src/open_ctf/configs/training.yaml`
-
-Central configuration for both training stages:
-
-```yaml
-model:
-  name: "unsloth/GLM-4.7-Flash"
-  max_seq_length: 4096
-  load_in_4bit: false  # MoE requires BF16
-
-lora:
-  r: 64
-  alpha: 64
-  target_modules: [q_proj, k_proj, v_proj, o_proj,
-                   gate_proj, up_proj, down_proj]
-
-sft:
-  epochs: 3
-  batch_size: 1
-  learning_rate: 2.0e-4
-  packing: true       # 3x throughput improvement
-
-grpo:
-  epochs: 1
-  learning_rate: 5.0e-6
-  beta: 0.0           # No KL penalty (pure DAPO)
-  loss_type: dapo     # Dynamic advantage normalization
-  num_generations: 8
-```
-
-### `src/open_ctf/configs/challenges.yaml`
-
-Challenge definitions for evaluation. Maps challenge IDs to vulnerability types, difficulty, platforms.
-
-## CLI Entry Points
-
-After `pip install -e .`, these commands are available:
-
-| Command | Module | Purpose |
-|---------|--------|---------|
-| `open-ctf-train` | `cli.train` | SFT, GRPO, merge subcommands |
-| `open-ctf-convert` | `cli.convert_traces` | BoxPwnr trace → ChatML conversion |
-| `open-ctf-split` | `cli.split_dataset` | Split data into SFT/GRPO sets |
-| `open-ctf-agent` | `cli.run_agent` | Run agent against CTF challenges |
-| `open-ctf-eval` | `cli.evaluate` | Evaluate and compare models |
-| `open-ctf-validate` | `cli.validate_pipeline` | Validate setup without GPU |
-| `open-ctf-export` | `cli.export_gguf` | Export LoRA to GGUF quantized format |
+The `training.yaml` files define model/lora/sft/grpo parameters consumed by the CLI. The LlamaFactory and SkyRL configs are framework-specific formats generated or used directly.
+
+### Key Settings (32K Context)
+
+| Parameter | SFT | GRPO |
+|-----------|-----|------|
+| Context length | 32768 (`cutoff_len`) | 32768 (`max_prompt_length`) |
+| Max completion | N/A | 32768 (`max_generate_length`) |
+| LoRA rank | 64 | 64 |
+| Learning rate | 2e-4 | 5e-6 |
+| Epochs | 5 | 1 |
+| Loss | Cross-entropy | DAPO |
+| Packing | Yes (3x throughput) | N/A |
+| Generations per prompt | N/A | 4 |
+| Max tool turns | N/A | 15 |
+| Trainer strategy | DeepSpeed / single GPU | FSDP2 + Ray |
 
 ## Container Strategy
 
-```mermaid
-graph TB
-    subgraph "Training Containers"
-        C1[unsloth-blackwell:v3<br/>ARM64, 20.5GB]
-        C2[nvcr.io/nvidia/pytorch:25.11-py3<br/>ARM64, 19.5GB]
-        C3[gogamza/unsloth-vllm-gb10<br/>ARM64, 41.6GB]
-    end
+Two Docker images, one per training stage:
 
-    subgraph "Use Cases"
-        U1[SFT with Unsloth<br/>Fast, optimized]
-        U2[GRPO with HF fallback<br/>Dtype bug workaround]
-        U3[vLLM inference<br/>FlashInfer backend]
-    end
+| Image | Base | Purpose | Size |
+|-------|------|---------|------|
+| `Dockerfile` (target: sft) | NGC PyTorch | LlamaFactory SFT + merge + validate + export | ~15GB |
+| `Dockerfile` (target: grpo) | NGC PyTorch | SkyRL GRPO + Ray + vLLM | ~20GB |
 
-    C1 -->|Preferred| U1
-    C2 -->|Fallback| U2
-    C3 -->|Inference only| U3
+OpenEnv server runs in its own container (or directly on host).
 
-    U1 -.->|If fails| C2
+## Evaluation Pipeline
 
-    style C1 fill:#e1f5e1
-    style C2 fill:#fff4e1
-    style C3 fill:#e1e8f5
+```
+Trained Model → BoxPwnr Agent → CyBench Challenges → Traces → Metrics
+                    │                    │
+                    └── shell, python ───►│
+                    └── flag_found ──────►│
+                                          ▼
+                                     Solve Rate, Avg Turns, Avg Time
 ```
 
-**Why Custom Containers?**
-- Official `unsloth/unsloth` is **AMD64 only**
-- DGX Spark is **ARM64** (aarch64)
-- `unsloth-blackwell:v3` is an ARM64 build with all required libraries
+Evaluation uses the same BoxPwnr scaffold as data collection. The only variable is model weights.
 
-**Library Versions (unsloth-blackwell:v3, built Feb 15 2026)**:
-- unsloth: 2026.2.1 (latest)
-- transformers: 5.1.0 (required for GLM-4.7-Flash)
-- trl: 0.28.0 (latest)
-- peft: 0.18.1 (latest)
-- torch: 2.10.0a0 (NVIDIA optimized)
-- triton: 3.6.0
+## CLI Entry Points
 
-## Performance Characteristics
+| Command | Module | Purpose |
+|---------|--------|---------|
+| `open-ctf-train sft` | `cli.train` | Stage 1: LlamaFactory SFT |
+| `open-ctf-train merge` | `cli.train` | Merge LoRA adapter |
+| `open-ctf-train grpo` | `cli.train` | Stage 2: SkyRL GRPO |
+| `open-ctf-train gepa` | `cli.train` | Stage 3: GEPA |
+| `open-ctf-convert` | `cli.convert_traces` | BoxPwnr trace → ChatML |
+| `open-ctf-split` | `cli.split_dataset` | SFT/GRPO splitting |
+| `open-ctf-eval` | `cli.evaluate` | CyBench evaluation |
+| `open-ctf-validate` | `cli.validate_pipeline` | Pipeline validation (no GPU) |
+| `open-ctf-export` | `cli.export_gguf` | GGUF export |
 
-| Stage | VRAM Usage | Time (20 samples) | Throughput |
-|-------|------------|-------------------|------------|
-| **SFT** | ~60GB (BF16 LoRA) | ~15-30 min | 2-3 samples/min |
-| **GRPO** | ~80GB (generation overhead) | ~45-60 min | 4 gens × 1-2 samples/min |
-| **Merge** | ~45GB (model + adapter) | ~3-5 min | N/A |
+## Key Design Decisions
 
-**GB10 Notes**:
-- Unified CPU-GPU memory: 273 GB/s bandwidth (shared)
-- No dedicated VRAM - memory allocation is dynamic
-- `nvidia-smi` reports `[N/A]` for memory stats
-- Actual usage visible via `docker stats` or container monitoring
+### 1. LlamaFactory for SFT (Replaces Custom sft.py)
+
+**Problem**: Custom `sft.py` (378 lines) had Unsloth dependency, manual message normalization, and broke on new hardware.
+
+**Solution**: LlamaFactory handles tool formats, packing, multi-GPU, and LoRA natively via YAML config. 11 built-in tool format classes cover all our model families.
+
+### 2. SkyRL for GRPO (Replaces Custom grpo.py)
+
+**Problem**: Custom `grpo.py` (1305 lines) required 6 monkey-patches for GLM-4.7-Flash MoE on Blackwell GB10 (prefix check, dtype cast, weight sync translation, NCCL segfault, etc.).
+
+**Solution**: SkyRL uses Ray process isolation -- vLLM runs in a separate process from training. This eliminates all 6 patches: no shared-process dtype collisions, no weight sync bugs, no NCCL group conflicts.
+
+### 3. Model-Agnostic Design
+
+**Problem**: Hardcoded model assumptions (MoE batch_size=1, BF16-only, specific template) made it difficult to test new architectures.
+
+**Solution**: All model-specific settings live in YAML configs. To add a model: create `configs/llamafactory/<model>.yaml` and `configs/skyrl/<model>.yaml`. No Python code changes.
+
+### 4. Framework-Independent Components
+
+OpenEnv server, CTFReward, data converters, and GEPA are framework-independent:
+- OpenEnv: HTTP API, consumed by SkyRL (via OpenCTFTextEnv), GEPA (via DSPy), or any other RL framework.
+- CTFReward: Pure Python callable, wrappable by any trainer.
+- BoxPwnrConverter/Splitter: Standard JSONL I/O.
+- GEPA: Uses OpenEnv + CTFReward directly, no training framework dependency.
+
+### 5. MoE-Aware Configuration
+
+MoE models (GLM-4.7-Flash) have unique constraints documented in their config files:
+- No 4-bit quantization (BitsAndBytes + MoE incompatibility)
+- batch_size=1 (MoE routing NaN with padding)
+- `colocate_all: true` (safe default for weight sync)
+- Router layers excluded from LoRA targets
+
+## Hardware Compatibility
+
+| Hardware | SFT (Dense 3B) | SFT (MoE 30B) | GRPO (Dense 3B) | GRPO (MoE 30B) |
+|----------|----------------|----------------|------------------|-----------------|
+| DGX Spark GB10 (128GB) | QLoRA 4-bit | BF16 LoRA | Colocate mode | Colocate mode |
+| H100 80GB | QLoRA 4-bit | BF16 LoRA | Colocate mode | Server mode (2 GPU) |
+| H200 141GB | QLoRA 4-bit | BF16 LoRA | Colocate mode | Server mode (1-2 GPU) |
 
 ## Extension Points
 
-### Adding New Model Formatters
+### Adding New Models
 
-1. Create `src/open_ctf/formatters/mymodel.py` extending `ModelFormatter`
-2. Implement `format_messages()` and `get_tool_definitions()`
-3. Add detection logic to `base.py` factory method
-4. Add test case to `validate_pipeline.py`
+1. Create `configs/llamafactory/<model>.yaml` with SFT hyperparameters
+2. Create `configs/skyrl/<model>.yaml` with GRPO hyperparameters
+3. Add a formatter in `src/open_ctf/formatters/` if the chat template is non-standard
+4. Add detection logic to `formatters/base.py` factory method
 
-### Adding New Reward Components
+### Adding New Reward Signals
 
-1. Create new reward function in `src/open_ctf/rewards/`
-2. Ensure `__call__(completions, prompts=None, **kwargs)` signature
-3. Add `__name__` attribute for TRL logging
-4. Import and instantiate in `cli/train.py` `cmd_grpo()`
+1. Add the signal computation to `src/open_ctf/rewards/reward.py`
+2. Add its weight to the configurable weights dict
+3. Ensure weights sum to 1.0
 
-### Adding New Platforms
+### Adding New Benchmarks
 
-1. Install platform support in `references/boxpwnr/`
-2. Add platform to `agent/runner.py` `_get_platform()`
-3. Update challenge format in `src/open_ctf/configs/challenges.yaml`
-4. Document in `docs/deployment.md`
+The `OpenEnv` server abstracts execution. To add a new CTF platform:
+1. Spin up target containers
+2. Register the endpoint on OpenEnv
+3. Point `OPEN_CTF_ENV_URL` to the new server
+4. No changes to training pipeline, reward function, or tool schemas

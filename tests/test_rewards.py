@@ -256,34 +256,44 @@ class TestExtractCommand:
 
 
 class TestEfficiencyScore:
-    def test_optimal(self, reward_no_noise):
-        score = reward_no_noise._efficiency_score(3, 3)
+    def test_optimal_with_flag(self, reward_no_noise):
+        score = reward_no_noise._efficiency_score(3, 3, flag_found=True)
         assert score == 1.0
 
-    def test_double_optimal(self, reward_no_noise):
-        score = reward_no_noise._efficiency_score(6, 3)
+    def test_double_optimal_with_flag(self, reward_no_noise):
+        score = reward_no_noise._efficiency_score(6, 3, flag_found=True)
         assert score == 0.5
 
-    def test_under_optimal(self, reward_no_noise):
-        # Fewer steps than optimal should cap at 1.0
-        score = reward_no_noise._efficiency_score(2, 3)
-        assert score == 1.0
+    def test_under_3_steps_gated(self, reward_no_noise):
+        # <3 steps = 0.0 (anti-gaming: prevent single-step garbage)
+        score = reward_no_noise._efficiency_score(2, 3, flag_found=True)
+        assert score == 0.0
 
     def test_no_metadata(self, reward_no_noise):
         score = reward_no_noise._efficiency_score(5, None)
-        assert score == 0.5  # Neutral score when metadata unavailable
+        assert score == 0.3  # Weak prior: trajectory exists but unmeasured
 
     def test_zero_steps(self, reward_no_noise):
         score = reward_no_noise._efficiency_score(0, 3)
         assert score == 0.0
 
-    def test_many_steps(self, reward_no_noise):
-        score = reward_no_noise._efficiency_score(20, 4)
+    def test_many_steps_with_flag(self, reward_no_noise):
+        score = reward_no_noise._efficiency_score(20, 4, flag_found=True)
         assert score == pytest.approx(0.2)
 
-    def test_large_optimal(self, reward_no_noise):
-        score = reward_no_noise._efficiency_score(15, 15)
+    def test_many_steps_without_flag_capped(self, reward_no_noise):
+        # Without flag, efficiency capped at 0.3
+        score = reward_no_noise._efficiency_score(20, 4, flag_found=False)
+        assert score == pytest.approx(0.2)  # min(4/20, 1.0) = 0.2, min(0.2, 0.3) = 0.2
+
+    def test_large_optimal_with_flag(self, reward_no_noise):
+        score = reward_no_noise._efficiency_score(15, 15, flag_found=True)
         assert score == 1.0
+
+    def test_no_flag_caps_at_03(self, reward_no_noise):
+        # Without flag found, efficiency capped at 0.3
+        score = reward_no_noise._efficiency_score(5, 5, flag_found=False)
+        assert score == 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +447,7 @@ class TestCallIntegration:
         assert scores[0] > 0.5
 
     def test_successful_trace_with_metadata(self, reward_no_noise):
-        """metadata.success=True should score high even without flag text."""
+        """metadata.success=True should give flag credit even without flag text."""
         msgs = [
             {"role": "assistant", "content": "", "tool_calls": [
                 {"function": {"name": "shell_command", "arguments": '{"command": "nmap target"}'}}
@@ -451,7 +461,9 @@ class TestCallIntegration:
             optimal_steps=[2],
             metadata=[{"success": True}],
         )
-        assert scores[0] > 0.5
+        # metadata.success=True → flag_sc=1.0 → 0.20*1.0 = 0.20
+        # Plus process signals from tool calls
+        assert scores[0] > 0.2
 
     def test_failed_trace_scores_low(self, reward_no_noise):
         # Trace with no tool calls at all -- pure text failure
@@ -518,8 +530,9 @@ class TestCallIntegration:
     def test_no_kwargs(self, reward_no_noise):
         scores = reward_no_noise(["hello world"])
         assert len(scores) == 1
-        # No ground truth, no optimal steps, no metadata = low score
-        assert scores[0] == pytest.approx(0.0)
+        # No ground truth, no optimal steps, no metadata = very low score
+        # Recovery gets 0.5 (neutral for <3 tool calls) → 0.07*0.5 = 0.035
+        assert scores[0] < 0.1
 
     def test_metadata_success_via_kwargs(self, reward_no_noise):
         """Verify metadata.success is extracted from nested metadata dict."""
@@ -529,11 +542,11 @@ class TestCallIntegration:
             optimal_steps=[5],
         )
         # metadata.success=True → flag_sc=1.0
-        # efficiency = min(5/0, 1.0) → 0 steps (no tool calls) → 0.0
-        # uniqueness = 0.0 (no tool calls)
-        # format = 0.0 (no tool calls)
-        # Total = 0.50 * 1.0 = 0.50
-        assert scores[0] == pytest.approx(0.50)
+        # efficiency = 0.0 (0 steps), progression = 0, exploration = 0
+        # uniqueness = 0, format = 0, recovery = 0.5 (neutral), cognitive = 0
+        # Total = 0.20*1.0 + 0.07*0.5 = 0.235
+        assert scores[0] > 0.2
+        assert scores[0] < 0.3
 
 
 # ---------------------------------------------------------------------------

@@ -1,151 +1,151 @@
-"""TRL tool wrappers for OpenEnv CTF environment interaction.
+"""Tool wrappers for CTF environment interaction via ToolExecutor.
 
-These functions are designed to be passed to TRL's GRPOTrainer via the
-``tools=`` parameter.  TRL auto-generates JSON tool schemas from the
-Google-style docstrings and type annotations.
+These functions provide a typed Python interface to the ToolExecutor
+for direct subprocess execution.  JSON tool schemas are auto-generated
+from the Google-style docstrings and type annotations, making them
+compatible with SkyRL and other trainers that accept callable tools.
 
 Full BoxPwnr tool set (13 tools, organized by tier):
 
-  Tier 1 — Execution:  shell_command, exec_command, write_stdin,
+  Tier 1 -- Execution:  shell_command, exec_command, write_stdin,
                         python_code, execute_command
-  Tier 2 — File ops:   read_file, grep, file_search, apply_patch
-  Tier 3 — Meta:       flag_found, submit_flag, web_search,
+  Tier 2 -- File ops:   read_file, grep, file_search, apply_patch
+  Tier 3 -- Meta:       flag_found, submit_flag, web_search,
                         list_sessions, close_session
 
 Episode management
 ------------------
-TRL's ``_tool_call_loop`` processes all ``num_generations`` completions
-for a prompt against the **same** environment server.  To prevent
-cross-contamination:
+When multiple generations run against the same environment,
+cross-contamination must be prevented:
 
-1. ``mark_step_begin()`` — called by ``OnlineGRPOTrainer`` at the start of
-   each batch.  Resets the environment and clears episode-done state.
-2. ``_episode_done`` flag — once ``flag_found()`` returns success for
+1. ``mark_step_begin()`` -- called by the trainer at the start of each
+   batch.  Resets the environment and clears episode-done state.
+2. ``_episode_done`` flag -- once ``flag_found()`` returns success for
    *any* generation, subsequent tool calls return an early-exit string
-   instead of hitting the server.  This prevents gen 0's flag submission
-   from corrupting the environment state that gen 1-3 are still using
-   for reconnaissance.
+   instead of executing.
 
 Usage::
 
     from open_ctf.training.tools import get_all_tools, init_env
 
-    init_env("http://localhost:8000")
-    tools = get_all_tools()  # returns list of callables for TRL
-
-    trainer = OnlineGRPOTrainer(
-        model=model,
-        tools=tools,
-        reward_funcs=[reward_fn],
-        args=GRPOConfig(max_tool_calling_iterations=15),
-    )
+    init_env()
+    tools = get_all_tools()  # returns list of callables
 """
 
 import logging
 import threading
 from typing import Optional
 
-import requests
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level environment client
+# Module-level ToolExecutor
 # ---------------------------------------------------------------------------
 
-_base_url: Optional[str] = None
-_session: Optional[requests.Session] = None
+_executor = None  # type: ignore
 _episode_id: Optional[str] = None
 
-# Episode lifecycle tracking (managed by OnlineGRPOTrainer).
-# Per-thread state via threading.local() to prevent leaks across
-# generations in multi-threaded GRPO (TRL uses ThreadPoolExecutor).
+# Episode lifecycle tracking (managed by the GRPO trainer).
 _thread_local = threading.local()
+_batch_gen: int = 0
+_batch_gen_lock = threading.Lock()
+
+
+def _sync_thread_state() -> None:
+    """Reset thread-local episode state if the batch generation has advanced."""
+    local_gen = getattr(_thread_local, "batch_gen", -1)
+    if local_gen != _batch_gen:
+        _thread_local.batch_gen = _batch_gen
+        _thread_local.episode_done = False
+        _thread_local.step_count = 0
 
 
 def _get_episode_done() -> bool:
+    _sync_thread_state()
     return getattr(_thread_local, "episode_done", False)
 
 
 def _set_episode_done(value: bool) -> None:
+    _sync_thread_state()
     _thread_local.episode_done = value
 
 
 def _get_step_count() -> int:
+    _sync_thread_state()
     return getattr(_thread_local, "step_count", 0)
 
 
 def _set_step_count(value: int) -> None:
+    _sync_thread_state()
     _thread_local.step_count = value
 
 
-def init_env(base_url: str) -> None:
-    """Initialize the environment client.
+def init_env(
+    target: str = "",
+    ground_truth: str = "",
+    max_steps: int = 30,
+) -> None:
+    """Initialize the ToolExecutor.
 
-    Must be called before any tool function is used. Creates an HTTP
-    session for connection pooling.
+    Must be called before any tool function is used.
 
     Args:
-        base_url: Base URL of the OpenEnv HTTP server
-            (e.g. ``http://localhost:8000``).
+        target: Target URL or description.
+        ground_truth: Expected flag for verification.
+        max_steps: Maximum steps per episode.
     """
-    global _base_url, _session
-    _base_url = base_url.rstrip("/")
-    _session = requests.Session()
-    _session.headers["Content-Type"] = "application/json"
-    logger.info("OpenEnv client initialized: %s", _base_url)
+    global _executor
+    from open_ctf.envs.tool_executor import ToolExecutor
+    _executor = ToolExecutor(
+        target=target,
+        ground_truth=ground_truth,
+        max_steps=max_steps,
+    )
+    logger.info("ToolExecutor initialized (target=%s)", target or "(default)")
 
 
-def reset_env(challenge_id: Optional[str] = None) -> str:
+def reset_env(challenge_id: Optional[str] = None, ground_truth: Optional[str] = None) -> str:
     """Reset the environment for a new episode.
 
     Args:
-        challenge_id: Optional challenge identifier. If provided,
-            the server will load this specific challenge.
+        challenge_id: Optional challenge identifier (unused, kept for API compat).
+        ground_truth: Optional ground-truth flag for this episode.
 
     Returns:
         The initial observation text from the environment.
     """
-    global _episode_id
     _ensure_initialized()
-    payload = {}
-    if challenge_id:
-        payload["challenge_id"] = challenge_id
-    resp = _post("/reset", payload)
-    _episode_id = resp.get("episode_id")
-    return resp.get("observation", {}).get("stdout", "Environment reset.")
+    if ground_truth is not None:
+        _executor.ground_truth = ground_truth
+    resp = _executor.reset()
+    return resp.get("stdout", "Environment reset.")
 
 
 def close_env() -> None:
-    """Close the environment client and release resources."""
-    global _base_url, _session, _episode_id
-    if _session is not None:
-        try:
-            _post("/close", {})
-        except Exception:
-            pass
-        _session.close()
-    _base_url = None
-    _session = None
-    _episode_id = None
-    logger.info("OpenEnv client closed")
+    """Close the ToolExecutor and release resources."""
+    global _executor
+    if _executor is not None:
+        _executor.close()
+    _executor = None
+    logger.info("ToolExecutor closed")
 
 
-def mark_step_begin(challenge_id: Optional[str] = None) -> None:
+def mark_step_begin(challenge_id: Optional[str] = None, ground_truth: Optional[str] = None) -> None:
     """Reset environment and clear episode state for a new training step.
 
-    Called by ``OnlineGRPOTrainer`` before each batch's tool-call loop.
-    Ensures all ``num_generations`` completions start against a fresh
-    environment, and clears the done flag so tool calls are routed to the
-    server.
+    Called by the GRPO trainer before each batch's tool-call loop.
 
     Args:
-        challenge_id: Optional challenge to load on reset.
+        challenge_id: Optional challenge to load on reset (unused, kept for API compat).
+        ground_truth: Optional ground-truth flag for this episode.
     """
+    global _batch_gen
+    with _batch_gen_lock:
+        _batch_gen += 1
     _set_episode_done(False)
     _set_step_count(0)
-    reset_env(challenge_id)
-    logger.debug("Episode reset — step_begin (challenge=%s)", challenge_id)
+    reset_env(challenge_id, ground_truth=ground_truth)
+    logger.debug("Episode reset — step_begin (challenge=%s, has_flag=%s, batch_gen=%d)", challenge_id, ground_truth is not None, _batch_gen)
 
 
 def is_episode_done() -> bool:
@@ -155,31 +155,26 @@ def is_episode_done() -> bool:
 
 def get_last_step_info() -> dict:
     """Return metadata from the last environment step."""
-    _ensure_initialized()
-    try:
-        return _get("/status")
-    except Exception:
-        return {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
-# Tool collections (pass to GRPOTrainer tools=)
+# Tool collections
 # ---------------------------------------------------------------------------
 
 
 def get_all_tools() -> list:
-    """Return all tool functions for TRL's tools= parameter.
+    """Return the curated tool set for GRPO training.
 
-    Returns the full BoxPwnr-compatible tool set. Each function has
-    proper type annotations and docstrings for TRL schema generation.
+    Returns the 8 core tools for online GRPO.
+
+    Included (8 tools): shell_command, python_code, read_file, grep,
+    file_search, apply_patch, web_search, flag_found.
     """
     return [
         # Tier 1: Execution
         shell_command,
-        exec_command,
-        write_stdin,
         python_code,
-        execute_command,
         # Tier 2: File operations
         read_file,
         grep,
@@ -188,16 +183,11 @@ def get_all_tools() -> list:
         # Tier 3: Meta
         flag_found,
         web_search,
-        list_sessions,
-        close_session,
     ]
 
 
 def get_core_tools() -> list:
-    """Return only the core 3 tools (backward compatible).
-
-    Suitable for simple challenges that only need shell + python + flag.
-    """
+    """Return only the core 3 tools (backward compatible)."""
     return [shell_command, python_code, flag_found]
 
 
@@ -429,14 +419,11 @@ def close_session(session_id: str) -> str:
 
 
 def _step(tool_name: str, arguments: dict) -> str:
-    """Send a tool call to the OpenEnv server and return the output string.
+    """Execute a tool call via ToolExecutor and return the output string.
 
     Episode-aware: once ``flag_found`` succeeds in *any* generation, all
-    further tool calls short-circuit with a done message.  This prevents
-    cross-contamination between generations that share the same server.
+    further tool calls short-circuit with a done message.
     """
-    # Short-circuit after flag has been submitted successfully.
-    # Other generations' tool calls return early without touching the env.
     if _get_episode_done():
         return (
             "[EPISODE COMPLETE] The flag has already been submitted and "
@@ -445,17 +432,14 @@ def _step(tool_name: str, arguments: dict) -> str:
 
     _ensure_initialized()
     _set_step_count(_get_step_count() + 1)
-    resp = _post("/step", {"action": {
-        "tool_name": tool_name,
-        "arguments": arguments,
-    }})
-    obs = resp.get("observation", {})
-    stdout = obs.get("stdout", "")
-    stderr = obs.get("stderr", "")
-    done = obs.get("done", False) or resp.get("done", False)
+
+    resp = _executor.step(tool_name, arguments)
+    stdout = resp.get("stdout", "")
+    stderr = resp.get("stderr", "")
+    done = resp.get("done", False)
 
     # Detect successful flag submission
-    if done or (tool_name == "flag_found" and "correct" in stdout.lower()):
+    if done or (tool_name == "flag_found" and "Correct!" in stdout):
         _set_episode_done(True)
         logger.info(
             "Episode done after %d steps (flag submitted via %s)",
@@ -482,37 +466,7 @@ def submit_flag(flag: str) -> str:
 
 def _ensure_initialized() -> None:
     """Raise if init_env() has not been called."""
-    if _base_url is None or _session is None:
+    if _executor is None:
         raise RuntimeError(
-            "OpenEnv client not initialized. Call init_env(base_url) first."
+            "ToolExecutor not initialized. Call init_env() first."
         )
-
-
-def _post(path: str, payload: dict) -> dict:
-    """Send a POST request to the environment server."""
-    url = f"{_base_url}{path}"
-    try:
-        resp = _session.post(url, json=payload, timeout=300)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.ConnectionError as e:
-        logger.error("Cannot connect to OpenEnv server at %s: %s", url, e)
-        return {"observation": {"stdout": f"[ERROR] Connection failed: {e}", "stderr": "", "exit_code": 1}}
-    except requests.exceptions.Timeout as e:
-        logger.error("OpenEnv request timed out: %s", e)
-        return {"observation": {"stdout": "[ERROR] Request timed out", "stderr": "", "exit_code": 1}}
-    except Exception as e:
-        logger.error("OpenEnv request failed: %s", e)
-        return {"observation": {"stdout": f"[ERROR] {e}", "stderr": "", "exit_code": 1}}
-
-
-def _get(path: str) -> dict:
-    """Send a GET request to the environment server."""
-    url = f"{_base_url}{path}"
-    try:
-        resp = _session.get(url, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        logger.error("OpenEnv GET request failed: %s", e)
-        return {}

@@ -1,190 +1,259 @@
-"""Supervised Fine-Tuning (SFT) stage.
+"""LlamaFactory-based Supervised Fine-Tuning (SFT) stage.
 
-Uses Unsloth + TRL SFTTrainer with:
-  - LoRA (r=64, alpha=128, use_rslora=False) via FastLanguageModel or PEFT
-  - Sequence packing for ~3x throughput (Unsloth only)
-  - Gradient checkpointing for VRAM efficiency
-  - Native ChatML message handling (no dataset_text_field)
+Thin orchestrator that:
+  1. Registers our JSONL data in LlamaFactory's dataset_info.json format
+  2. Generates a LlamaFactory YAML config from our training.yaml
+  3. Launches LlamaFactory training via CLI subprocess
+  4. Handles LoRA merge post-training
 
-Falls back to HuggingFace transformers + PEFT when:
-  - OPEN_CTF_NO_UNSLOTH=1 env var is set (for GB10 Triton OOM issues)
-  - Unsloth import fails
+Replaces the custom sft.py (386 lines) with ~120 lines by delegating to
+LlamaFactory for:
+  - 11 native tool formats (GLM4MOE, Qwen, Mistral, etc.)
+  - Sequence packing with 4D attention masks
+  - DeepSpeed ZeRO for multi-GPU
+  - QLoRA / LoRA with proper MoE handling
 
-HF fallback uses SDPA (PyTorch Scaled Dot-Product Attention) instead of
-FlashAttention 2. On Blackwell GB10 (sm_121), PyTorch SDPA with cuDNN 9.13
-is faster than FlashAttention 2.
-
-MoE model notes (GLM-4.7-Flash):
-  - Standard BnB load_in_4bit only saves ~3 GB for MoE models (90% of params
-    are 3D expert tensors that BnB skips).  Post-load expert quantization
-    via quantize.py brings model from ~58 GB to ~17 GB.
-  - On GB10 (Blackwell sm_121): set UNSLOTH_MOE_BACKEND=grouped_mm to avoid
-    Triton shared memory OOM (99KB limit vs 104KB+ required by MoE kernels)
-  - Router layers NOT targeted by LoRA (per Unsloth recommendation)
-
-Compatible with TRL >= 0.26 (SFTConfig, processing_class, max_length).
+Default test model: Nanbeige4.1-3B (dense LlamaForCausalLM, Hermes tool format).
 """
 
 import json
 import logging
-import math
 import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-import torch
-from datasets import load_dataset
-from trl import SFTConfig, SFTTrainer
+import yaml
 
 logger = logging.getLogger(__name__)
 
+# Project root (where data/dataset_info.json lives)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_CONFIGS_DIR = _PROJECT_ROOT / "configs" / "llamafactory"
 
-def _normalize_messages(messages: List[Dict]) -> List[Dict]:
-    """Normalize messages for compatibility with model chat templates.
+# Model → LlamaFactory config mapping
+_MODEL_CONFIG_MAP = {
+    "nanbeige": "nanbeige_3b.yaml",
+    "glm-4": "glm47_flash.yaml",
+    "glm4": "glm47_flash.yaml",
+    "glm-4.7": "glm47_flash.yaml",
+    "devstral": "devstral_24b.yaml",
+}
 
-    Fixes common format mismatches:
-    - Converts tool_calls[].function.arguments from JSON string to dict
-      (required by GLM-4, Qwen3, and other models whose Jinja templates
-      iterate over arguments with .items())
-    - Removes empty assistant content fields when tool_calls are present
+
+def _resolve_lf_config(model_id: str) -> Optional[Path]:
+    """Find a pre-built LlamaFactory config for the given model."""
+    model_lower = model_id.lower()
+    for pattern, config_name in _MODEL_CONFIG_MAP.items():
+        if pattern in model_lower:
+            path = _CONFIGS_DIR / config_name
+            if path.exists():
+                return path
+    return None
+
+
+def _ensure_dataset_info(data_path: str) -> Path:
+    """Ensure dataset_info.json references the given data file.
+
+    LlamaFactory needs a dataset_info.json in the same directory as the
+    data files (or a parent). We create/update one that points to the
+    training JSONL.
+
+    Returns:
+        Path to the directory containing dataset_info.json.
     """
-    normalized = []
-    for msg in messages:
-        msg = dict(msg)  # shallow copy
-        if "tool_calls" in msg and msg["tool_calls"]:
-            tool_calls = []
-            for tc in list(msg["tool_calls"]):  # copy list to avoid mutating original
-                tc = dict(tc)
-                if "function" in tc:
-                    func = dict(tc["function"])
-                    args = func.get("arguments", "{}")
-                    if isinstance(args, str):
-                        try:
-                            func["arguments"] = json.loads(args)
-                        except (json.JSONDecodeError, TypeError):
-                            func["arguments"] = {"raw": args}
-                    tc["function"] = func
-                tool_calls.append(tc)
-            msg["tool_calls"] = tool_calls
-        normalized.append(msg)
-    return normalized
+    data_file = Path(data_path).resolve()
+    data_dir = data_file.parent
+    info_path = data_dir / "dataset_info.json"
+
+    # Load existing or start fresh
+    info = {}
+    if info_path.exists():
+        with open(info_path) as f:
+            info = json.load(f)
+
+    # Register our dataset under a stable key
+    # Use "openai" formatting so LlamaFactory extracts tool_calls arrays
+    # from assistant messages (sharegpt silently drops them).
+    dataset_key = "open_ctf_sft"
+    info[dataset_key] = {
+        "file_name": data_file.name,
+        "formatting": "openai",
+        "columns": {
+            "messages": "messages",
+        },
+        "tags": {
+            "role_tag": "role",
+            "content_tag": "content",
+            "user_tag": "user",
+            "assistant_tag": "assistant",
+            "observation_tag": "tool",
+            "function_tag": "function_call",
+            "system_tag": "system",
+        },
+    }
+
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2)
+        f.write("\n")
+
+    logger.info("dataset_info.json updated at %s (key=%s)", info_path, dataset_key)
+    return data_dir
 
 
-def _load_model_unsloth(model_id, max_seq_length, load_in_4bit, lora_cfg):
-    """Load model via Unsloth FastLanguageModel (faster, optimized kernels)."""
-    from open_ctf.training.quantize import set_moe_backend
-    set_moe_backend()
-    from unsloth import FastLanguageModel
+def _build_lf_config(
+    model_id: str,
+    data_dir: Path,
+    output_dir: str,
+    config: Dict[str, Any],
+    val_data_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a LlamaFactory config dict from our training.yaml settings.
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_id,
-        max_seq_length=max_seq_length,
-        dtype=torch.bfloat16,
-        load_in_4bit=load_in_4bit,
-    )
-
-    # If PyTorch inductor is disabled, fallback to standard gradient checkpointing
-    # to avoid the Triron FlexAttention OOM bug on Blackwell GB10
-    grad_ckpt = "unsloth" if os.environ.get("TORCH_INDUCTOR_DISABLE", "0") == "0" else True
-
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=lora_cfg.get("r", 64),
-        lora_alpha=lora_cfg.get("alpha", 128),
-        lora_dropout=lora_cfg.get("dropout", 0),
-        target_modules=lora_cfg.get("target_modules", [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ]),
-        use_rslora=lora_cfg.get("use_rslora", False),
-        use_gradient_checkpointing=grad_ckpt,
-    )
-    # Prevent fix_untrained_tokens bug on MoE / Meta tensors in Unsloth
-    if hasattr(model, "config"):
-        model.config.fix_untrained_tokens = False
-    return model, tokenizer
-
-
-def _load_model_hf(model_id, max_seq_length, load_in_4bit, lora_cfg):
-    """Load model via standard HuggingFace transformers + PEFT (slower, no Unsloth kernels).
-
-    For MoE models with load_in_4bit=True, applies post-load expert
-    quantization (BnB only quantizes nn.Linear; 3D expert tensors need
-    separate quantization via quantize.py).
+    Starts from a model-specific base config (if available) and overrides
+    with values from the user's training.yaml.
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from peft import LoraConfig, get_peft_model
+    # Start from pre-built config or empty
+    base_config_path = _resolve_lf_config(model_id)
+    if base_config_path:
+        with open(base_config_path) as f:
+            lf_config = yaml.safe_load(f) or {}
+        logger.info("Using base LlamaFactory config: %s", base_config_path)
+    else:
+        lf_config = {}
+        logger.info("No pre-built config for %s, building from scratch", model_id)
 
-    from open_ctf.training.quantize import (
-        find_moe_expert_param_names,
-        quantize_moe_expert_params,
+    # Always override these from our config
+    model_cfg = config.get("model", {})
+    lora_cfg = config.get("lora", {})
+    sft_cfg = config.get("sft", {})
+    output_cfg = config.get("output", {})
+
+    lf_config["model_name_or_path"] = model_id
+    lf_config["trust_remote_code"] = True
+    lf_config["stage"] = "sft"
+    lf_config["do_train"] = True
+
+    # Dataset
+    lf_config["dataset"] = "open_ctf_sft"
+    lf_config["dataset_dir"] = str(data_dir)
+    lf_config["cutoff_len"] = model_cfg.get("max_seq_length", 8192)
+
+    # Template + tool format (set from base config or detect from model_id)
+    # Only set if the base config didn't already provide them.
+    model_lower = model_id.lower()
+    if "template" not in lf_config:
+        if any(p in model_lower for p in ("glm-4", "glm4", "glm-4.7")):
+            lf_config["template"] = "glm4_7"
+        elif any(p in model_lower for p in ("devstral", "mistral")):
+            lf_config["template"] = "mistral_small"
+        else:
+            # Default: ChatML (Nanbeige, Qwen, and most models)
+            lf_config["template"] = "chatml"
+    if "tool_format" not in lf_config:
+        if any(p in model_lower for p in ("glm-4", "glm4", "glm-4.7")):
+            lf_config["tool_format"] = "glm4_moe"
+        elif any(p in model_lower for p in ("devstral", "mistral")):
+            lf_config["tool_format"] = "mistral"
+        else:
+            # Default: qwen format (<tool_call> tags, same as Hermes)
+            lf_config["tool_format"] = "qwen"
+
+    # LoRA
+    lf_config["finetuning_type"] = "lora"
+    lf_config["lora_rank"] = lora_cfg.get("r", 64)
+    lf_config["lora_alpha"] = lora_cfg.get("alpha", 128)
+    lf_config["lora_dropout"] = lora_cfg.get("dropout", 0.0)
+    target_modules = lora_cfg.get("target_modules", [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ])
+    lf_config["lora_target"] = ",".join(target_modules)
+
+    # Quantization (dense models only)
+    if model_cfg.get("load_in_4bit", False):
+        lf_config["quantization_bit"] = 4
+        lf_config["quantization_method"] = "bitsandbytes"
+    else:
+        lf_config.pop("quantization_bit", None)
+        lf_config.pop("quantization_method", None)
+
+    # Training hyperparameters
+    lf_config["per_device_train_batch_size"] = sft_cfg.get("batch_size", 2)
+    lf_config["gradient_accumulation_steps"] = sft_cfg.get(
+        "gradient_accumulation_steps", 8
     )
+    lf_config["learning_rate"] = sft_cfg.get("learning_rate", 2e-4)
+    lf_config["num_train_epochs"] = sft_cfg.get("epochs", 5)
+    lf_config["lr_scheduler_type"] = sft_cfg.get("lr_scheduler_type", "cosine")
+    lf_config["warmup_ratio"] = sft_cfg.get("warmup_ratio", 0.03)
+    lf_config["weight_decay"] = sft_cfg.get("weight_decay", 0.01)
+    lf_config["bf16"] = True
+    lf_config["optim"] = "adamw_8bit"
+    lf_config["seed"] = 42
+    lf_config["gradient_checkpointing"] = True
+    lf_config["packing"] = sft_cfg.get("packing", True)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    # Output
+    lf_config["output_dir"] = output_dir
+    lf_config["logging_steps"] = output_cfg.get("logging_steps", 1)
+    lf_config["save_steps"] = output_cfg.get("save_steps", 50)
+    lf_config["save_only_model"] = True
+    lf_config["overwrite_output_dir"] = True
 
-    kwargs = {
-        "torch_dtype": torch.bfloat16,
-        "trust_remote_code": True,
+    # Wandb
+    report_to = output_cfg.get("report_to", "none")
+    try:
+        import wandb
+        if wandb.api.api_key and report_to != "none":
+            lf_config["report_to"] = "wandb"
+        else:
+            lf_config["report_to"] = "none"
+    except (ImportError, AttributeError):
+        lf_config["report_to"] = "none"
+
+    # Validation
+    if val_data_path and Path(val_data_path).exists():
+        val_dir = _ensure_dataset_info_val(val_data_path)
+        lf_config["eval_dataset"] = "open_ctf_sft_val"
+        lf_config["eval_strategy"] = "steps"
+        lf_config["eval_steps"] = output_cfg.get("save_steps", 50)
+
+    return lf_config
+
+
+def _ensure_dataset_info_val(val_data_path: str) -> Path:
+    """Register validation data in dataset_info.json."""
+    val_file = Path(val_data_path).resolve()
+    data_dir = val_file.parent
+    info_path = data_dir / "dataset_info.json"
+
+    info = {}
+    if info_path.exists():
+        with open(info_path) as f:
+            info = json.load(f)
+
+    info["open_ctf_sft_val"] = {
+        "file_name": val_file.name,
+        "formatting": "openai",
+        "columns": {"messages": "messages"},
+        "tags": {
+            "role_tag": "role",
+            "content_tag": "content",
+            "user_tag": "user",
+            "assistant_tag": "assistant",
+            "observation_tag": "tool",
+            "function_tag": "function_call",
+            "system_tag": "system",
+        },
     }
-    if load_in_4bit:
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-
-    # --- Post-load 4-bit quantization for MoE 3D expert tensors -----------
-    # BnB only quantizes nn.Linear (2D). MoE expert 3D nn.Parameter tensors
-    # are left in BF16 (~52 GB for GLM-4.7-Flash).  Quantize them post-load.
-    moe_experts_quantized = False
-    if load_in_4bit:
-        expert_names = find_moe_expert_param_names(model)
-        if expert_names:
-            moe_experts_quantized = quantize_moe_expert_params(model)
-
-    # --- Prepare for k-bit training ----------------------------------------
-    # MoE models with post-load expert quantization skip
-    # prepare_model_for_kbit_training (fp32 cast causes OOM ~115 GB peak).
-    # Instead, manually enable input_require_grads.
-    if load_in_4bit and moe_experts_quantized:
-        model.enable_input_require_grads()
-        logger.info(
-            "4-bit MoE: skipped prepare_model_for_kbit_training (OOMs for MoE), "
-            "enabled input_require_grads manually"
-        )
-    elif load_in_4bit:
-        from peft import prepare_model_for_kbit_training
-        model = prepare_model_for_kbit_training(model)
-
-    # --- LoRA configuration ------------------------------------------------
-    lora_kwargs = {
-        "r": lora_cfg.get("r", 64),
-        "lora_alpha": lora_cfg.get("alpha", 128),
-        "lora_dropout": lora_cfg.get("dropout", 0),
-        "target_modules": lora_cfg.get("target_modules", [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ]),
-        "task_type": "CAUSAL_LM",
-    }
-    # Exclude parametrized (4-bit quantized) expert weights from LoRA
-    if moe_experts_quantized:
-        lora_kwargs["exclude_modules"] = r".*\.parametrizations\..*"
-        logger.info(
-            "MoE 4-bit LoRA: target_modules=%s (attention + shared expert only, "
-            "routed experts quantized but not LoRA'd)",
-            lora_kwargs["target_modules"],
-        )
-
-    lora_config = LoraConfig(**lora_kwargs)
-    model = get_peft_model(model, lora_config)
-    # Don't call gradient_checkpointing_enable() here — SFTConfig handles it.
-    # Double-enable can cause issues with MoE models on some hardware.
-
-    return model, tokenizer
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2)
+        f.write("\n")
+    return data_dir
 
 
 def train_sft(
@@ -195,181 +264,53 @@ def train_sft(
     val_data_path: Optional[str] = None,
     resume_from: Optional[str] = None,
 ) -> str:
-    """Run SFT training with Unsloth.
+    """Run SFT training via LlamaFactory.
 
     Args:
         model_id: HuggingFace model identifier.
         data_path: Path to JSONL training data (ChatML messages format).
         output_dir: Directory for checkpoints and final model.
-        config: Merged config dict with keys: model, lora, sft, output.
+        config: Merged config dict from training.yaml.
         val_data_path: Optional path to validation data.
         resume_from: Optional checkpoint path to resume from.
 
     Returns:
-        Path to the saved final model directory.
+        Path to the saved model directory.
     """
     logger.info("=" * 60)
-    logger.info("SFT TRAINING")
+    logger.info("SFT TRAINING (LlamaFactory)")
     logger.info("  Model:  %s", model_id)
     logger.info("  Data:   %s", data_path)
     logger.info("  Output: %s", output_dir)
     logger.info("=" * 60)
 
-    model_cfg = config.get("model", {})
-    lora_cfg = config.get("lora", {})
-    sft_cfg = config.get("sft", {})
-    output_cfg = config.get("output", {})
+    # 1. Register dataset
+    data_dir = _ensure_dataset_info(data_path)
 
-    max_seq_length = model_cfg.get("max_seq_length", 8192)
-    load_in_4bit = model_cfg.get("load_in_4bit", True)
-
-    # --- Model + LoRA (Unsloth or HF fallback) --------------------------
-    use_unsloth = os.environ.get("OPEN_CTF_NO_UNSLOTH", "").lower() not in ("1", "true")
-    if use_unsloth:
-        try:
-            model, tokenizer = _load_model_unsloth(
-                model_id, max_seq_length, load_in_4bit, lora_cfg
-            )
-            logger.info("Loaded model via Unsloth (optimized kernels)")
-        except (ImportError, RuntimeError, OSError) as e:
-            logger.warning("Unsloth loading failed (%s), falling back to HF", e)
-            use_unsloth = False
-
-    if not use_unsloth:
-        model, tokenizer = _load_model_hf(
-            model_id, max_seq_length, load_in_4bit, lora_cfg
-        )
-        logger.info("Loaded model via HuggingFace transformers + PEFT (no Unsloth)")
-
-    # --- Dataset ---------------------------------------------------------
-    dataset = load_dataset("json", data_files=data_path, split="train")
-    eval_dataset = None
-    if val_data_path and Path(val_data_path).exists():
-        eval_dataset = load_dataset("json", data_files=val_data_path, split="train")
-
-    # Drop columns SFTTrainer doesn't need (avoids PyArrow type conflicts
-    # from mixed types in metadata/optimal_steps columns)
-    keep_cols = {"messages"}
-    for ds_name, ds in [("train", dataset), ("val", eval_dataset)]:
-        if ds is None:
-            continue
-        drop = [c for c in ds.column_names if c not in keep_cols]
-        if drop:
-            if ds_name == "train":
-                dataset = dataset.remove_columns(drop)
-            else:
-                eval_dataset = eval_dataset.remove_columns(drop)
-            logger.info("Dropped columns from %s dataset: %s", ds_name, drop)
-
-    # --- Tool schemas for chat template ---------------------------------
-    # Inject formal JSON tool schemas into the chat template so the model
-    # learns native tool-call format (parameter names, types, descriptions)
-    # during SFT — not just the textual description in the system prompt.
-    # This matches what TRL's GRPOTrainer injects during GRPO (tools= param).
-    from open_ctf.training.tools import get_all_tools
-
-    _tool_fns = get_all_tools()  # Safe without init_env(): only metadata used
-    tools_for_template = None
-    try:
-        _test_msgs = [{"role": "user", "content": "test"}]
-        tokenizer.apply_chat_template(
-            _test_msgs, tools=_tool_fns, tokenize=False,
-        )
-        tools_for_template = _tool_fns
-        logger.info(
-            "Chat template supports tools= (%d tool schemas will be injected)",
-            len(_tool_fns),
-        )
-    except Exception as e:
-        logger.warning(
-            "Chat template doesn't support tools= (%s), "
-            "falling back to text-only tool descriptions",
-            e,
-        )
-
-    # Manually map the formatting func over the dataset to create the "text" column
-    # and remove the "messages" column so TRL 0.28 does not attempt to
-    # re-apply the chat template directly.
-    def _map_messages_to_text(example):
-        normalized = _normalize_messages(example["messages"])
-        text = tokenizer.apply_chat_template(
-            normalized,
-            tools=tools_for_template,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        return {"text": text}
-
-    dataset = dataset.map(_map_messages_to_text, remove_columns=["messages"])
-    if eval_dataset:
-        eval_dataset = eval_dataset.map(_map_messages_to_text, remove_columns=["messages"])
-
-    # --- Determine wandb availability -----------------------------------
-    from open_ctf.training import check_wandb_available
-
-    report_to = check_wandb_available(output_cfg.get("report_to", "wandb"))
-
-    # --- Convert warmup_ratio to warmup_steps ----------------------------
-    # TRL >= 0.26 deprecated warmup_ratio in favor of warmup_steps.
-    warmup_ratio = sft_cfg.get("warmup_ratio", 0.03)
-    num_epochs = sft_cfg.get("epochs", 3)
-    batch_size = sft_cfg.get("batch_size", 2)
-    grad_accum = sft_cfg.get("gradient_accumulation_steps", 8)
-    total_samples = len(dataset)
-    steps_per_epoch = max(1, total_samples // (batch_size * grad_accum))
-    total_steps = steps_per_epoch * num_epochs
-    warmup_steps = max(0, int(math.ceil(warmup_ratio * total_steps)))
-
-    # --- SFT config (TRL >= 0.26 uses SFTConfig) -------------------------
-    # Packing is an Unsloth optimization - disable if using HF fallback
-    enable_packing = sft_cfg.get("packing", True) and use_unsloth
-
-    training_args = SFTConfig(
-        output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=sft_cfg.get("learning_rate", 2e-4),
-        warmup_steps=warmup_steps,
-        weight_decay=sft_cfg.get("weight_decay", 0.01),
-        lr_scheduler_type=sft_cfg.get("lr_scheduler_type", "cosine"),
-        logging_steps=output_cfg.get("logging_steps", 1),
-        save_steps=output_cfg.get("save_steps", 50),
-        bf16=True,
-        optim="adamw_8bit",
-        seed=42,
-        report_to=report_to,
-        gradient_checkpointing=sft_cfg.get("gradient_checkpointing", True),
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        eval_strategy="steps" if eval_dataset else "no",
-        eval_steps=output_cfg.get("save_steps", 50) if eval_dataset else None,
-        dataset_text_field="text",
-        max_length=max_seq_length,
-        packing=enable_packing,
-        # Force single-process dataset mapping to avoid pickle errors with
-        # transformers 5.0's ConfigModuleInstance (not pickle-serializable).
-        dataset_num_proc=1,
-    )
-    # Unsloth's _backwards_compatible_trainer can re-instantiate SFTConfig and
-    # inject eos_token="<EOS_TOKEN>" which doesn't exist in GLM-4.7-Flash vocab.
-    # We set it here anyway; the Dockerfile also patches TRL's sft_trainer.py
-    # to fall back to tokenizer.eos_token instead of crashing.
-    training_args.eos_token = tokenizer.eos_token
-
-    # --- Trainer ---------------------------------------------------------
-    trainer = SFTTrainer(
-        model=model,
-        processing_class=tokenizer,
-        train_dataset=dataset,
-        eval_dataset=eval_dataset,
-        args=training_args,
+    # 2. Build LlamaFactory config
+    lf_config = _build_lf_config(
+        model_id, data_dir, output_dir, config, val_data_path
     )
 
-    trainer.train(resume_from_checkpoint=resume_from)
+    if resume_from:
+        lf_config["resume_from_checkpoint"] = resume_from
 
-    # --- Save final model ------------------------------------------------
-    final_dir = os.path.join(output_dir, "final")
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    logger.info("SFT model saved to %s", final_dir)
-    return final_dir
+    # 3. Write config to temp file
+    config_path = Path(output_dir) / "llamafactory_config.yaml"
+    os.makedirs(output_dir, exist_ok=True)
+    with open(config_path, "w") as f:
+        yaml.dump(lf_config, f, default_flow_style=False)
+    logger.info("LlamaFactory config written to %s", config_path)
+
+    # 4. Launch LlamaFactory training
+    cmd = ["llamafactory-cli", "train", str(config_path)]
+    logger.info("Launching: %s", " ".join(cmd))
+
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"LlamaFactory training failed with exit code {result.returncode}"
+        )
+
+    logger.info("SFT training complete. Output: %s", output_dir)
+    return output_dir

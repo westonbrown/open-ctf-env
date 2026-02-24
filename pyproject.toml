@@ -1,7 +1,7 @@
 [project]
 name = "open-ctf-env"
-version = "0.3.0"
-description = "Open-source CTF training environment with BoxPwnr agent harness"
+version = "0.4.0"
+description = "Open-source CTF training environment: LlamaFactory SFT + SkyRL GRPO + GEPA"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -9,27 +9,63 @@ authors = [
     {name = "Open CTF Team"},
 ]
 
+# Core dependencies — only what the CLI, data tools, reward, formatters,
+# and ToolExecutor need at the top level.
+# Heavy ML deps (transformers, torch, etc.) live in optional extras.
 dependencies = [
-    "transformers>=5.0.0,!=5.1.0",
-    "trl>=0.28.0,<0.29.0",
-    "datasets>=3.0.0",
-    "peft>=0.14.0",
-    "accelerate>=1.4.0",
-    "bitsandbytes>=0.48.0",
-    "gymnasium",
-    "pydantic>=2.0.0",
-    "docker",
     "pyyaml",
+    "pydantic>=2.0.0",
     "jsonlines",
-    "rich",
 ]
 
 [project.optional-dependencies]
-train = ["torch>=2.4.0", "unsloth>=2026.2.1", "wandb"]
-agent = ["litellm"]
-gepa = ["dspy-ai>=3.1.0", "gepa>=0.0.26"]
-dev = ["pytest", "ruff"]
-rl = ["colorama", "ray"]
+# LoRA merge + GGUF export (open-ctf-train merge, open-ctf-export)
+merge = [
+    "torch>=2.4.0",
+    "transformers>=4.45.0",
+    "peft>=0.15.0",
+    "accelerate>=0.34.0",
+]
+# Stage 1: LlamaFactory SFT
+# NOTE: LlamaFactory pins transformers<=4.57.1, accelerate<=1.2.1,
+# datasets<=3.6.0. Do NOT override these — let LlamaFactory resolve them.
+# Docker separates SFT and GRPO envs so they can have different versions.
+sft = [
+    "llamafactory>=0.9.0",
+    "torch>=2.4.0",
+    "bitsandbytes>=0.45.0",
+    "deepspeed>=0.15.0",
+    "wandb",
+]
+# Stage 2: SkyRL GRPO (online RL)
+# NOTE: skyrl-train is NOT on PyPI. Install from source:
+#   pip install git+https://github.com/SkyRL-Team/SkyRL-Train.git
+grpo = [
+    "skyrl-gym>=0.1.0",
+    "ray[default]>=2.40.0",
+    "torch>=2.5.0",
+    "transformers>=4.45.0",
+    "peft>=0.15.0",
+    "accelerate>=0.34.0",
+    "omegaconf",
+    "hydra-core",
+    "wandb",
+    "jmespath",
+]
+# Stage 3: GEPA prompt evolution
+gepa = [
+    "dspy>=3.1.0",
+    "gepa>=0.0.26",
+]
+# Agent runner (wraps BoxPwnr)
+agent = [
+    "litellm",
+]
+# Development and testing
+dev = [
+    "pytest",
+    "ruff",
+]
 
 [project.scripts]
 open-ctf-train = "open_ctf.cli.train:main"
@@ -39,6 +75,7 @@ open-ctf-agent = "open_ctf.cli.run_agent:main"
 open-ctf-eval = "open_ctf.cli.evaluate:main"
 open-ctf-validate = "open_ctf.cli.validate_pipeline:main"
 open-ctf-export = "open_ctf.cli.export_gguf:main"
+open-ctf-challenges = "open_ctf.cli.challenges:main"
 
 [build-system]
 requires = ["hatchling"]

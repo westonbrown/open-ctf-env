@@ -1,0 +1,106 @@
+# Nanbeige4.1-3B Training Configuration (DGX Spark / Cloud GPU)
+# ==============================================================
+# Dense LlamaForCausalLM (3B params) — no MoE complexities.
+# Fits comfortably on DGX Spark (119GB unified) for both SFT and GRPO.
+#
+# Key differences from GLM-4.7-Flash (training_120gb_moe.yaml):
+#   - Dense model: QLoRA 4-bit fully supported (no MoE expert tensor workaround)
+#   - batch_size > 1 safe (no MoE routing NaN with padding)
+#   - vLLM colocate mode works (LlamaForCausalLM is first-class in vLLM)
+#   - ~8 GB BF16 inference, ~15-20 GB LoRA training, ~6-10 GB QLoRA
+#
+# Architecture: LlamaForCausalLM
+# Vocab: 166,144 (large, Chinese + English)
+# Context: 262K max_position_embeddings (128K validated)
+# Tool calling: Hermes format (<tool_call> JSON </tool_call>)
+# Reasoning: <think> / </think> tags
+# Chat template: ChatML (<|im_start|> / <|im_end|>)
+
+model:
+  name: "Nanbeige/Nanbeige4.1-3B"
+  # 32K context: Nanbeige4.1-3B supports 262K but 32K is practical for training.
+  # batch=1 + 32K + grad_ckpt fits on DGX Spark (119 GB unified).
+  max_seq_length: 32768
+  # QLoRA 4-bit works perfectly for dense Llama models.
+  # ~3-4 GB model weights in 4-bit (vs ~8 GB BF16).
+  load_in_4bit: true
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  # Standard Llama target modules (same as GLM config).
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+sft:
+  # 3 epochs: balances convergence vs training time.
+  # Loss already drops to ~0.9 by step 7 (~epoch 0.14), 3 epochs sufficient.
+  epochs: 3
+  # batch_size=1 required: 166K vocab → logits tensor is ~81 GiB at batch=4.
+  # Compensate with gradient_accumulation_steps=16 for same effective batch.
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  # Effective batch: 1 * 16 = 16
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+  # Memory budget for SFT on DGX Spark (119 GB unified):
+  #   Model (NF4): ~3-4 GB
+  #   LoRA adapters: ~0.5 GB
+  #   Optimizer (8-bit AdamW): ~1 GB
+  #   Logits (1 × 32K × 166K × 4B): ~21 GB (166K vocab is large!)
+  #   Gradient activations (checkpointed, 32K, batch=1): ~15-20 GB
+  #   Framework/OS: ~5 GB
+  #   Total: ~45-50 GB -> ~70 GB headroom
+
+grpo:
+  epochs: 1
+  # Dense model: batch_size > 1 possible but keep 1 for GRPO stability.
+  batch_size: 1
+  # batch_size(1) * grad_accum(8) must be divisible by num_gen(8): 8 % 8 = 0 (valid)
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  beta: 0.0
+  loss_type: dapo
+  num_generations: 8
+  advantage_estimator: rloo_n
+  # 32K completion matches the model's max_seq_length.
+  # 3B dense model at NF4 + vLLM colocate @ 0.4 util still fits DGX Spark.
+  # KV cache: 32 layers × 2 × 32 heads × 128 dim × 32K × 8 gens × 2B ≈ 32 GB
+  # Total GRPO ≈ 3-4 (model) + 48 (vLLM 0.4) + 2 (train) + 32 (KV) + 5 (OS) ≈ 90-94 GB
+  # Headroom: ~25-29 GB on 119 GB unified — FITS.
+  max_completion_length: 32768
+  max_tool_calling_iterations: 15
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+  # vLLM colocate mode: LlamaForCausalLM is the most tested arch.
+  # Model + vLLM + training all fit on DGX Spark.
+  use_vllm: true
+  vllm_mode: colocate
+  gpu_memory_utilization: 0.4
+  # Memory budget for GRPO on DGX Spark (119 GB unified):
+  #   Model (NF4): ~3-4 GB
+  #   vLLM engine (colocate, 40% util): ~48 GB (includes KV cache)
+  #   Training state (LoRA + AdamW 8-bit): ~2 GB
+  #   Gradient activations (checkpointed, 32K): ~15-20 GB
+  #   Framework/OS: ~5 GB
+  #   Total: ~73-79 GB -> ~40-46 GB headroom
+
+output:
+  save_steps: 25
+  logging_steps: 1
+  report_to: none

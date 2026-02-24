@@ -1,0 +1,102 @@
+"""BoxPwnr adapter implementing the CTFAgent protocol.
+
+Wraps the existing AgentRunner to satisfy the CTFAgent interface,
+enabling BoxPwnr to be used interchangeably with other agents.
+"""
+
+import logging
+import time
+from typing import Any, Optional
+
+from .protocol import AgentResult
+
+logger = logging.getLogger(__name__)
+
+
+class BoxPwnrAgent:
+    """Adapter wrapping BoxPwnr's AgentRunner to implement CTFAgent protocol.
+
+    Usage::
+
+        agent = BoxPwnrAgent(model="ollama/nanbeige4.1-3b")
+        result = agent.solve(challenge="eval-me", target="http://localhost:32805")
+    """
+
+    def __init__(
+        self,
+        model: str = "openrouter/openai/gpt-oss-120b",
+        platform: str = "cybench",
+        strategy: str = "chat_tools",
+        traces_dir: str = "./targets",
+        reasoning_effort: str = "medium",
+        **kwargs: Any,
+    ):
+        self.model = model
+        self.platform = platform
+        self.strategy = strategy
+        self.traces_dir = traces_dir
+        self.reasoning_effort = reasoning_effort
+        self._extra_kwargs = kwargs
+
+    def solve(
+        self,
+        challenge: str,
+        target: str,
+        ground_truth_flag: str = "",
+        max_steps: int = 30,
+        timeout: int = 300,
+    ) -> AgentResult:
+        """Solve a challenge using BoxPwnr's AgentRunner.
+
+        Args:
+            challenge: Challenge identifier (used as BoxPwnr target name).
+            target: Target URL (currently informational — BoxPwnr resolves targets via platform).
+            ground_truth_flag: Expected flag (for post-run validation).
+            max_steps: Maximum conversation turns.
+            timeout: Maximum time in seconds (converted to minutes for BoxPwnr).
+
+        Returns:
+            AgentResult with success/failure and metadata.
+        """
+        from .runner import AgentRunner
+
+        start = time.monotonic()
+        max_time_min = max(1, timeout // 60)
+
+        runner = AgentRunner(
+            platform=self.platform,
+            model=self.model,
+            strategy=self.strategy,
+            max_turns=max_steps,
+            max_time=max_time_min,
+            traces_dir=self.traces_dir,
+            reasoning_effort=self.reasoning_effort,
+            **self._extra_kwargs,
+        )
+
+        try:
+            runner.run(target=challenge)
+            elapsed = time.monotonic() - start
+            # BoxPwnr doesn't return structured results yet — wrap as best-effort
+            return AgentResult(
+                success=False,  # Cannot determine without trace parsing
+                flag=None,
+                steps=0,
+                duration_seconds=elapsed,
+                metadata={
+                    "model": self.model,
+                    "platform": self.platform,
+                    "challenge": challenge,
+                    "target": target,
+                },
+            )
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            logger.error("BoxPwnr solve failed for %s: %s", challenge, exc)
+            return AgentResult(
+                success=False,
+                flag=None,
+                steps=0,
+                duration_seconds=elapsed,
+                metadata={"error": str(exc), "challenge": challenge},
+            )

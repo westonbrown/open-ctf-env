@@ -13,10 +13,10 @@ BoxPwnr Agent → CyBench Challenges → Raw Traces → Converter → Training D
 
 ## Prerequisites
 
-1. **BoxPwnr installed** (already in `references/boxpwnr/` after setup)
+1. **BoxPwnr installed** (in `references/boxpwnr/` after setup)
 2. **CyBench benchmarks cloned** (in `benchmarks/cybench/`)
 3. **Docker running** (for challenge containers)
-4. **LLM API access** (GPT-4, Claude Sonnet, or local models)
+4. **LLM API access** (GPT-4o, Claude Sonnet, or local models)
 
 ## Step 1: Setup CyBench
 
@@ -28,18 +28,11 @@ cd ..
 
 # Verify BoxPwnr has CyBench platform
 cd references/boxpwnr
-uv sync  # Install dependencies
+uv sync
 uv run boxpwnr --platform cybench --list
 ```
 
-This should list 40 challenges across categories:
-- **Crypto**: Cryptography challenges
-- **Web**: Web security (SQLi, IDOR, XSS, etc.)
-- **Pwn**: Binary exploitation
-- **Reversing**: Reverse engineering
-- **Forensics**: Digital forensics
-- **Misc**: Miscellaneous
-- **Blockchain**: Smart contract security
+This lists 40 challenges across categories: Crypto, Web, Pwn, Reversing, Forensics, Misc, Blockchain.
 
 ## Step 2: Run BoxPwnr on CyBench Challenges
 
@@ -62,26 +55,17 @@ uv run boxpwnr --platform cybench \
 # - report.md          (human-readable summary)
 ```
 
-### Batch Collection (Recommended)
-
-Create a challenge list for systematic data collection:
+### Multiple Challenges
 
 ```bash
-# challenges.txt - Start with Very Easy and Easy challenges
-cat > challenges.txt << 'EOF'
-benchmark/hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Dynastic
-benchmark/hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Primary Knowledge
-benchmark/hackthebox/cyber-apocalypse-2024/misc/[Very Easy] Stop Drop and Roll
-benchmark/hackthebox/cyber-apocalypse-2024/web/[Easy] TimeKORP
-benchmark/project-sekai-ctf/sekaictf-2023/web/chunky
-EOF
-
-# Run batch collection
-uv run boxpwnr --platform cybench \
-  --targets-file challenges.txt \
-  --model gpt-4o \
-  --max-cost 10.0 \
-  --output-dir ../../targets/cybench_batch_001
+# Run individual challenges sequentially
+for target in "[Very Easy] Dynastic" "[Very Easy] Primary Knowledge" "[Easy] TimeKORP"; do
+  uv run boxpwnr --platform cybench \
+    --target "$target" \
+    --model gpt-4o \
+    --max-turns 30 \
+    --max-cost 2.0
+done
 ```
 
 ### Cost Management
@@ -109,10 +93,10 @@ cat targets/cybench/[Very Easy] Dynastic/stats.json | jq '.flag_found'
 ```
 
 **Good trace characteristics:**
-- ✅ 10-100 messages (multi-turn problem solving)
-- ✅ Mix of reasoning + tool calls (shell, python, etc.)
-- ✅ `success: true` and `flag_found: true` for SFT data
-- ✅ Both successes AND failures for GRPO data
+- 10-100 messages (multi-turn problem solving)
+- Mix of reasoning + tool calls (shell, python, etc.)
+- `success: true` and `flag_found: true` for SFT data
+- Both successes AND failures for GRPO data
 
 ## Step 4: Convert Traces to Training Data
 
@@ -123,42 +107,36 @@ cd ../..  # Back to open-ctf-env root
 
 # Convert all successful CyBench traces
 open-ctf-convert \
-  --input targets/cybench_batch_001/ \
-  --output data/sft_cybench.jsonl \
+  --input targets/cybench/ \
+  --output data/sft.jsonl \
   --success-only \
   --dedup
 
 # Check output
-wc -l data/sft_cybench.jsonl
-head -1 data/sft_cybench.jsonl | jq .
+wc -l data/sft.jsonl
+head -1 data/sft.jsonl | jq .
 ```
 
 ### Convert All Traces (SFT + GRPO)
 
 ```bash
-# Successful traces → SFT
-# All traces → GRPO (failures help with exploration)
+# Successful traces → SFT data
+# All traces → GRPO data (failures help with exploration)
 open-ctf-convert \
-  --input targets/cybench_batch_001/ \
-  --output data/sft_cybench.jsonl \
-  --output-failure data/grpo_all_cybench.jsonl \
+  --input targets/cybench/ \
+  --output data/sft.jsonl \
+  --output-failure data/grpo_all.jsonl \
   --dedup
 ```
 
 ### Split into SFT and GRPO Datasets
 
 ```bash
-# Split based on length and complexity
 open-ctf-split \
-  --input data/sft_cybench.jsonl \
+  --input data/sft.jsonl \
   --sft-output data/sft_final.jsonl \
   --grpo-output data/grpo_final.jsonl \
   --max-grpo-tokens 32768
-
-# GRPO dataset will contain:
-# - Long multi-turn trajectories (good for efficiency learning)
-# - Ground truth flags for reward computation
-# - Optimal step counts
 ```
 
 ## Step 5: Validate Data Format
@@ -178,47 +156,36 @@ head -1 data/grpo_final.jsonl | jq '.ground_truth_flag'
 
 Collect data in order of increasing difficulty:
 
-```bash
-# Phase 1: Very Easy (quick wins, build dataset foundation)
-# Expected success rate: 60-80%
-# Collect: 50-100 traces
-
-# Phase 2: Easy (more complex, multi-step)
-# Expected success rate: 40-60%
-# Collect: 50-100 traces
-
-# Phase 3: Medium (challenging, diverse techniques)
-# Expected success rate: 20-40%
-# Collect: 30-50 traces
-
-# Phase 4: Hard (expert-level, include failures for GRPO)
-# Expected success rate: 5-20%
-# Collect: 20-30 traces
-```
+| Phase | Difficulty | Expected Success Rate | Target Traces |
+|-------|-----------|----------------------|---------------|
+| 1 | Very Easy | 60-80% | 50-100 |
+| 2 | Easy | 40-60% | 50-100 |
+| 3 | Medium | 20-40% | 30-50 |
+| 4 | Hard | 5-20% | 20-30 |
 
 ### Strategy 2: Category Diversity
 
 Ensure coverage across vulnerability types:
 
-```bash
-# Web (30%): SQLi, XSS, IDOR, SSRF, LFI, RCE
-# Crypto (20%): Classical crypto, modern crypto
-# Pwn (20%): Buffer overflow, ROP, heap exploitation
-# Reversing (15%): Static/dynamic analysis
-# Misc (10%): Steganography, OSINT, scripting
-# Forensics (5%): Memory, disk, network forensics
-```
+| Category | Target % | Types |
+|----------|----------|-------|
+| Web | 30% | SQLi, XSS, IDOR, SSRF, LFI, RCE |
+| Crypto | 20% | Classical, modern, implementation flaws |
+| Pwn | 20% | Buffer overflow, ROP, heap |
+| Reversing | 15% | Static/dynamic analysis |
+| Misc | 10% | Steganography, OSINT, scripting |
+| Forensics | 5% | Memory, disk, network |
 
 ### Strategy 3: Model Diversity
 
-Use different models for different challenges:
+Different models have different strengths:
 
-```bash
-# GPT-4o: Web, crypto (better reasoning)
-# Claude Sonnet: Pwn, reversing (better code analysis)
-# Claude Haiku: Misc, forensics (bulk collection)
-# Local models: Retry failed challenges (exploration)
-```
+| Model | Best For | Notes |
+|-------|----------|-------|
+| GPT-4o | Web, crypto | Better reasoning |
+| Claude Sonnet | Pwn, reversing | Better code analysis |
+| Claude Haiku | Misc, forensics | Cheap bulk collection |
+| Local models | Retry failures | Free exploration |
 
 ## Expected Dataset Sizes
 
@@ -227,14 +194,12 @@ Use different models for different challenges:
 | **SFT** | 100 traces | 500 traces | 1,000+ traces |
 | **GRPO** | 50 trajectories | 200 trajectories | 500+ trajectories |
 
-**For conference demo/paper:**
-- Minimum viable: 200 SFT + 100 GRPO (~$100-200 in API costs)
-- Production quality: 1,000 SFT + 500 GRPO (~$500-1,000 in API costs)
+**For conference demo:** 200 SFT + 100 GRPO (~$100-200 in API costs).
+**Production quality:** 1,000 SFT + 500 GRPO (~$500-1,000 in API costs).
 
 ## Troubleshooting
 
-### BoxPwnr Challenge Fails Immediately
-
+**BoxPwnr challenge fails immediately:**
 ```bash
 # Check Docker is running
 docker ps
@@ -243,85 +208,39 @@ docker ps
 uv run boxpwnr --platform cybench \
   --target "[Very Easy] Dynastic" \
   --model gpt-4o \
-  --keep-container \
-  --debug
+  --keep-container
 ```
 
-### Trace Conversion Fails
-
+**Trace conversion fails:**
 ```bash
 # Check conversation.json structure
 cat targets/cybench/[challenge]/conversation.json | jq '.messages[0]'
 
-# Validate it has required fields
+# Validate required fields
 cat targets/cybench/[challenge]/stats.json | jq '{success, flag_found, optimal_steps}'
 ```
 
-### Empty Dataset After Conversion
-
+**Empty dataset after conversion:**
 ```bash
 # Check input directory has traces
-ls -la targets/cybench_batch_001/
+ls -la targets/cybench/
 
-# Check for success-only filter
+# Try without --success-only to include failures
 open-ctf-convert --input targets/ --output data/test.jsonl
-# (without --success-only to include failures)
-```
-
-## Real-World Example
-
-Here's a complete workflow for collecting 100 high-quality traces:
-
-```bash
-# 1. Setup
-cd references/boxpwnr
-uv sync
-
-# 2. Create challenge list (select 100 diverse challenges)
-uv run boxpwnr --platform cybench --list > all_challenges.txt
-# Edit to select 100 challenges across categories/difficulties
-
-# 3. Run batch collection (overnight job)
-nohup uv run boxpwnr --platform cybench \
-  --targets-file selected_100.txt \
-  --model claude-3-5-haiku-20241022 \
-  --max-cost 50.0 \
-  --output-dir ../../targets/cybench_production \
-  > batch_run.log 2>&1 &
-
-# 4. Monitor progress
-tail -f batch_run.log
-
-# 5. Convert successful traces
-cd ../..
-open-ctf-convert \
-  --input targets/cybench_production/ \
-  --output data/sft_production.jsonl \
-  --success-only \
-  --dedup
-
-# 6. Split for training
-open-ctf-split \
-  --input data/sft_production.jsonl \
-  --sft-output data/sft_train.jsonl \
-  --grpo-output data/grpo_train.jsonl
-
-# 7. Train
-open-ctf-train sft --data data/sft_train.jsonl --output outputs/sft
-open-ctf-train grpo --model outputs/sft/final --data data/grpo_train.jsonl --output outputs/grpo
 ```
 
 ## Next Steps
 
 After collecting data:
 
-1. [Training Guide](training.md) - Train your model with SFT + GRPO
-2. [Deployment Guide](deployment.md) - Deploy the trained model
-3. [Architecture](architecture.md) - Understand the pipeline internals
+1. [Training Guide](training.md) -- Train your model with the 3-stage pipeline
+2. [Deployment Guide](deployment.md) -- Deploy the trained model
+3. [Architecture](architecture.md) -- Understand the pipeline internals
 
 ## Resources
 
 - **CyBench Paper**: https://arxiv.org/abs/2408.08926
 - **CyBench Repository**: https://github.com/andyzorigin/cybench
 - **BoxPwnr Documentation**: https://github.com/0ca/BoxPwnr
+- **BoxPwnr Traces**: https://github.com/0ca/BoxPwnr-Traces
 - **Open CTF Environment**: https://github.com/westonbrown/open-ctf-env

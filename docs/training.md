@@ -1,35 +1,22 @@
 # Training Guide
 
-Open CTF uses a 2-stage training pipeline: SFT (supervised fine-tuning) for knowledge acquisition, followed by GRPO (Group Relative Policy Optimization) for efficiency optimization.
+Open CTF uses a **3-stage training pipeline**: SFT (supervised fine-tuning) for knowledge acquisition, online GRPO (reinforcement learning with live tool execution) for efficiency optimization, and GEPA (prompt evolution) for no-weight-update refinement.
 
 ## Pipeline Overview
 
-```mermaid
-graph LR
-    A[BoxPwnr Traces<br/>conversation.json] --> B[Convert]
-    B --> C[ChatML JSONL]
-    C --> D[Split]
-
-    D --> E[SFT Data<br/>Successful traces]
-    D --> F[GRPO Data<br/>Multi-turn + flags]
-
-    E --> G[SFT Training<br/>LoRA r=64<br/>3 epochs]
-    F --> H[GRPO Training<br/>DAPO loss<br/>1 epoch]
-
-    G --> I[Merge LoRA]
-    I --> H
-    H --> J[Final Model]
-
-    J --> K[GGUF Export<br/>Q4_K_M]
-    J --> L[vLLM Serve]
-
-    K --> M[Ollama/llama.cpp]
-    L --> N[API Deploy]
-
-    style G fill:#e1f5e1
-    style H fill:#e1f5e1
-    style J fill:#d4edda
 ```
+BoxPwnr Traces ──> Convert ──> Split ──> SFT Data + GRPO Data
+                                              │           │
+                              LlamaFactory SFT│           │SkyRL Online GRPO
+                                              ▼           ▼
+                                    LoRA Adapter ──> Merge ──> GRPO Model ──> GEPA ──> Final
+```
+
+| Stage | Framework | What It Does | Weight Updates |
+|-------|-----------|--------------|----------------|
+| **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) | YAML-driven fine-tuning on expert traces. LoRA, packing, DeepSpeed ZeRO. | Yes |
+| **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online RL with live tool execution against OpenEnv. Ray-based, vLLM, DAPO. | Yes |
+| **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection. Pareto-based candidate selection. ~6% better than GRPO with 4-35x fewer rollouts. | No |
 
 ## Data Preparation
 
@@ -42,7 +29,7 @@ open-ctf-convert \
     --output data/sft_train.jsonl \
     --success-only --dedup
 
-# Also save failures (useful for GRPO negative examples)
+# Also save failures (useful for GRPO exploration)
 open-ctf-convert \
     --input targets/ \
     --output data/sft_train.jsonl \
@@ -87,187 +74,260 @@ open-ctf-split \
 
 ## Stage 1: Supervised Fine-Tuning (SFT)
 
-SFT teaches the model domain knowledge, tool schemas, and reasoning patterns.
+SFT uses **LlamaFactory** to teach the model domain knowledge, tool schemas, and reasoning patterns. Configuration is entirely YAML-driven -- no Python changes between experiments.
 
 ### Quick Start
 
 ```bash
 open-ctf-train sft \
-    --model unsloth/GLM-4.7-Flash \
+    --model Nanbeige/Nanbeige4.1-3B \
     --data data/sft.jsonl \
     --output outputs/sft
 ```
 
 ### Configuration
 
-Edit `src/open_ctf/configs/training.yaml`:
+Model-specific configs live in `configs/llamafactory/`:
+
+| Model | Config | Template | Tool Format | Notes |
+|-------|--------|----------|-------------|-------|
+| **Nanbeige4.1-3B** | `nanbeige_3b.yaml` | `chatml` | `qwen` | Default, 3B dense, QLoRA 4-bit |
+| **GLM-4.7-Flash** | `glm47_flash.yaml` | `glm4_7` | `glm4_moe` | MoE, BF16 LoRA, batch_size=1 |
+| **Devstral-Small-2-24B** | `devstral_24b.yaml` | `mistral` | (default) | Dense, QLoRA 4-bit |
+
+Example config (`configs/llamafactory/nanbeige_3b.yaml`):
 
 ```yaml
-model:
-  name: "unsloth/GLM-4.7-Flash"
-  max_seq_length: 4096
-  # MoE models: use BF16 LoRA (4-bit QLoRA not supported for MoE)
-  load_in_4bit: false
-
-lora:
-  r: 64
-  alpha: 64
-  dropout: 0
-  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
-  use_rslora: false
-
-sft:
-  epochs: 3
-  batch_size: 1
-  gradient_accumulation_steps: 16
-  learning_rate: 2.0e-4
-  warmup_ratio: 0.03
-  weight_decay: 0.01
-  lr_scheduler_type: cosine
-  packing: true
+model_name_or_path: Nanbeige/Nanbeige4.1-3B
+trust_remote_code: true
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.0
+lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+template: chatml
+tool_format: qwen
+cutoff_len: 32768
+packing: true
+neat_packing: true
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-4
+num_train_epochs: 5
+bf16: true
+gradient_checkpointing: true
+quantization_bit: 4
+quantization_method: bitsandbytes
 ```
 
-### Key Parameters
+### SFT Key Parameters
 
 | Parameter | Recommended | Notes |
 |-----------|-------------|-------|
-| `epochs` | 3 | More epochs can improve tool-use accuracy |
-| `batch_size` | 2 | Adjust based on GPU memory |
+| `cutoff_len` | 32768 | Context window for training |
+| `num_train_epochs` | 5 | Research shows short SFT (1-3) can underfit for RL |
 | `learning_rate` | 2e-4 | Standard for LoRA SFT |
-| `packing` | true | Significantly improves throughput |
-| `lora.r` | 64 | Higher rank = more capacity |
+| `packing` | true | 3x throughput improvement |
+| `lora_rank` | 64 | Higher rank = more capacity |
+| `template` | model-specific | `chatml` for ChatML, `glm4_7` for GLM, `mistral` for Devstral |
+| `tool_format` | model-specific | `qwen` for Hermes/ChatML, `glm4_moe` for GLM |
 
-## Stage 2: GRPO (Reinforcement Learning)
+### MoE Model Notes (GLM-4.7-Flash)
 
-GRPO optimizes for flag capture efficiency using the CTF reward function.
+- **No 4-bit quantization**: MoE expert tensors are incompatible with BitsAndBytes. Use BF16 LoRA (`quantization_bit` omitted).
+- **batch_size=1**: Padding tokens through MoE router produce NaN gradients. Compensate with `gradient_accumulation_steps: 16`.
+- **Router layers excluded**: Only attention + FFN shared layers targeted by LoRA.
+
+## Merging LoRA Adapters
+
+After SFT, merge the LoRA adapter into the base model for GRPO:
+
+```bash
+open-ctf-train merge \
+    --adapter outputs/sft \
+    --base-model Nanbeige/Nanbeige4.1-3B \
+    --output outputs/sft-merged
+```
+
+## Stage 2: Online GRPO (Reinforcement Learning)
+
+GRPO uses **SkyRL** to optimize for flag capture efficiency with live tool execution against the **OpenEnv** server. The model generates tool calls, OpenEnv executes them (shell, Python, file ops), and the CTF reward function scores the full trajectory.
+
+### Prerequisites
+
+1. **OpenEnv server running**: Provides live tool execution for the agent.
+2. **Merged SFT model**: GRPO starts from the SFT checkpoint.
 
 ### Quick Start
 
 ```bash
+# Start OpenEnv server (in a separate terminal or Docker container)
+# ...
+
+# Run GRPO
+OPEN_CTF_ENV_URL=http://localhost:8100 \
 open-ctf-train grpo \
-    --model outputs/sft/final \
+    --model outputs/sft-merged \
     --data data/grpo.jsonl \
     --output outputs/grpo
 ```
 
 ### Configuration
 
+GRPO configs live in `configs/skyrl/`:
+
+| Model | Config | Placement | Notes |
+|-------|--------|-----------|-------|
+| **Nanbeige4.1-3B** | `nanbeige_3b.yaml` | `colocate_all: true` | Dense, fast iteration |
+| **GLM-4.7-Flash** | `glm47_flash.yaml` | `colocate_all: true` | MoE safe default |
+
+Example config (`configs/skyrl/nanbeige_3b.yaml`):
+
 ```yaml
-grpo:
-  epochs: 1
-  batch_size: 1
-  gradient_accumulation_steps: 8
-  learning_rate: 5.0e-6
-  warmup_ratio: 0.10
-  beta: 0.0
-  loss_type: dapo
-  num_generations: 8
-  max_completion_length: 4096
-  max_grad_norm: 0.1
-  epsilon_high: 0.28
-  weight_decay: 0.1
-  scale_rewards: "group"
+trainer:
+  strategy: fsdp2
+  bf16: true
+  gradient_checkpointing: true
+  train_batch_size: 1
+  max_prompt_length: 32768
+  placement:
+    colocate_all: true
+  policy:
+    model:
+      path: outputs/sft-merged/
+      lora:
+        rank: 64
+        alpha: 128
+    optimizer_config:
+      lr: 5.0e-6
+  algorithm:
+    advantage_estimator: grpo
+    kl_loss_coef: 0.0
+
+generator:
+  backend: vllm
+  n_samples_per_prompt: 4
+  max_turns: 15
+  sampling_params:
+    max_generate_length: 32768
+    temperature: 1.0
+
+environment:
+  env_class: openctf
 ```
 
 ### Reward Function
 
-The CTF reward scores completions on four dimensions:
+The CTF reward scores completions on **8 signals + 1 penalty**:
 
-| Component | Weight | Description |
-|-----------|--------|-------------|
-| **Flag Capture** | 0.30 | Exact flag match (1.0) or pattern match (0.1) |
-| **Skill Grammar** | 0.20 | RECON -> ENUM -> EXPLOIT phase ordering |
-| **Efficiency** | 0.35 | Fewer steps = higher reward |
-| **Format** | 0.15 | Valid tool call structure |
+| Signal | Weight | Description |
+|--------|--------|-------------|
+| **Flag Capture** | 0.20 | Exact match (1.0) or pattern match (0.1) |
+| **Efficiency** | 0.25 | `min(optimal / actual, 1.0)` |
+| **Format** | 0.15 | Valid tool call JSON structure |
+| **Progression** | 0.10 | RECON -> ENUM -> EXPLOIT phase ordering |
+| **Exploration** | 0.08 | Novel tool usage weighted toward early trajectory |
+| **Uniqueness** | 0.07 | Command diversity (detects stuck loops) |
+| **Recovery** | 0.08 | Successful pivot after errors |
+| **Cognitive** | 0.07 | Reasoning depth (words per action) |
+| **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag |
 
-### Key Parameters
+All process signals are ungated -- they provide gradient signal regardless of flag capture.
+
+### GRPO Key Parameters
 
 | Parameter | Recommended | Notes |
 |-----------|-------------|-------|
-| `beta` | 0.0 | No KL penalty (pure DAPO) |
-| `loss_type` | dapo | Dynamic advantage normalization |
-| `num_generations` | 8 | Completions per prompt for ranking |
-| `learning_rate` | 5e-6 | Much lower than SFT to avoid instability |
+| `lr` | 5e-6 | Much lower than SFT to avoid instability |
+| `n_samples_per_prompt` | 4 | Completions per prompt for ranking |
+| `max_turns` | 15 | Tool-calling iterations per generation |
+| `max_generate_length` | 32768 | Full-length completions |
+| `colocate_all` | true | Safe default, avoids weight sync issues |
+| `advantage_estimator` | grpo | Group Relative Policy Optimization |
+| `kl_loss_coef` | 0.0 | No KL penalty (pure DAPO) |
 
-## Merging LoRA Adapters
+### SkyRL Architecture
 
-After training, merge the LoRA adapter into the base model:
+SkyRL uses Ray actors for fully async GRPO:
+
+- **Generator**: vLLM inference engine produces completions in a separate process.
+- **Trainer**: FSDP2 handles distributed training with gradient checkpointing.
+- **Environment**: `OpenCTFTextEnv` (in `skyrl_envs/openctf_env.py`) bridges SkyRL and OpenEnv via HTTP.
+- **Placement**: `colocate_all: true` offloads weights to CPU between gen/train phases. Slower but eliminates all weight sync bugs for MoE models.
+
+## Stage 3: GEPA (Prompt Evolution)
+
+GEPA optimizes the system prompt without changing model weights. It uses DSPy's reflective agent pattern with Pareto-based candidate selection.
+
+### Quick Start
 
 ```bash
-open-ctf-train merge \
-    --adapter outputs/grpo/final \
-    --output outputs/merged
+open-ctf-train gepa \
+    --model openai/ctf-agent \
+    --data data/grpo.jsonl \
+    --output outputs/gepa \
+    --reflection-model anthropic/claude-sonnet-4-20250514
 ```
 
-## Full Pipeline (SFT + GRPO + Merge)
+GEPA can run in offline mode (stub tools, scores structure) or online mode (real tools, scores flag capture). Online mode uses OpenEnv, same as GRPO.
+
+## Full Pipeline
 
 ```bash
-# Run each stage via CLI
-open-ctf-train sft --model unsloth/GLM-4.7-Flash --data data/sft.jsonl --output outputs/sft
-open-ctf-train merge --adapter outputs/sft --base-model unsloth/GLM-4.7-Flash --output outputs/merged
-open-ctf-train grpo --model outputs/merged --data data/grpo.jsonl --output outputs/grpo
+# 1. Convert traces
+open-ctf-convert --input targets/ --output data/all.jsonl --dedup
+open-ctf-split --input data/all.jsonl
+
+# 2. SFT
+open-ctf-train sft --model Nanbeige/Nanbeige4.1-3B --data data/sft.jsonl --output outputs/sft
+
+# 3. Merge
+open-ctf-train merge --adapter outputs/sft --base-model Nanbeige/Nanbeige4.1-3B --output outputs/sft-merged
+
+# 4. GRPO (start OpenEnv first)
+OPEN_CTF_ENV_URL=http://localhost:8100 \
+open-ctf-train grpo --model outputs/sft-merged --data data/grpo.jsonl --output outputs/grpo
+
+# 5. GEPA (optional)
+open-ctf-train gepa --model outputs/grpo/final --output outputs/gepa
+
+# 6. Export
+open-ctf-export --adapter outputs/grpo/final --base-model Nanbeige/Nanbeige4.1-3B --output models/ctf-agent.gguf --quant Q4_K_M
 ```
 
 ## Docker Training
 
-For GPU training with Docker:
-
 ```bash
-# SFT
+# Stage 1: SFT (LlamaFactory image)
 docker compose run --rm sft
 
-# GRPO (uses OPEN_CTF_NO_UNSLOTH=1 fallback for compatibility)
+# Merge LoRA
+docker compose run --rm merge
+
+# Stage 2: GRPO (SkyRL image, needs OPEN_CTF_ENV_URL)
 docker compose run --rm grpo
+
+# Validate
+docker compose run --rm validate
 ```
 
 ## Monitoring
 
-Training logs to W&B by default. Set `WANDB_API_KEY` in your environment, or disable with:
+Training logs to W&B when `report_to: wandb` is set. Set `WANDB_API_KEY` in your environment, or disable:
 
 ```yaml
 output:
   report_to: none
 ```
 
-## DGX Spark / GB10 Notes
-
-The NVIDIA DGX Spark (Grace Blackwell GB10) has specific constraints for MoE model training:
-
-### MoE Models (GLM-4.7-Flash)
-
-- **4-bit QLoRA is NOT supported** for MoE models (BitsAndBytes limitation). Use BF16 LoRA instead (`load_in_4bit: false`). GLM-4.7-Flash needs ~60GB VRAM for BF16 LoRA.
-- **Triton shared memory limit**: GB10 has 99KB per thread block vs 104-147KB needed by MoE Triton kernels. Set `UNSLOTH_MOE_BACKEND=grouped_mm` (done automatically by our training code) to use `torch._grouped_mm` instead.
-- **GRPO dtype bug**: Unsloth's GRPO kernels have a Half/BFloat16 mismatch on GB10. Use `OPEN_CTF_NO_UNSLOTH=1` for GRPO stage.
-- **Router layers**: Not targeted by LoRA (per Unsloth recommendation for stability).
-
-### Recommended Container Setup
-
-```bash
-# SFT with Unsloth (set MOE backend for MoE models)
-docker run --gpus all \
-  -e UNSLOTH_MOE_BACKEND=grouped_mm \
-  -v ./data:/workspace/data -v ./outputs:/workspace/outputs \
-  unsloth/unsloth open-ctf-train sft --model unsloth/GLM-4.7-Flash ...
-
-# GRPO without Unsloth (bypass dtype bug)
-docker run --gpus all \
-  -e OPEN_CTF_NO_UNSLOTH=1 \
-  -v ./data:/workspace/data -v ./outputs:/workspace/outputs \
-  nvcr.io/nvidia/pytorch:25.11-py3 open-ctf-train grpo ...
-```
-
-### Fallback Options
-
-If `grouped_mm` still fails on GB10:
-1. Try `UNSLOTH_MOE_BACKEND=native_torch` (12x slower but avoids all Triton kernels)
-2. Use `OPEN_CTF_NO_UNSLOTH=1` for both SFT and GRPO (pure HuggingFace + PEFT)
-3. Use a dense model (e.g., Qwen3-8B) where 4-bit QLoRA works fine
-
 ## Hardware Requirements
 
-| Stage | Minimum GPU | Recommended |
-|-------|-------------|-------------|
-| SFT (GLM-4.7-Flash, BF16 LoRA) | 1x 80GB (A100) | DGX Spark (128GB) |
-| SFT (8B dense, 4-bit) | 1x 24GB (RTX 4090) | 1x 80GB (A100/H100) |
-| GRPO (8B model) | 1x 80GB (A100/H100) | 1x 141GB (H200) |
-| SFT (120B model) | 8x H100 80GB | 8x H200 141GB |
+| Stage | Model | Minimum GPU | Recommended |
+|-------|-------|-------------|-------------|
+| SFT | Nanbeige4.1-3B (QLoRA 4-bit) | 1x 24GB | 1x 80GB |
+| SFT | GLM-4.7-Flash (BF16 LoRA) | 1x 80GB | DGX Spark (128GB) |
+| GRPO | Nanbeige4.1-3B | DGX Spark (128GB) | 1x H200 (141GB) |
+| GRPO | GLM-4.7-Flash | 2x H200 (server mode) | 2x H200 |
+| GEPA | Any | No GPU required | - |

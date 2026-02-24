@@ -1,0 +1,264 @@
+# CyBench Challenge Registry
+# Maps 40 challenges to infrastructure requirements for online RL training.
+# infra_type: "docker" = needs running container, "static" = file-based (no server)
+
+challenges:
+  # ---- Crypto (15 challenges) ----
+  - id: "Dynastic"
+    name: "[Very Easy] Dynastic"
+    category: crypto
+    difficulty: very_easy
+    infra_type: static
+
+  - id: "Primary Knowledge"
+    name: "[Very Easy] Primary Knowledge"
+    category: crypto
+    difficulty: very_easy
+    infra_type: static
+
+  - id: "makeshift"
+    name: "[Very Easy] makeshift"
+    category: crypto
+    difficulty: very_easy
+    infra_type: static
+
+  - id: "Iced TEA"
+    name: "[Easy] Iced TEA"
+    category: crypto
+    difficulty: easy
+    infra_type: static
+
+  - id: "Blunt"
+    name: "[Easy] Blunt"
+    category: crypto
+    difficulty: easy
+    infra_type: static
+
+  - id: "Partial Tenacity"
+    name: "[Easy] Partial Tenacity"
+    category: crypto
+    difficulty: easy
+    infra_type: static
+
+  - id: "ROT128"
+    name: "[Easy] ROT128"
+    category: crypto
+    difficulty: easy
+    infra_type: static
+
+  - id: "Arranged"
+    name: "[Medium] Arranged"
+    category: crypto
+    difficulty: medium
+    infra_type: static
+
+  - id: "Bloom Bloom"
+    name: "[Medium] Bloom Bloom"
+    category: crypto
+    difficulty: medium
+    infra_type: static
+
+  - id: "Down the Rabbithole"
+    name: "[Medium] Down the Rabbithole"
+    category: crypto
+    difficulty: medium
+    infra_type: static
+
+  - id: "Permuted"
+    name: "[Medium] Permuted"
+    category: crypto
+    difficulty: medium
+    infra_type: static
+
+  - id: "the-three-eyed-oracle"
+    name: "[Medium] the-three-eyed-oracle"
+    category: crypto
+    difficulty: medium
+    infra_type: docker
+    port: 32801
+
+  - id: "tsb"
+    name: "[Medium] tsb"
+    category: crypto
+    difficulty: medium
+    infra_type: static
+
+  - id: "Probing"
+    name: "[Hard] Probing"
+    category: crypto
+    difficulty: hard
+    infra_type: docker
+    port: 32802
+
+  - id: "RsaCtfTool"
+    name: "[Hard] RsaCtfTool"
+    category: crypto
+    difficulty: hard
+    infra_type: static
+
+  # ---- Forensics (4 challenges) ----
+  - id: "LootStash"
+    name: "[Very Easy] LootStash"
+    category: forensics
+    difficulty: very_easy
+    infra_type: static
+
+  - id: "Urgent"
+    name: "[Very Easy] Urgent"
+    category: forensics
+    difficulty: very_easy
+    infra_type: static
+
+  - id: "It Has Begun"
+    name: "[Easy] It Has Begun"
+    category: forensics
+    difficulty: easy
+    infra_type: static
+
+  - id: "Phreaky"
+    name: "[Medium] Phreaky"
+    category: forensics
+    difficulty: medium
+    infra_type: static
+
+  # ---- Misc (10 challenges) ----
+  - id: "Flag Command"
+    name: "[Very Easy] Flag Command"
+    category: misc
+    difficulty: very_easy
+    infra_type: docker
+    port: 32803
+
+  - id: "Stop Drop and Roll"
+    name: "[Very Easy] Stop Drop and Roll"
+    category: misc
+    difficulty: very_easy
+    infra_type: docker
+    port: 32804
+
+  - id: "eval-me"
+    name: "[Very Easy] eval-me"
+    category: misc
+    difficulty: very_easy
+    infra_type: docker
+    port: 32805
+
+  - id: "avatar"
+    name: "[Very Easy] avatar"
+    category: misc
+    difficulty: very_easy
+    infra_type: docker
+    port: 32806
+
+  - id: "Character"
+    name: "[Easy] Character"
+    category: misc
+    difficulty: easy
+    infra_type: docker
+    port: 32807
+
+  - id: "Colored Squares"
+    name: "[Easy] Colored Squares"
+    category: misc
+    difficulty: easy
+    infra_type: static
+
+  - id: "meerkat"
+    name: "[Easy] meerkat"
+    category: misc
+    difficulty: easy
+    infra_type: static
+
+  - id: "Compressor"
+    name: "[Medium] Compressor"
+    category: misc
+    difficulty: medium
+    infra_type: docker
+    port: 32808
+
+  - id: "MultiDigilingual"
+    name: "[Medium] MultiDigilingual"
+    category: misc
+    difficulty: medium
+    infra_type: static
+
+  - id: "05-motp"
+    name: "[Hard] 05-motp"
+    category: misc
+    difficulty: hard
+    infra_type: docker
+    port: 32809
+
+  # ---- Web (6 challenges) ----
+  - id: "TimeKORP"
+    name: "[Easy] TimeKORP"
+    category: web
+    difficulty: easy
+    infra_type: docker
+    port: 32810
+
+  - id: "Labyrinth Linguist"
+    name: "[Medium] Labyrinth Linguist"
+    category: web
+    difficulty: medium
+    infra_type: docker
+    port: 32811
+
+  - id: "chunky"
+    name: "[Medium] chunky"
+    category: web
+    difficulty: medium
+    infra_type: docker
+    port: 32812
+
+  - id: "KORP Terminal"
+    name: "[Easy] KORP Terminal"
+    category: web
+    difficulty: easy
+    infra_type: docker
+    port: 32813
+
+  - id: "ProxyAsAService"
+    name: "[Easy] ProxyAsAService"
+    category: web
+    difficulty: easy
+    infra_type: docker
+    port: 32814
+
+  - id: "LoveTok"
+    name: "[Easy] LoveTok"
+    category: web
+    difficulty: easy
+    infra_type: docker
+    port: 32815
+
+  # ---- Rev (5 challenges) ----
+  - id: "BabyRE"
+    name: "[Very Easy] BabyRE"
+    category: rev
+    difficulty: very_easy
+    infra_type: static
+
+  - id: "Crushing"
+    name: "[Easy] Crushing"
+    category: rev
+    difficulty: easy
+    infra_type: static
+
+  - id: "FollowThePath"
+    name: "[Easy] FollowThePath"
+    category: rev
+    difficulty: easy
+    infra_type: static
+
+  - id: "Packed Away"
+    name: "[Medium] Packed Away"
+    category: rev
+    difficulty: medium
+    infra_type: static
+
+  - id: "Metagaming"
+    name: "[Hard] Metagaming"
+    category: rev
+    difficulty: hard
+    infra_type: static

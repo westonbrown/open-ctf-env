@@ -1,0 +1,59 @@
+# Open CTF Training Configuration -- E2E Smoke Test
+# ==================================================
+# Minimal settings for fast pipeline validation on DGX Spark.
+# Used by: scripts/test_e2e_dgx.sh
+#
+# Differences from default training.yaml:
+#   - max_seq_length: 2048 (vs 32768) for speed
+#   - epochs: 1
+#   - batch_size: 1, grad_accum: 1 (minimal)
+#   - LoRA r=16 (vs 64) for smaller adapter
+#   - save_steps: 999999 (only save at end)
+#   - report_to: none (no wandb)
+
+model:
+  name: "Nanbeige/Nanbeige4.1-3B"
+  max_seq_length: 2048
+  load_in_4bit: true
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  use_rslora: false
+
+sft:
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+
+grpo:
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  beta: 0.0
+  loss_type: dapo
+  num_generations: 2
+  max_completion_length: 1024
+  max_grad_norm: 0.1
+  weight_decay: 0.1
+  scale_rewards: false
+  use_vllm: false
+  max_tool_calling_iterations: 5
+
+output:
+  save_steps: 999999
+  logging_steps: 1
+  report_to: none

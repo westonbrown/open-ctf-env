@@ -5,7 +5,7 @@ Runs BoxPwnr's Solver against CTF challenges from the command line.
 
 Usage:
     open-ctf agent --platform xbow --target XBEN-003-24
-    open-ctf agent --platform xbow --target XBEN-003-24 --model ollama/glm-4.7-flash
+    open-ctf agent --platform xbow --target XBEN-003-24 --model ollama/nanbeige4.1-3b
     open-ctf agent --check
 """
 

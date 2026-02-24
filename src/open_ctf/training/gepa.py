@@ -13,15 +13,7 @@ GEPA reflects on execution traces to propose improved instructions,
 using Pareto-based candidate selection to avoid local optima.
 Outperforms GRPO by ~6% avg with 4-35x fewer rollouts (ICLR 2026 Oral).
 
-Two modes:
-
-  **Offline** (default): Stub tools return acknowledgment strings.
-  The metric scores on trajectory STRUCTURE (format, progression,
-  exploration, uniqueness) -- no live environment required.
-
-  **Online** (with ``env_url``): Tools connect to an OpenEnv server.
-  The metric can also score on flag capture and actual tool output.
-  Requires ``open-ctf-env`` server running with challenges loaded.
+Tools execute via ToolExecutor (direct subprocess, no HTTP server needed).
 
 References:
   - Paper: https://arxiv.org/abs/2507.19457
@@ -31,7 +23,6 @@ References:
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -63,142 +54,6 @@ Install additional tools with apt-get if needed.
 - Test default credentials on login forms
 - Look for IDOR, SSRF, SQLi, command injection
 - When you find a flag, submit it immediately with flag_found"""
-
-
-# ---------------------------------------------------------------------------
-# Stub tools for offline GEPA (no environment server needed)
-# ---------------------------------------------------------------------------
-
-
-def _make_stub_tools() -> list:
-    """Create stub tool callables for offline GEPA.
-
-    These tools have proper signatures and docstrings so DSPy ReAct
-    can generate tool-call decisions. Stubs return acknowledgment
-    strings -- the metric scores on trajectory structure, not output.
-    """
-
-    def shell_command(command: str, timeout: int = 30) -> str:
-        """Run a shell command in the CTF attacker container and return output.
-
-        Use this to execute reconnaissance, enumeration, and exploitation
-        commands against the target challenge.
-
-        Args:
-            command: The shell command to execute (e.g. ``nmap -sV target``).
-            timeout: Maximum execution time in seconds. Defaults to 30.
-
-        Returns:
-            The combined stdout and stderr output from the command.
-        """
-        return f"$ {command}\n[command executed, output returned]"
-
-    def exec_command(cmd: str, workdir: str = "", yield_time: int = 5) -> str:
-        """Start an interactive process in a PTY session and return its output.
-
-        Args:
-            cmd: Shell command to execute (e.g. ``python3``, ``ssh user@host``).
-            workdir: Optional working directory.
-            yield_time: Seconds to wait for initial output. Defaults to 5.
-
-        Returns:
-            Session ID and initial output from the process.
-        """
-        return f"Session started: {cmd}\n[session_id: 1]"
-
-    def python_code(code: str, timeout: int = 120) -> str:
-        """Execute Python code in the CTF attacker container.
-
-        Args:
-            code: Python source code to execute.
-            timeout: Maximum execution time in seconds. Defaults to 120.
-
-        Returns:
-            The output from executing the Python code.
-        """
-        return f"[Python executed]\n{code[:100]}..."
-
-    def read_file(file_path: str, line_numbers: bool = True) -> str:
-        """Read the contents of a file in the CTF environment.
-
-        Args:
-            file_path: Path to the file to read.
-            line_numbers: Whether to include line numbers. Defaults to True.
-
-        Returns:
-            The file contents.
-        """
-        return f"[Read] {file_path}\n[file contents returned]"
-
-    def grep(pattern: str, path: str = ".", include: str = "") -> str:
-        """Search for a regex pattern in files.
-
-        Args:
-            pattern: Regex pattern to search for.
-            path: Directory to search in. Defaults to current directory.
-            include: File pattern to include (e.g. ``*.py``). Optional.
-
-        Returns:
-            Grep results with line numbers.
-        """
-        return f"[Grep] pattern='{pattern}' path='{path}'\n[matches returned]"
-
-    def file_search(pattern: str, path: str = ".") -> str:
-        """Find files by name pattern.
-
-        Args:
-            pattern: Glob pattern to match file names (e.g. ``*.py``).
-            path: Directory to search in. Defaults to current directory.
-
-        Returns:
-            List of matching file paths.
-        """
-        return f"[Find] {pattern} in {path}\n[files listed]"
-
-    def apply_patch(patch: str) -> str:
-        """Apply a patch to modify files in the CTF environment.
-
-        Args:
-            patch: The patch content to apply.
-
-        Returns:
-            Result of applying the patch.
-        """
-        return "[Patch applied]"
-
-    def flag_found(content: str) -> str:
-        """Submit a discovered flag for verification.
-
-        Args:
-            content: The flag string you discovered (e.g. ``FLAG{example}``).
-
-        Returns:
-            Verification result.
-        """
-        return f"Flag submitted: {content}"
-
-    def web_search(query: str) -> str:
-        """Search the web for information using DuckDuckGo.
-
-        Args:
-            query: The search query string.
-
-        Returns:
-            Search results with titles, snippets, and URLs.
-        """
-        return f"[Search] {query}\n[results returned]"
-
-    return [
-        shell_command,
-        exec_command,
-        python_code,
-        read_file,
-        grep,
-        file_search,
-        apply_patch,
-        flag_found,
-        web_search,
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -391,13 +246,14 @@ def run_gepa(
     budget: str = "medium",
     val_data_path: Optional[str] = None,
     max_samples: Optional[int] = None,
-    env_url: Optional[str] = None,
 ) -> str:
     """Run GEPA prompt optimization.
 
     Evolves the CTF agent's system prompt by reflecting on execution
     traces. Uses DSPy ReAct with BoxPwnr tool schemas and the
     CTFReward metric for scoring.
+
+    Tools execute via ToolExecutor (direct subprocess, no HTTP server).
 
     Args:
         model_id: LLM model identifier for ``dspy.LM``
@@ -412,9 +268,6 @@ def run_gepa(
         budget: GEPA budget preset (``light`` / ``medium`` / ``heavy``).
         val_data_path: Optional separate validation data path.
         max_samples: Maximum number of training examples to load.
-        env_url: OpenEnv server URL for online mode. If not set,
-            falls back to ``OPEN_CTF_ENV_URL`` env var, then offline
-            mode with stub tools.
 
     Returns:
         Path to saved optimized prompt file.
@@ -457,31 +310,25 @@ def run_gepa(
         logger.info("Loaded %d validation examples", len(valset))
 
     # --- Build CTF agent with tools ----------------------------------------
-    # Determine online vs offline mode
-    env = env_url or os.environ.get("OPEN_CTF_ENV_URL")
-    if env:
-        from open_ctf.training.tools import get_all_tools, init_env
-        init_env(env)
-        tools = get_all_tools()
-        logger.info("Online mode: tools connected to %s", env)
-    else:
-        tools = _make_stub_tools()
-        logger.info("Offline mode: using stub tools (structural scoring only)")
+    from open_ctf.training.tools import get_all_tools, init_env
+    init_env()
+    tools = get_all_tools()
+    logger.info("Tools initialized (direct execution via ToolExecutor)")
 
     seed = gepa_cfg.get("seed_prompt", SEED_PROMPT)
+
+    class CTFAgentSignature(dspy.Signature):
+        """Placeholder instructions (replaced by seed prompt below)."""
+
+        challenge: str = dspy.InputField(
+            desc="CTF challenge description and target information",
+        )
+        answer: str = dspy.OutputField(
+            desc="The captured flag or final answer",
+        )
+
     agent = dspy.ReAct(
-        signature=dspy.Signature(
-            {
-                "challenge": dspy.InputField(
-                    desc="CTF challenge description and target information",
-                ),
-            },
-            seed,
-        ).append(
-            "answer",
-            dspy.OutputField(desc="The captured flag or final answer"),
-            type_=str,
-        ),
+        signature=CTFAgentSignature.with_instructions(seed),
         tools=tools,
         max_iters=gepa_cfg.get("max_iters", 20),
     )

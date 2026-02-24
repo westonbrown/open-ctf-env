@@ -1,0 +1,34 @@
+{
+  "open_ctf_sft": {
+    "file_name": "sft.jsonl",
+    "formatting": "openai",
+    "columns": {
+      "messages": "messages"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "observation_tag": "tool",
+      "function_tag": "function_call",
+      "system_tag": "system"
+    }
+  },
+  "open_ctf_grpo": {
+    "file_name": "grpo_cybench40.jsonl",
+    "formatting": "openai",
+    "columns": {
+      "messages": "messages"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "observation_tag": "tool",
+      "function_tag": "function_call",
+      "system_tag": "system"
+    }
+  }
+}

@@ -1,0 +1,522 @@
+"""Smoke tests for SkyRL GRPO orchestrator.
+
+Validates:
+- _convert_grpo_data correctly converts GRPO JSONL to SkyRL format
+- _build_skyrl_config produces valid SkyRL config dict
+- Config has correct nesting (data.train_data, trainer.policy.model.path, etc.)
+"""
+
+import json
+import os
+import pytest
+from pathlib import Path
+
+from open_ctf.training.grpo import (
+    _convert_grpo_data,
+    _build_skyrl_config,
+)
+
+
+# ---------------------------------------------------------------------------
+# Sample GRPO data
+# ---------------------------------------------------------------------------
+
+
+def _write_grpo_jsonl(path, samples=None):
+    """Write sample GRPO JSONL data."""
+    if samples is None:
+        samples = [
+            {
+                "messages": [
+                    {"role": "system", "content": "You are a CTF agent."},
+                    {"role": "user", "content": "Scan 10.0.0.1 for vulnerabilities."},
+                    {"role": "assistant", "content": "Running nmap..."},
+                    {"role": "tool", "name": "shell_command", "content": "80/tcp open http"},
+                ],
+                "ground_truth_flag": "FLAG{test123}",
+                "metadata": {
+                    "optimal_steps": 5,
+                    "challenge_id": "XBEN-001",
+                    "task_type": "ctf",
+                },
+            },
+            {
+                "messages": [
+                    {"role": "system", "content": "You are a CTF agent."},
+                    {"role": "user", "content": "Find the flag on the web server."},
+                    {"role": "assistant", "content": "Let me check."},
+                ],
+                "ground_truth_flag": "FLAG{web_flag}",
+                "metadata": {
+                    "optimal_steps": 3,
+                    "challenge_id": "XBEN-002",
+                    "task_type": "ctf",
+                },
+            },
+        ]
+    import jsonlines
+    with jsonlines.open(str(path), "w") as w:
+        for s in samples:
+            w.write(s)
+
+
+# ---------------------------------------------------------------------------
+# _convert_grpo_data
+# ---------------------------------------------------------------------------
+
+
+class TestConvertGRPOData:
+    def test_output_file_created(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(str(src), output_dir)
+        assert os.path.exists(result)
+        assert result.endswith("skyrl_grpo_data.jsonl")
+
+    def test_correct_number_of_samples(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(str(src), output_dir)
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+        assert len(rows) == 2
+
+    def test_prompt_extracted(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(str(src), output_dir)
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+
+        # Prompt should contain system + user messages before first assistant
+        assert isinstance(row["prompt"], list)
+        roles = [m["role"] for m in row["prompt"]]
+        assert "system" in roles
+        assert "user" in roles
+        assert "assistant" not in roles
+
+    def test_prompt_ends_with_user(self, tmp_path):
+        """SkyRL requires prompt to end with a user message."""
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(str(src), output_dir)
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            for row in reader:
+                assert row["prompt"][-1]["role"] == "user"
+
+    def test_env_class_set(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(str(src), output_dir)
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            for row in reader:
+                assert row["env_class"] == "openctf"
+
+    def test_ground_truth_flag_preserved(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(str(src), output_dir)
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["ground_truth_flag"] == "FLAG{test123}"
+
+    def test_metadata_flattened(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(str(src), output_dir)
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["optimal_steps"] == 5
+        assert row["challenge_id"] == "XBEN-001"
+        assert row["task_type"] == "ctf"
+
+    def test_missing_user_message_gets_default(self, tmp_path):
+        """If messages only have system + assistant, a default user msg is added."""
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "assistant", "content": "Doing stuff."},
+                ],
+                "ground_truth_flag": "FLAG{x}",
+                "metadata": {},
+            })
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(str(src), output_dir)
+        import jsonlines as jl2
+        with jl2.open(result) as reader:
+            row = next(iter(reader))
+        # Prompt should end with user
+        assert row["prompt"][-1]["role"] == "user"
+        assert "flag" in row["prompt"][-1]["content"].lower()
+
+
+# ---------------------------------------------------------------------------
+# _build_skyrl_config
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSkyrlConfig:
+    @pytest.fixture
+    def config(self):
+        return {
+            "model": {"max_seq_length": 8192},
+            "lora": {
+                "r": 64,
+                "alpha": 128,
+                "dropout": 0.0,
+                "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            },
+            "grpo": {
+                "learning_rate": 5e-6,
+                "num_generations": 4,
+                "max_completion_length": 4096,
+                "max_tool_calling_iterations": 15,
+                "batch_size": 1,
+                "epochs": 1,
+                "beta": 0.001,
+            },
+            "output": {"save_steps": 50, "report_to": "none"},
+        }
+
+    def test_returns_dict(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        assert isinstance(result, dict)
+
+    def test_data_train_data_nesting(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        assert "data" in result
+        assert "train_data" in result["data"]
+        assert result["data"]["train_data"] == ["/data.jsonl"]
+
+    def test_trainer_policy_model_path(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        assert result["trainer"]["policy"]["model"]["path"] == "/path/to/model"
+
+    def test_trainer_policy_optimizer_lr(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        assert result["trainer"]["policy"]["optimizer_config"]["lr"] == 5e-6
+
+    def test_trainer_algorithm_default(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        algo = result["trainer"]["algorithm"]
+        assert algo["advantage_estimator"] == "rloo_n"
+
+    def test_generator_sampling_params(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        sp = result["generator"]["sampling_params"]
+        assert sp["max_generate_length"] == 4096  # From fixture's max_completion_length
+        assert sp["temperature"] == 1.0
+        assert sp["top_p"] == 0.95
+
+    def test_generator_n_samples(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        # n_samples_per_prompt comes from config's num_generations (4 in fixture)
+        assert result["generator"]["n_samples_per_prompt"] == 4
+
+    def test_generator_max_turns(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        assert result["generator"]["max_turns"] == 15
+
+    def test_environment_env_class(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        assert result["environment"]["env_class"] == "openctf"
+
+    def test_lora_config_nested(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        lora = result["trainer"]["policy"]["model"]["lora"]
+        assert lora["rank"] == 64
+        assert lora["alpha"] == 128
+        assert lora["dropout"] == 0.0
+
+    def test_kl_loss_enabled_when_beta_positive(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        algo = result["trainer"]["algorithm"]
+        assert algo["use_kl_loss"] is True
+        assert algo["kl_loss_coef"] == 0.001
+
+    def test_missing_grpo_section_uses_defaults(self):
+        """Config without grpo section should still produce valid output."""
+        config = {
+            "model": {"max_seq_length": 4096},
+            "lora": {"r": 32, "alpha": 64, "dropout": 0.0, "target_modules": ["q_proj"]},
+            "output": {"save_steps": 100},
+        }
+        result = _build_skyrl_config("/model", "/out", config, "/data.jsonl")
+        assert isinstance(result, dict)
+        assert "trainer" in result
+        assert "generator" in result
+        # Should have sensible defaults for GRPO params
+        assert result["generator"]["n_samples_per_prompt"] >= 1
+
+    def test_environment_env_class_always_openctf(self):
+        """env_class should always be 'openctf' regardless of config."""
+        config = {
+            "model": {"max_seq_length": 4096},
+            "lora": {"r": 32, "alpha": 64, "dropout": 0.0, "target_modules": ["q_proj"]},
+            "grpo": {"batch_size": 1, "epochs": 1, "num_generations": 2},
+            "output": {"save_steps": 50},
+        }
+        result = _build_skyrl_config("/model", "/out", config, "/data.jsonl")
+        assert result["environment"]["env_class"] == "openctf"
+
+
+class TestTargetExtraction:
+    def test_target_from_user_message(self, tmp_path):
+        """Target URL should be extracted from user message content."""
+        src = tmp_path / "with_target.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "You are a CTF agent."},
+                    {"role": "user", "content": "Solve the challenge at http://localhost:32801"},
+                    {"role": "assistant", "content": "Scanning..."},
+                ],
+                "ground_truth_flag": "FLAG{target_test}",
+                "metadata": {"challenge_id": "eval-me", "task_type": "ctf"},
+            })
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] == "http://localhost:32801"
+
+    def test_no_target_produces_none(self, tmp_path):
+        """File-based challenges without URLs should have target=None."""
+        src = tmp_path / "no_target.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "You are a CTF agent."},
+                    {"role": "user", "content": "Decrypt the ciphertext."},
+                ],
+                "ground_truth_flag": "FLAG{crypto}",
+                "metadata": {"challenge_id": "Dynastic", "task_type": "ctf"},
+            })
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] is None
+
+    def test_challenge_id_fallback_to_challenge(self, tmp_path):
+        """challenge_id should fall back to metadata.challenge if challenge_id missing."""
+        src = tmp_path / "fallback.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Solve it."},
+                ],
+                "ground_truth_flag": "FLAG{fb}",
+                "metadata": {"challenge": "eval-me", "task_type": "ctf"},
+            })
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["challenge_id"] == "eval-me"
+
+    def test_target_from_metadata_fallback(self, tmp_path):
+        """If no URL in user message, target should come from metadata."""
+        src = tmp_path / "meta_target.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Solve the challenge."},
+                ],
+                "ground_truth_flag": "FLAG{mt}",
+                "metadata": {"target": "http://localhost:9999", "task_type": "ctf"},
+            })
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] == "http://localhost:9999"
+
+
+class TestConvertGRPODataEdgeCases:
+    def test_data_without_ground_truth_flag(self, tmp_path):
+        """Samples without ground_truth_flag should still convert."""
+        src = tmp_path / "no_flag.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Scan the target."},
+                ],
+                "metadata": {"optimal_steps": 3},
+            })
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        # Should have a prompt and env_class even without flag
+        assert "prompt" in row
+        assert row["env_class"] == "openctf"
+
+    def test_data_with_empty_metadata(self, tmp_path):
+        """Samples with empty metadata dict should convert."""
+        src = tmp_path / "empty_meta.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Find the flag."},
+                ],
+                "ground_truth_flag": "FLAG{empty_meta}",
+                "metadata": {},
+            })
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["ground_truth_flag"] == "FLAG{empty_meta}"
+
+
+class TestRegistryIntegration:
+    """Test _convert_grpo_data with ChallengeRegistry integration."""
+
+    def _make_registry(self, tmp_path):
+        """Create a simple test registry."""
+        import yaml
+        registry_data = {
+            "challenges": [
+                {
+                    "id": "eval-me",
+                    "category": "misc",
+                    "difficulty": "very_easy",
+                    "infra_type": "docker",
+                    "port": 32805,
+                },
+                {
+                    "id": "Dynastic",
+                    "category": "crypto",
+                    "difficulty": "very_easy",
+                    "infra_type": "static",
+                },
+            ]
+        }
+        path = tmp_path / "test_registry.yaml"
+        with open(path, "w") as f:
+            yaml.dump(registry_data, f)
+        from open_ctf.challenges.registry import ChallengeRegistry
+        return ChallengeRegistry(str(path))
+
+    def test_registry_provides_target_when_missing(self, tmp_path):
+        """Registry should provide target URL when not in user message."""
+        registry = self._make_registry(tmp_path)
+
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Solve the eval-me challenge."},
+                ],
+                "ground_truth_flag": "FLAG{eval}",
+                "metadata": {"challenge_id": "eval-me"},
+            })
+
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir, registry=registry)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] == "http://localhost:32805"
+
+    def test_url_in_message_takes_precedence_over_registry(self, tmp_path):
+        """If URL is in user message, it should override registry."""
+        registry = self._make_registry(tmp_path)
+
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Solve at http://localhost:9999"},
+                ],
+                "ground_truth_flag": "FLAG{override}",
+                "metadata": {"challenge_id": "eval-me"},
+            })
+
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir, registry=registry)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] == "http://localhost:9999"  # Message URL wins
+
+    def test_static_challenge_gets_none_from_registry(self, tmp_path):
+        """Static challenges should get target=None even with registry."""
+        registry = self._make_registry(tmp_path)
+
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Solve the crypto puzzle."},
+                ],
+                "ground_truth_flag": "FLAG{dyn}",
+                "metadata": {"challenge_id": "Dynastic"},
+            })
+
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir, registry=registry)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] is None  # Static = no URL
+
+    def test_unknown_challenge_in_registry_returns_none(self, tmp_path):
+        """Challenge not in registry should not crash, target stays None."""
+        registry = self._make_registry(tmp_path)
+
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Solve it."},
+                ],
+                "ground_truth_flag": "FLAG{unk}",
+                "metadata": {"challenge_id": "unknown-challenge"},
+            })
+
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(str(src), output_dir, registry=registry)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] is None

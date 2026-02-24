@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional
 class ModelFormatter(ABC):
     """Base class for model-specific message formatters.
 
-    Each model family (Qwen3, GLM-4, Devstral/Mistral) has its own chat
-    template and tool-calling convention.  Concrete subclasses translate
+    Each model family (Qwen3/Nanbeige, GLM-4, Devstral/Mistral) has its
+    own chat template and tool-calling convention.  Concrete subclasses translate
     the canonical OpenAI-style message list into the model-native text
     representation used during training and inference.
 
@@ -42,7 +42,8 @@ class ModelFormatter(ABC):
         """
         model_lower = model_id.lower()
 
-        if any(k in model_lower for k in ("qwen", "openthinker")):
+        # Nanbeige uses ChatML + Hermes tool calling (same as Qwen3).
+        if any(k in model_lower for k in ("qwen", "openthinker", "nanbeige")):
             from .qwen3 import Qwen3Formatter
             return Qwen3Formatter(tokenizer)
 
@@ -54,10 +55,9 @@ class ModelFormatter(ABC):
             from .devstral import DevstralFormatter
             return DevstralFormatter(tokenizer)
 
-        raise ValueError(
-            f"Unknown model family for '{model_id}'. "
-            "Supported families: qwen/openthinker, glm, devstral/mistral."
-        )
+        # Default: try ChatML/Hermes format (works for most Llama-family models).
+        from .qwen3 import Qwen3Formatter
+        return Qwen3Formatter(tokenizer)
 
     # ── Abstract interface ────────────────────────────────────────────
 

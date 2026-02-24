@@ -176,6 +176,9 @@ def main() -> None:
             _ok(f"{label}: Syntax OK ({fpath.stat().st_size} bytes)")
         except py_compile.PyCompileError as e:
             _fail(f"{label}: Syntax error -> {e}", errors)
+        except PermissionError:
+            # __pycache__ may be owned by root from Docker runs
+            _ok(f"{label}: Exists ({fpath.stat().st_size} bytes, pyc write skipped)")
 
     config_file = SRC_DIR / "open_ctf" / "configs" / "training.yaml"
     if config_file.exists():
@@ -297,6 +300,9 @@ def main() -> None:
             _ok(f"{label}: Syntax OK ({fpath.stat().st_size} bytes)")
         except py_compile.PyCompileError as e:
             _fail(f"{label}: Syntax error -> {e}", errors)
+        except PermissionError:
+            # __pycache__ may be owned by root from Docker runs
+            _ok(f"{label}: Exists ({fpath.stat().st_size} bytes, pyc write skipped)")
 
     challenges_file = SRC_DIR / "open_ctf" / "configs" / "challenges.yaml"
     if challenges_file.exists():
@@ -323,6 +329,8 @@ def main() -> None:
             _ok(f"agent/runner.py: Syntax OK ({runner_file.stat().st_size} bytes)")
         except py_compile.PyCompileError as e:
             _fail(f"agent/runner.py: Syntax error -> {e}", errors)
+        except PermissionError:
+            _ok(f"agent/runner.py: Exists ({runner_file.stat().st_size} bytes, pyc write skipped)")
 
         try:
             from open_ctf.agent import AgentRunner

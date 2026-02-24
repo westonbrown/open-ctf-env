@@ -1,0 +1,53 @@
+# LlamaFactory SFT config for GLM-4.7-Flash (30B MoE, 3.6B active)
+# Production MoE model — requires BF16 LoRA (4-bit breaks MoE routing).
+#
+# Usage:
+#   llamafactory-cli train configs/llamafactory/glm47_flash.yaml
+
+### Model
+model_name_or_path: THUDM/GLM-4.7-Flash
+trust_remote_code: true
+
+### Training method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.0
+# Attention + shared expert only (routed experts excluded per MoE best practice)
+lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+
+### Dataset
+dataset: open_ctf_sft
+dataset_dir: data
+template: glm4_7
+tool_format: glm4_moe
+cutoff_len: 32768
+preprocessing_num_workers: 4
+packing: true
+
+### Output
+output_dir: outputs/sft
+logging_steps: 1
+save_steps: 50
+save_only_model: true
+overwrite_output_dir: true
+report_to: none
+
+### Hyperparameters
+# batch_size=1 for MoE NaN gradient fix (padding tokens through MoE router)
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 2.0e-4
+num_train_epochs: 5
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+bf16: true
+optim: adamw_8bit
+seed: 42
+gradient_checkpointing: true
+
+### No quantization (BF16 LoRA — 4-bit breaks MoE routing)
+# quantization_bit: null

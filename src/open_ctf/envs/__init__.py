@@ -1,19 +1,11 @@
-"""Open CTF Gymnasium and OpenEnv environments."""
+"""Open CTF environments."""
+from .tool_executor import ToolExecutor
 
-# OpenEnv types (always available)
-from .openenv import AgentEnv, AgentEnvironment, ToolAction, ToolObservation, ToolState
+__all__ = ["ToolExecutor"]
 
-__all__ = [
-    "AgentEnv",
-    "AgentEnvironment",
-    "ToolAction",
-    "ToolObservation",
-    "ToolState",
-]
-
-# Gymnasium environment (optional, only if gymnasium is installed)
+# SkyRL env (optional)
 try:
-    from .gym_env import OpenCTFEnv
-    __all__.append("OpenCTFEnv")
+    from .skyrl.openctf_env import OpenCTFTextEnv, parse_tool_calls
+    __all__.extend(["OpenCTFTextEnv", "parse_tool_calls"])
 except ImportError:
     pass

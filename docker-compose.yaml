@@ -1,21 +1,18 @@
 # Open CTF Environment - Docker Compose
 #
+# Single Dockerfile with multi-stage build targets:
+#   docker/Dockerfile → targets: base, sft, grpo
+#
 # Usage:
-#   docker compose run --rm sft
-#   docker compose run --rm grpo
-#   docker compose run --rm merge
-#   docker compose run --rm validate
+#   docker compose run --rm sft        # Stage 1: SFT
+#   docker compose run --rm merge      # Merge LoRA adapter
+#   docker compose run --rm grpo       # Stage 2: GRPO
+#   docker compose run --rm validate   # Validate pipeline
+#   docker compose run --rm export     # Export to GGUF
 #
 # Override model/data paths via environment or .env file.
 
-x-common: &common
-  build:
-    context: .
-    dockerfile: Dockerfile
-  volumes:
-    - ./data:/workspace/data
-    - ./outputs:/workspace/outputs
-    - ./src/open_ctf/configs:/workspace/configs
+x-gpu: &gpu
   deploy:
     resources:
       reservations:
@@ -25,57 +22,79 @@ x-common: &common
             capabilities: [gpu]
   shm_size: "64g"
 
+x-volumes: &volumes
+  volumes:
+    - ./data:/workspace/data
+    - ./outputs:/workspace/outputs
+    - ./configs:/workspace/configs
+
 services:
+  # Stage 1: SFT via LlamaFactory
   sft:
-    <<: *common
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: sft
+    <<: [*gpu, *volumes]
     command: >
       open-ctf-train sft
-        --model ${MODEL:-unsloth/GLM-4.7-Flash}
+        --model ${MODEL:-Nanbeige/Nanbeige4.1-3B}
         --data /workspace/data/${SFT_DATA:-sft.jsonl}
         --output /workspace/outputs/sft
-        --config /workspace/configs/training.yaml
     environment:
       - WANDB_API_KEY=${WANDB_API_KEY:-}
       - HF_TOKEN=${HF_TOKEN:-}
 
-  grpo:
-    <<: *common
-    command: >
-      open-ctf-train grpo
-        --model ${GRPO_MODEL:-/workspace/outputs/sft/final}
-        --data /workspace/data/${GRPO_DATA:-grpo.jsonl}
-        --output /workspace/outputs/grpo
-        --config /workspace/configs/training.yaml
-    environment:
-      - OPEN_CTF_NO_UNSLOTH=1
-      - WANDB_API_KEY=${WANDB_API_KEY:-}
-      - HF_TOKEN=${HF_TOKEN:-}
-
+  # Merge LoRA adapter into base (uses SFT image)
   merge:
-    <<: *common
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: sft
+    <<: [*gpu, *volumes]
     command: >
       open-ctf-train merge
-        --adapter ${ADAPTER:-/workspace/outputs/grpo/final}
-        --base-model ${MODEL:-unsloth/GLM-4.7-Flash}
-        --output /workspace/outputs/merged
-        --config /workspace/configs/training.yaml
+        --adapter ${ADAPTER:-/workspace/outputs/sft}
+        --base-model ${MODEL:-Nanbeige/Nanbeige4.1-3B}
+        --output /workspace/outputs/sft-merged
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
 
+  # Stage 2: GRPO via SkyRL (requires merged model)
+  grpo:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: grpo
+    <<: [*gpu, *volumes]
+    command: >
+      open-ctf-train grpo
+        --model ${GRPO_MODEL:-/workspace/outputs/sft-merged}
+        --data /workspace/data/${GRPO_DATA:-grpo_offline_683.jsonl}
+        --output /workspace/outputs/grpo
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+
+  # Validation (uses base — no heavy ML deps needed)
   validate:
-    <<: *common
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: base
+    <<: *volumes
     command: open-ctf-validate
 
+  # Export to GGUF (uses SFT image for merge + export tools)
   export:
-    <<: *common
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: sft
+    <<: [*gpu, *volumes]
     command: >
       open-ctf-export
-        --adapter ${ADAPTER:-/workspace/outputs/sft/final}
-        --base-model ${MODEL:-unsloth/GLM-4.7-Flash}
+        --adapter ${ADAPTER:-/workspace/outputs/sft}
+        --base-model ${MODEL:-Nanbeige/Nanbeige4.1-3B}
         --output /workspace/outputs/model.gguf
         --quant ${QUANT:-Q4_K_M}
-    volumes:
-      - ./data:/workspace/data
-      - ./outputs:/workspace/outputs
-      - ./src/open_ctf/configs:/workspace/configs
-      - ./models:/workspace/models

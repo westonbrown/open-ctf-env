@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Open CTF training CLI.
 
+3-stage pipeline:
+  Stage 1 (SFT):  LlamaFactory — battle-tested tool format support, packing, DeepSpeed
+  Stage 2 (GRPO): SkyRL — fully async Ray-based trainer, vLLM in separate process
+  Stage 3 (GEPA): DSPy — prompt evolution, no weight updates
+
 Usage:
-    # Stage 1: SFT
+    # Stage 1: SFT via LlamaFactory
     open-ctf-train sft \\
-        --model unsloth/GLM-4.7-Flash \\
+        --model Nanbeige/Nanbeige4.1-3B \\
         --data data/sft.jsonl \\
         --output outputs/sft
 
-    # Stage 2: GRPO (requires SFT model)
+    # Stage 2: GRPO via SkyRL (requires SFT merged model)
     open-ctf-train grpo \\
-        --model outputs/sft/final \\
+        --model outputs/sft-merged \\
         --data data/grpo.jsonl \\
         --output outputs/grpo
 
@@ -24,26 +29,13 @@ Usage:
     # Merge LoRA adapter into base weights
     open-ctf-train merge \\
         --adapter outputs/sft/final \\
-        --base-model unsloth/GLM-4.7-Flash \\
+        --base-model Nanbeige/Nanbeige4.1-3B \\
         --output outputs/merged
 """
 
 import argparse
 import logging
-import os
 from pathlib import Path
-
-# Tell Unsloth not to start a vLLM server on import (we manage vLLM ourselves).
-os.environ.setdefault("UNSLOTH_VLLM_STANDBY", "1")
-
-# Unsloth MUST be imported before trl/transformers/peft for patching to work.
-# Skip when OPEN_CTF_NO_UNSLOTH=1 to avoid Unsloth's TRL wrapping which causes
-# pickle errors with transformers 5.0's ConfigModuleInstance on GLM-4.7-Flash.
-if os.environ.get("OPEN_CTF_NO_UNSLOTH", "").lower() not in ("1", "true"):
-    try:
-        import unsloth  # noqa: F401
-    except ImportError:
-        pass
 
 import yaml
 
@@ -72,11 +64,11 @@ def load_config(path: Path) -> dict:
 
 
 def cmd_sft(args: argparse.Namespace) -> None:
-    """Run SFT training."""
+    """Run SFT training via LlamaFactory."""
     from open_ctf.training.sft import train_sft
 
     config = load_config(args.config)
-    model_id = args.model or config.get("model", {}).get("name", "unsloth/GLM-4.7-Flash")
+    model_id = args.model or config.get("model", {}).get("name", "Nanbeige/Nanbeige4.1-3B")
 
     train_sft(
         model_id=model_id,
@@ -89,28 +81,18 @@ def cmd_sft(args: argparse.Namespace) -> None:
 
 
 def cmd_grpo(args: argparse.Namespace) -> None:
-    """Run GRPO training."""
-    from open_ctf.rewards import CTFReward
+    """Run GRPO training via SkyRL."""
     from open_ctf.training.grpo import train_grpo
 
     config = load_config(args.config)
-    reward_cfg = config.get("reward", {})
-    reward_kwargs = {}
-    for key in (
-        "flag_weight", "efficiency_weight", "progression_weight",
-        "format_weight", "exploration_weight", "uniqueness_weight",
-    ):
-        if key in reward_cfg:
-            reward_kwargs[key] = float(reward_cfg[key])
-    reward_fn = CTFReward(**reward_kwargs)
 
     train_grpo(
         model_path=args.model,
         data_path=args.data,
         output_dir=args.output,
         config=config,
-        reward_fn=reward_fn,
         resume_from=args.resume,
+        challenge_registry=getattr(args, 'challenge_registry', None),
     )
 
 
@@ -129,67 +111,38 @@ def cmd_gepa(args: argparse.Namespace) -> None:
         budget=args.budget,
         val_data_path=args.val_data,
         max_samples=args.max_samples,
-        env_url=args.env_url,
     )
 
 
 def cmd_merge(args: argparse.Namespace) -> None:
-    """Merge LoRA adapter into base model weights.
-
-    Tries Unsloth for merging (faster, optimized). Falls back to standard
-    PEFT merge_and_unload() when Unsloth is unavailable or OPEN_CTF_NO_UNSLOTH=1.
-    """
-    import os
+    """Merge LoRA adapter into base model weights via PEFT merge_and_unload()."""
     import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
 
     logger.info("Merging adapter from %s", args.adapter)
 
     config = load_config(args.config)
-    max_seq_length = config.get("model", {}).get("max_seq_length", 8192)
-
-    use_unsloth = os.environ.get("OPEN_CTF_NO_UNSLOTH", "").lower() not in ("1", "true")
-    merged = False
-
-    if use_unsloth:
-        try:
-            from unsloth import FastLanguageModel
-
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=args.adapter,
-                max_seq_length=max_seq_length,
-                dtype=torch.bfloat16,
-            )
-            model.save_pretrained_merged(args.output, tokenizer, save_method="merged_16bit")
-            merged = True
-            logger.info("Merged via Unsloth → %s", args.output)
-        except (ImportError, RuntimeError, OSError) as e:
-            logger.warning("Unsloth merge failed (%s), falling back to PEFT", e)
-
-    if not merged:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import PeftModel
-
-        logger.info("Merging via PEFT merge_and_unload()")
-        base_model_id = args.base_model or config.get("model", {}).get("name", "")
-        if not base_model_id:
-            raise ValueError(
-                "HF merge requires --base-model or model.name in config "
-                "(needed to load the base model before applying adapter)"
-            )
-
-        tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_id,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            device_map="auto",
+    base_model_id = args.base_model or config.get("model", {}).get("name", "")
+    if not base_model_id:
+        raise ValueError(
+            "Merge requires --base-model or model.name in config "
+            "(needed to load the base model before applying adapter)"
         )
-        model = PeftModel.from_pretrained(base_model, args.adapter)
-        model = model.merge_and_unload()
 
-        model.save_pretrained(args.output, safe_serialization=True)
-        tokenizer.save_pretrained(args.output)
-        logger.info("Merged via PEFT → %s", args.output)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_id,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+    )
+    model = PeftModel.from_pretrained(base_model, args.adapter)
+    model = model.merge_and_unload()
+
+    model.save_pretrained(args.output, safe_serialization=True)
+    tokenizer.save_pretrained(args.output)
+    logger.info("Merged via PEFT -> %s", args.output)
 
 
 # -----------------------------------------------------------------------
@@ -199,7 +152,7 @@ def cmd_merge(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Open CTF Training Pipeline",
+        description="Open CTF Training Pipeline (LlamaFactory SFT + SkyRL GRPO + GEPA)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -207,12 +160,12 @@ def main() -> None:
         "--config",
         type=Path,
         default=DEFAULT_CONFIG,
-        help="Path to training YAML config (default: src/open_ctf/configs/training.yaml)",
+        help=f"Path to training YAML config (default: {DEFAULT_CONFIG})",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # -- sft --------------------------------------------------------------
-    sft_parser = subparsers.add_parser("sft", help="Run supervised fine-tuning")
+    # -- sft (LlamaFactory) -----------------------------------------------
+    sft_parser = subparsers.add_parser("sft", help="Run SFT via LlamaFactory")
     sft_parser.add_argument("--model", default=None, help="HF model id (overrides config)")
     sft_parser.add_argument("--data", required=True, help="Path to SFT JSONL data")
     sft_parser.add_argument("--val-data", default=None, help="Path to validation JSONL")
@@ -220,15 +173,19 @@ def main() -> None:
     sft_parser.add_argument("--resume", default=None, help="Resume from checkpoint")
     sft_parser.set_defaults(func=cmd_sft)
 
-    # -- grpo -------------------------------------------------------------
-    grpo_parser = subparsers.add_parser("grpo", help="Run GRPO training")
-    grpo_parser.add_argument("--model", required=True, help="Path to SFT model")
+    # -- grpo (SkyRL) -----------------------------------------------------
+    grpo_parser = subparsers.add_parser("grpo", help="Run GRPO via SkyRL")
+    grpo_parser.add_argument("--model", required=True, help="Path to SFT merged model")
     grpo_parser.add_argument("--data", required=True, help="Path to GRPO JSONL data")
     grpo_parser.add_argument("--output", required=True, help="Output directory")
     grpo_parser.add_argument("--resume", default=None, help="Resume from checkpoint")
+    grpo_parser.add_argument(
+        "--challenge-registry", default=None,
+        help="Path to challenge registry YAML for target URL resolution",
+    )
     grpo_parser.set_defaults(func=cmd_grpo)
 
-    # -- gepa -------------------------------------------------------------
+    # -- gepa (unchanged) -------------------------------------------------
     gepa_parser = subparsers.add_parser(
         "gepa",
         help="Optimize system prompt with GEPA (Stage 3, no weight updates)",
@@ -246,13 +203,9 @@ def main() -> None:
         help="GEPA budget preset (default: medium)",
     )
     gepa_parser.add_argument("--max-samples", type=int, default=None, help="Max training examples")
-    gepa_parser.add_argument(
-        "--env-url", default=None,
-        help="OpenEnv server URL for online mode (default: offline with stub tools)",
-    )
     gepa_parser.set_defaults(func=cmd_gepa)
 
-    # -- merge ------------------------------------------------------------
+    # -- merge (unchanged) ------------------------------------------------
     merge_parser = subparsers.add_parser("merge", help="Merge LoRA adapter into base")
     merge_parser.add_argument("--adapter", required=True, help="Path to LoRA adapter dir")
     merge_parser.add_argument("--base-model", default=None, help="Base model id (for HF merge fallback)")

@@ -144,6 +144,9 @@ def _extract_reasoning_and_text(content: Any) -> tuple[str, str]:
     text_parts: list[str] = []
 
     for item in content:
+        if isinstance(item, str):
+            text_parts.append(item)
+            continue
         if not isinstance(item, dict):
             continue
         item_type = item.get("type", "")
@@ -468,6 +471,11 @@ def _extract_metadata(
         meta["challenge"] = parts[idx - 1] if idx >= 1 else "unknown"
         meta["platform"] = parts[idx - 2] if idx >= 2 else "unknown"
     else:
+        logger.debug(
+            "Trace path does not contain 'traces' directory, "
+            "defaulting challenge/platform to 'unknown': %s",
+            trace_path,
+        )
         meta["challenge"] = "unknown"
         meta["platform"] = "unknown"
 
@@ -592,8 +600,13 @@ class BoxPwnrConverter:
         # Extract flag
         ground_truth_flag = _extract_flag(stats, raw_messages)
 
-        # Count tool steps for optimal_steps
-        optimal_steps = _count_tool_steps(messages)
+        # Count tool steps for optimal_steps.
+        # Only set for successful traces -- failure traces get None because
+        # their step count is misleading (the splitter overwrites with the
+        # min across successful siblings when available, and the reward
+        # function treats None as a weak prior of 0.3).
+        is_success = metadata.get("success", False)
+        optimal_steps = _count_tool_steps(messages) if is_success else None
 
         return {
             "messages": messages,
