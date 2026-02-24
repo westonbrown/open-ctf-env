@@ -134,17 +134,59 @@ def _build_skyrl_config(
     our training-specific values. This ensures all required keys exist
     regardless of SkyRL version.
     """
-    from dataclasses import asdict
+    # Load SkyRL's default config as a base. SkyRL 0.3.1 uses a Hydra
+    # YAML config (ppo_base_config.yaml) rather than a Python dataclass.
+    skyrl_defaults = {}
     try:
+        from dataclasses import asdict
         from skyrl_train.config.config import SkyRLConfig
         skyrl_defaults = asdict(SkyRLConfig())
-    except ImportError:
-        skyrl_defaults = {}
+    except (ImportError, ModuleNotFoundError):
+        pass
+    if not skyrl_defaults:
+        try:
+            import importlib.resources as pkg_resources
+            from omegaconf import OmegaConf as _OC
+            # Load the YAML base config from skyrl_train package
+            cfg_dir = Path(
+                pkg_resources.files("skyrl_train") / "config"
+            )
+            base_yaml = cfg_dir / "ppo_base_config.yaml"
+            if base_yaml.exists():
+                raw = _OC.load(base_yaml)
+                skyrl_defaults = _OC.to_container(raw, resolve=False)
+                logger.info("Loaded SkyRL base config from %s", base_yaml)
+        except Exception as exc:
+            logger.warning("Could not load SkyRL base config: %s", exc)
 
     model_cfg = config.get("model", {})
     lora_cfg = config.get("lora", {})
     grpo_cfg = config.get("grpo", {})
     output_cfg = config.get("output", {})
+
+    # Detect transformer layer class for FSDP wrapping.
+    # model._no_split_modules returns a set on some architectures (e.g. Llama),
+    # which triggers a set-indexing bug in SkyRL's apply_fsdp2.
+    # We auto-detect and pass the class name as a string to avoid this.
+    _ARCH_TO_LAYER_CLS = {
+        "LlamaForCausalLM": "LlamaDecoderLayer",
+        "Qwen2ForCausalLM": "Qwen2DecoderLayer",
+        "Qwen3ForCausalLM": "Qwen3DecoderLayer",
+        "MistralForCausalLM": "MistralDecoderLayer",
+        "GptOssForCausalLM": "GptOssDecoderLayer",
+    }
+    transformer_layer_cls = None
+    try:
+        from transformers import AutoConfig
+        auto_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        arch = getattr(auto_cfg, "architectures", [None])[0]
+        transformer_layer_cls = _ARCH_TO_LAYER_CLS.get(arch)
+        if not transformer_layer_cls and arch:
+            # Fallback: guess from architecture name
+            base = arch.replace("ForCausalLM", "")
+            transformer_layer_cls = f"{base}DecoderLayer"
+    except Exception:
+        pass
 
     # Reference model path for KL divergence. Defaults to the policy model
     # (standard GRPO), but can be overridden for distillation.
@@ -154,29 +196,64 @@ def _build_skyrl_config(
         # Data
         "data": {
             "train_data": [data_path],
+            "val_data": [],
         },
 
-        # Trainer
+        # Trainer — includes all fields required by SkyRL 0.3.1 validate_cfg
         "trainer": {
             "strategy": "fsdp2",
             "bf16": True,
             "gradient_checkpointing": True,
+            "gradient_checkpointing_use_reentrant": False,
             "seed": 42,
+            "sequence_parallel_backend": "ulysses",
             "epochs": grpo_cfg.get("epochs", 1),
+            "update_epochs_per_batch": 1,
             "train_batch_size": grpo_cfg.get("batch_size", 1),
             "policy_mini_batch_size": grpo_cfg.get("batch_size", 1),
+            "critic_mini_batch_size": grpo_cfg.get("batch_size", 1),
             "micro_train_batch_size_per_gpu": 1,
+            "micro_forward_batch_size_per_gpu": 1,
             "max_prompt_length": model_cfg.get("max_seq_length", 8192),
+            "use_sample_packing": grpo_cfg.get("use_sample_packing", False),  # Requires flash_attention_2 which has issues on GB10
+            "eval_batch_size": 1,
+            "eval_interval": -1,
+            "flash_attn": grpo_cfg.get("flash_attn", False),  # GB10 sm_121a: "Cannot access data pointer" with flash_attn
+            "disable_fast_tokenizer": False,
+            "update_ref_every_epoch": False,
+            "resume_mode": None,
+            "resume_path": None,
             "ckpt_path": output_dir,
+            "max_ckpts_to_keep": -1,
+            "hf_save_interval": -1,
             "ckpt_interval": output_cfg.get("save_steps", 50),
-            "log_path": os.path.join(output_dir, "logs"),
             "export_path": os.path.join(output_dir, "final"),
+            "eval_before_train": False,
             "project_name": "open-ctf",
             "run_name": "grpo",
-            "logger": output_cfg.get("report_to", "none"),
+            "logger": output_cfg.get("report_to", "console"),
+            "dump_data_batch": False,
+            "dump_eval_results": False,
+            "target_modules": None,
+            "exclude_modules": None,
+            "rope_scaling": None,
+            "rope_theta": None,
 
             "placement": {
-                "colocate_all": True,
+                # colocate_all must be False when using external vLLM server
+                "colocate_all": not bool(grpo_cfg.get("vllm_server_url")),
+                "colocate_policy_ref": True,
+                "policy_num_nodes": 1,
+                "policy_num_gpus_per_node": 1,
+                "critic_num_nodes": 1,
+                "critic_num_gpus_per_node": 1,
+                "ref_num_nodes": 1,
+                "ref_num_gpus_per_node": 1,
+            },
+
+            "fully_async": {
+                "max_staleness_steps": 4,
+                "num_parallel_generation_workers": 1,
             },
 
             "policy": {
@@ -186,22 +263,79 @@ def _build_skyrl_config(
                         "rank": lora_cfg.get("r", 64),
                         "alpha": lora_cfg.get("alpha", 128),
                         "dropout": lora_cfg.get("dropout", 0.0),
-                        "target_modules": ",".join(lora_cfg.get("target_modules", [
-                            "q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj",
-                        ])),
+                        "target_modules": "all-linear",
+                        "exclude_modules": None,
+                        "lora_sync_path": os.path.join(output_dir, "lora_sync"),
+                        "init_method": "kaiming",
                     },
+                    "config_kwargs": {},
                 },
+                "model_config_kwargs": {},
+                "fsdp_config": {
+                    "cpu_offload": False,
+                    "reshard_after_forward": True,
+                    "fsdp_size": -1,
+                    "wrap_policy": (
+                        {"transformer_layer_cls_to_wrap": [transformer_layer_cls]}
+                        if transformer_layer_cls
+                        else {}
+                    ),
+                },
+                "sequence_parallel_size": 1,
+                "use_torch_compile": False,
+                "record_memory": False,
                 "optimizer_config": {
                     "lr": grpo_cfg.get("learning_rate", 5e-6),
+                    "adam_betas": [0.9, 0.999],
                     "weight_decay": grpo_cfg.get("weight_decay", 0.0),
                     "max_grad_norm": grpo_cfg.get("max_grad_norm", 5.0),
+                    "offload_after_step": True,
+                    "num_warmup_steps": 0,
+                    "scheduler": "constant_with_warmup",
                 },
             },
 
             "ref": {
                 "model": {
                     "path": ref_model_path,
+                    "config_kwargs": {},
+                },
+                "model_config_kwargs": {},
+                "sequence_parallel_size": 1,
+                "fsdp_config": {
+                    "cpu_offload": False,
+                    "reshard_after_forward": True,
+                    "fsdp_size": -1,
+                },
+            },
+
+            "critic": {
+                "model": {
+                    "path": None,
+                    "lora": {
+                        "rank": 0,
+                        "alpha": 16,
+                        "dropout": 0,
+                        "target_modules": "all-linear",
+                        "exclude_modules": None,
+                        "init_method": "kaiming",
+                    },
+                },
+                "model_config_kwargs": {},
+                "sequence_parallel_size": 1,
+                "fsdp_config": {
+                    "cpu_offload": False,
+                    "reshard_after_forward": True,
+                    "fsdp_size": -1,
+                },
+                "optimizer_config": {
+                    "lr": 5e-6,
+                    "adam_betas": [0.9, 0.999],
+                    "weight_decay": 0.01,
+                    "max_grad_norm": 1.0,
+                    "offload_after_step": True,
+                    "num_warmup_steps": 0,
+                    "scheduler": "constant_with_warmup",
                 },
             },
 
@@ -210,17 +344,61 @@ def _build_skyrl_config(
                 "policy_loss_type": "regular",
                 "kl_loss_coef": grpo_cfg.get("beta", 0.0),
                 "use_kl_loss": grpo_cfg.get("beta", 0.0) > 0,
+                "use_kl_in_reward": False,
+                "kl_ctrl": {
+                    "type": "fixed",
+                    "kl_target": 0.1,
+                    "horizon": 10000,
+                },
+                "kl_estimator_type": "k3",
+                "use_kl_estimator_k3": False,
+                "use_abs_kl": False,
+                "use_entropy_loss": False,
+                "entropy_loss_coef": 0.01,
+                "advantage_batch_normalize": False,
+                "value_head_prefix": "value_head",
                 "loss_reduction": "token_mean",
+                "grpo_norm_by_std": True,
+                "zero_variance_filter": False,
+                "lambd": 1.0,
+                "gamma": 1.0,
                 "eps_clip_low": 0.2,
                 "eps_clip_high": 0.2,
+                "clip_ratio_c": 3.0,
+                "tis_imp_ratio_cap": -1.0,
+                "use_tis": False,
+                "sapo": {"tau_pos": 1.0, "tau_neg": 1.05},
+                "value_clip": 0.2,
+                "dynamic_sampling": {
+                    "type": None,
+                    "max_sample_batches": 30,
+                    "min_replace_ratio": 0.3,
+                },
+                "clip_cov": {
+                    "clip_ratio": 0.0002,
+                    "clip_cov_lb": 1.0,
+                    "clip_cov_ub": 5.0,
+                },
+                "kl_cov": {
+                    "kl_cov_frac": 0.2,
+                    "ppo_kl_coef": 1.0,
+                },
+                "cispo": {
+                    "cispo_eps_clip_low": 0,
+                    "cispo_eps_clip_high": 5,
+                },
             },
         },
 
-        # Generator (vLLM inference) — all fields from SkyRL 0.3.1 GeneratorConfig
+        # Generator (vLLM inference) — all fields from SkyRL 0.3.1
+        #
+        # When vllm_server_url is set, run_engines_locally=False causes
+        # SkyRL to create RemoteInferenceEngine objects that connect to
+        # the external vLLM server via standard /v1/completions.
         "generator": {
-            "model_name": "",
+            "model_name": model_path,
             "model_dtype": "bfloat16",
-            "run_engines_locally": True,
+            "run_engines_locally": not bool(grpo_cfg.get("vllm_server_url")),
             "num_inference_engines": 1,
             "backend": "vllm",
             "weight_sync_backend": "nccl",
@@ -242,7 +420,11 @@ def _build_skyrl_config(
             "enable_ray_prometheus_stats": False,
             "gpu_memory_utilization": 0.8,
             "max_num_seqs": 32,
-            "remote_inference_engine_urls": ["127.0.0.1:8001"],
+            "remote_inference_engine_urls": (
+                [grpo_cfg["vllm_server_url"].replace("http://", "").replace("https://", "")]
+                if grpo_cfg.get("vllm_server_url")
+                else ["127.0.0.1:8001"]
+            ),
             "enable_http_endpoint": False,
             "http_endpoint_host": "127.0.0.1",
             "http_endpoint_port": 8000,
@@ -259,7 +441,9 @@ def _build_skyrl_config(
                 "top_p": 0.95,
                 "min_p": 0.0,
                 "top_k": -1,
-                "logprobs": 1,
+                # logprobs must be None for external server (remote mode
+                # rejects any non-None value); logprobs=1 for local mode.
+                "logprobs": None if grpo_cfg.get("vllm_server_url") else 1,
                 "stop": None,
                 "additional_kwargs": None,
             },
@@ -272,7 +456,7 @@ def _build_skyrl_config(
                 "top_p": 0.95,
                 "min_p": 0.0,
                 "top_k": -1,
-                "logprobs": 0,
+                "logprobs": None if grpo_cfg.get("vllm_server_url") else 0,
                 "stop": None,
                 "additional_kwargs": None,
             },
@@ -282,8 +466,6 @@ def _build_skyrl_config(
             "rope_scaling": None,
             "rope_theta": None,
             "step_wise_trajectories": False,
-            "external_proxy_url": None,
-            "external_server_urls": None,
         },
 
         # Environment
@@ -298,6 +480,12 @@ def _build_skyrl_config(
     # Merge with SkyRL defaults to ensure all required keys exist.
     # Our overrides take precedence over defaults.
     if skyrl_defaults:
+        # Strip Hydra-specific keys that contain OmegaConf interpolations
+        # (e.g. ${deepspeed_config.train}) — we don't use DeepSpeed/Megatron.
+        _HYDRA_KEYS = {"defaults", "deepspeed_config", "megatron_config"}
+        for k in _HYDRA_KEYS:
+            skyrl_defaults.pop(k, None)
+
         def _deep_merge(base, override):
             """Recursively merge override into base dict."""
             result = dict(base)
@@ -308,6 +496,10 @@ def _build_skyrl_config(
                     result[k] = v
             return result
         skyrl_config = _deep_merge(skyrl_defaults, skyrl_config)
+
+    # Remove any remaining Hydra/OmegaConf interpolation keys from final config
+    for k in ("defaults", "deepspeed_config", "megatron_config"):
+        skyrl_config.pop(k, None)
 
     return skyrl_config
 
@@ -440,9 +632,70 @@ def _run_skyrl_training(
             },
         )
 
+        # Monkey-patch tokenizer after SkyRL loads it to fix BatchEncoding.
+        # Some tokenizers (e.g. Nanbeige) return BatchEncoding from
+        # apply_chat_template(tokenize=True) instead of List[int].
+        # list(BatchEncoding) returns dict keys ["input_ids", "attention_mask"],
+        # not actual token IDs, corrupting all downstream token operations.
+        _patch_tokenizer_for_batchencoding()
+
         exp = BasePPOExp(cfg)
         exp.run()  # Already calls asyncio.run() internally
 
     # Convert back to dict for serialization through Ray
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     ray.get(_skyrl_entrypoint.remote(cfg_dict, reward_config))
+
+
+def _patch_tokenizer_for_batchencoding():
+    """Monkey-patch SkyRL's generator to handle BatchEncoding from tokenizers.
+
+    Some tokenizers (e.g. Nanbeige4.1-3B) return BatchEncoding (dict-like)
+    from apply_chat_template(tokenize=True) instead of List[int].
+    SkyRL's skyrl_gym_generator.py calls apply_chat_template in 5+ places
+    and expects a plain List[int]. list(BatchEncoding) returns dict keys
+    ["input_ids", "attention_mask"], corrupting all token operations.
+
+    Rather than patching each call site, we wrap the generator class's
+    _create_agent_loop method to ensure the tokenizer always returns lists.
+    """
+    try:
+        from skyrl_train.generators.skyrl_gym_generator import SkyRLGymGenerator
+    except ImportError:
+        logger.warning("Could not import SkyRLGymGenerator for BatchEncoding patch")
+        return
+
+    _orig_init = SkyRLGymGenerator.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        if self.tokenizer is not None:
+            _wrap_apply_chat_template(self.tokenizer)
+
+    SkyRLGymGenerator.__init__ = _patched_init
+    logger.info("Patched SkyRLGymGenerator.__init__ for BatchEncoding safety")
+
+
+def _wrap_apply_chat_template(tokenizer):
+    """Wrap tokenizer.apply_chat_template to always return List[int].
+
+    When return_dict=True is passed, returns are kept as-is (the caller
+    already handles dict access). Otherwise, unwraps BatchEncoding to
+    get the raw input_ids list.
+    """
+    orig_fn = tokenizer.apply_chat_template
+
+    def _safe_apply_chat_template(*args, **kwargs):
+        result = orig_fn(*args, **kwargs)
+        # If caller requested return_dict=True, leave result as-is
+        if kwargs.get("return_dict"):
+            return result
+        # Unwrap BatchEncoding to List[int]
+        if hasattr(result, "input_ids"):
+            return list(result.input_ids)
+        if isinstance(result, dict) and "input_ids" in result:
+            return list(result["input_ids"])
+        return result
+
+    tokenizer.apply_chat_template = _safe_apply_chat_template
+    logger.info("Wrapped tokenizer.apply_chat_template for BatchEncoding safety")

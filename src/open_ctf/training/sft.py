@@ -40,6 +40,11 @@ _MODEL_CONFIG_MAP = {
     "glm4": "glm47_flash.yaml",
     "glm-4.7": "glm47_flash.yaml",
     "devstral": "devstral_24b.yaml",
+    "qwen3": "qwen3_8b.yaml",
+    "qwen/qwen3": "qwen3_8b.yaml",
+    "gpt-oss": "gptoss_20b.yaml",
+    "gptoss": "gptoss_20b.yaml",
+    "gpt_oss": "gptoss_20b.yaml",
 }
 
 
@@ -149,6 +154,10 @@ def _build_lf_config(
             lf_config["template"] = "glm4_7"
         elif any(p in model_lower for p in ("devstral", "mistral")):
             lf_config["template"] = "mistral_small"
+        elif any(p in model_lower for p in ("qwen3", "qwen/qwen3")):
+            lf_config["template"] = "qwen3"
+        elif any(p in model_lower for p in ("gpt-oss", "gptoss", "gpt_oss")):
+            lf_config["template"] = "gpt_oss"
         else:
             # Default: ChatML (Nanbeige, Qwen, and most models)
             lf_config["template"] = "chatml"
@@ -157,6 +166,8 @@ def _build_lf_config(
             lf_config["tool_format"] = "glm4_moe"
         elif any(p in model_lower for p in ("devstral", "mistral")):
             lf_config["tool_format"] = "mistral"
+        elif any(p in model_lower for p in ("gpt-oss", "gptoss", "gpt_oss")):
+            lf_config["tool_format"] = "default"
         else:
             # Default: qwen format (<tool_call> tags, same as Hermes)
             lf_config["tool_format"] = "qwen"

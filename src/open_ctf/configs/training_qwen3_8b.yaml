@@ -1,0 +1,109 @@
+# Qwen3-8B Training Configuration (DGX Spark / Cloud GPU)
+# ==============================================================
+# Dense Qwen3ForCausalLM (8B params) — no MoE complexities.
+# Fits on DGX Spark (119GB unified) for both SFT and GRPO with QLoRA.
+#
+# Key properties:
+#   - Dense model: QLoRA 4-bit fully supported
+#   - batch_size > 1 safe (no MoE routing NaN with padding)
+#   - External vLLM recommended for GRPO (8B model uses more memory than 3B)
+#   - ~16 GB BF16 inference, ~4 GB NF4
+#
+# Architecture: Qwen3ForCausalLM (dense transformer)
+# Vocab: 151,936
+# Context: 128K max_position_embeddings (8K for training)
+# Tool calling: Hermes format (<tool_call> JSON </tool_call>)
+# Reasoning: <think> / </think> tags
+# Chat template: ChatML (<|im_start|> / <|im_end|>)
+
+model:
+  name: "Qwen/Qwen3-8B"
+  # 8K context: conservative for training memory. Inference can use 32K+.
+  # 8B model + 8K context + grad_ckpt fits on DGX Spark (119 GB unified).
+  max_seq_length: 8192
+  # QLoRA 4-bit works perfectly for dense models.
+  # ~4 GB model weights in 4-bit (vs ~16 GB BF16).
+  load_in_4bit: true
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  # Standard Qwen3 target modules (same linear layers as Llama).
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+sft:
+  # 3 epochs: balances convergence vs training time.
+  epochs: 3
+  # batch_size=1: safe default for 8B model on DGX Spark.
+  # 152K vocab -> logits tensor is ~5 GB at batch=1 x 8K seq.
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  # Effective batch: 1 * 16 = 16
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+  # flash_attn disabled: GB10 sm_121a incompatibility.
+  flash_attn: false
+  use_sample_packing: false
+  # Memory budget for SFT on DGX Spark (119 GB unified):
+  #   Model (NF4): ~4 GB
+  #   LoRA adapters: ~0.5 GB
+  #   Optimizer (8-bit AdamW): ~1 GB
+  #   Logits (1 x 8K x 152K x 4B): ~5 GB
+  #   Gradient activations (checkpointed, 8K, batch=1): ~20 GB
+  #   Framework/OS: ~5 GB
+  #   Total: ~35-40 GB -> ~79-84 GB headroom
+
+grpo:
+  epochs: 1
+  batch_size: 1
+  # batch_size(1) * grad_accum(4) must be divisible by num_gen(4): 4 % 4 = 0 (valid)
+  gradient_accumulation_steps: 4
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  beta: 0.0
+  loss_type: dapo
+  # 4 generations (reduced from 8): 8B model uses more memory per generation.
+  num_generations: 4
+  advantage_estimator: rloo
+  # 8K completion matches model's training max_seq_length.
+  max_completion_length: 8192
+  max_tool_calling_iterations: 15
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+  # External vLLM recommended for 8B: colocate uses too much shared memory.
+  # Use skyrl_vllm_server.py on port 8001 with --gpu-memory-utilization 0.20.
+  use_vllm: true
+  vllm_mode: server
+  vllm_server_url: "http://127.0.0.1:8001"
+  gpu_memory_utilization: 0.20
+  # flash_attn disabled: GB10 sm_121a incompatibility.
+  flash_attn: false
+  use_sample_packing: false
+  # Memory budget for GRPO on DGX Spark (119 GB unified):
+  #   Model (NF4): ~4 GB
+  #   vLLM (external, 20% util): ~24 GB (17GB weights + 7GB KV cache)
+  #   LoRA + optimizer: ~2 GB
+  #   Logits (1 x 8K x 152K x 4B): ~5 GB
+  #   Gradient activations (checkpointed, 8K): ~20 GB
+  #   Framework/OS: ~5 GB
+  #   Total: ~60 GB -> ~59 GB headroom
+
+output:
+  save_steps: 25
+  logging_steps: 1
+  report_to: none

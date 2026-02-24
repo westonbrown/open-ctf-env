@@ -1,0 +1,112 @@
+# GPT-OSS 20B Training Configuration (B200 192GB HBM3e)
+# ==============================================================
+# MoE model: 20B total, ~5.1B active (32 experts, top-4 routing).
+# Designed for B200 with colocated vLLM — maximizes sequence length.
+#
+# Key properties:
+#   - MoE: DO NOT target router/gate layers with LoRA
+#   - batch_size=1 mandatory: MoE routing produces NaN for padded positions
+#   - 32K training context: fits on single B200 in colocate mode
+#   - ~40 GB BF16 weights, ~10 GB NF4
+#   - Sliding window (128) + full attention alternation
+#   - Attention sink patches available in SkyRL (skyrl_train/patches/gptoss/)
+#
+# Architecture: GptOssForCausalLM (MoE, 32 experts, top-4)
+# Vocab: 201,088
+# Context: 128K max_position_embeddings (32K for training)
+# Tool calling: Harmony format
+# Reasoning: reasoning_content field (not <think> tags)
+# Chat template: Harmony (<|start|>role<|message|>...<|end|>)
+
+model:
+  name: "unsloth/gpt-oss-20b-BF16"
+  # 32K context: maximum practical for single B200 GRPO.
+  # 128K native but logits tensor at 201K vocab is the bottleneck.
+  max_seq_length: 32768
+  # QLoRA 4-bit: reduces 40GB weights to ~10GB. Essential for GRPO
+  # where policy + ref + vLLM all compete for memory.
+  load_in_4bit: true
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  # Attention layers only — DO NOT target MoE expert/router layers.
+  # Router layers (gate) cause training instability with LoRA.
+  # Expert FFN layers (w1/w2/w3) are safe but multiply LoRA size by num_experts.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  # RSLoRA recommended for MoE: stabilizes LoRA scaling across experts.
+  use_rslora: true
+
+sft:
+  epochs: 3
+  # batch_size=1 MANDATORY: MoE routing NaN with padding (same issue as GLM-4.7-Flash).
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  # Effective batch: 1 * 16 = 16
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+  # Flash Attention 3: B200 HBM3e supports FA natively.
+  flash_attn: true
+  use_sample_packing: false
+  # Memory budget for SFT on B200 (192 GB HBM3e):
+  #   Model (NF4): ~10 GB
+  #   LoRA adapters (attention only): ~0.3 GB
+  #   Optimizer (8-bit AdamW): ~0.6 GB
+  #   Logits (1 x 32K x 201K x 4B): ~25.7 GB
+  #   Gradient activations (checkpointed, 32K): ~40 GB
+  #   Framework/OS: ~5 GB
+  #   Total: ~82 GB -> ~110 GB headroom
+
+grpo:
+  epochs: 1
+  # batch_size=1 MANDATORY: MoE routing NaN.
+  batch_size: 1
+  # batch_size(1) * grad_accum(4) must be divisible by num_gen(4): 4 % 4 = 0
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-6
+  warmup_ratio: 0.10
+  beta: 0.0
+  loss_type: dapo
+  # 4 generations per prompt: balance between sample efficiency and memory.
+  num_generations: 4
+  advantage_estimator: rloo_n
+  # 16K max completion: allows ~25-35 tool-use steps with truncated outputs.
+  # Combined with 16K prompt = 32K total sequence.
+  max_completion_length: 16384
+  # 30 tool iterations: covers most CTF solves (median ~20 steps).
+  max_tool_calling_iterations: 30
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+  # Colocate vLLM: B200 has enough HBM to share model weights.
+  # No external server needed — eliminates HTTP overhead + NCCL patch.
+  use_vllm: true
+  vllm_mode: colocate
+  gpu_memory_utilization: 0.45
+  # Flash Attention 3: B200 HBM3e native support.
+  flash_attn: true
+  use_sample_packing: false
+  # Memory budget for GRPO on B200 (192 GB HBM3e), colocate mode:
+  #   Policy model (bf16, shared with vLLM): ~40 GB
+  #   Ref model (bf16): ~40 GB
+  #   LoRA + optimizer: ~4 GB
+  #   KV cache (4 seqs x 32K, 48KB/tok): ~6 GB
+  #   Logits (1 x 32K x 201K x 4B): ~25.7 GB
+  #   Gradient activations (checkpointed, 32K): ~35 GB
+  #   Framework/OS: ~5 GB
+  #   Total: ~156 GB -> ~36 GB headroom
+
+output:
+  save_steps: 25
+  logging_steps: 1
+  report_to: none
