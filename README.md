@@ -26,8 +26,8 @@ flowchart LR
 
     subgraph convert["2. Convert"]
         traces["conversation.json\n+ stats.json"] --> converter["BoxPwnrConverter"]
-        converter --> sft_data["SFT Data\n(1,120 successes)"]
-        converter --> grpo_data["GRPO Data\n(1,369 traces + flags)"]
+        converter --> sft_data["SFT Data\n(820 successes)"]
+        converter --> grpo_data["GRPO Data\n(87 CyBench traces + flags)"]
     end
 
     subgraph train["3. Fine-Tune"]
@@ -211,10 +211,11 @@ Data is generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) -
 
 | Dataset | Traces | Size | Description |
 |---------|--------|------|-------------|
-| `data/sft.jsonl` | 1,120 | 97MB | Successful solves for SFT |
-| `data/grpo.jsonl` | 1,369 | 82MB | All traces with cross-referenced flags for GRPO |
+| `data/sft.jsonl` | 820 | 62.5MB | Successful solves for SFT |
+| `data/grpo_cybench40.jsonl` | 87 | 7.3MB | CyBench traces with flags for online GRPO |
+| `data/grpo_offline_683.jsonl` | 676 | 38.8MB | Cross-platform traces for offline GRPO |
 
-**Sources:** HackTheBox (997), XBOW (462), PicoCTF (433), PortSwigger (377), CyBench (311), TryHackMe (204), 2712 (197), HackBench (3) -- 2,984 raw traces total. After conversion, splitting, and quality filtering (token outliers, empty traces, placeholder flags removed), 1,369 remain. See [`data/README.md`](data/README.md) for filter criteria and quality metrics.
+**Sources:** BoxPwnr-Traces across 8 CTF platforms. After conversion, splitting, and quality filtering (token outliers, empty traces, placeholder flags removed), 820 SFT + 87 online GRPO remain. See [`data/README.md`](data/README.md) for filter criteria.
 
 ## Reward Function
 
@@ -277,63 +278,59 @@ GEPA produces an optimized system prompt at `outputs/gepa/optimized_prompt.txt` 
 | `--model` | (required) | LLM for agent execution (e.g. local vLLM endpoint) |
 | `--reflection-model` | same as model | Strong LLM for GEPA reflection (frontier model recommended) |
 | `--budget` | `medium` | Optimization budget: `light` / `medium` / `heavy` |
-| `--env-url` | offline | OpenEnv server URL for live tool execution |
+| `--env-url` | offline | ToolExecutor URL for live tool execution |
 | `--max-samples` | all | Limit training examples |
 
 ## Architecture
 
-### Online GRPO Training Loop (SkyRL)
+### Online GRPO Training Loop
 
-```
-SkyRL BasePPOExp
-    |
-    +-- Ray Data / Worker Distribution
-    |       |
-    |       +-- vLLM Generator Phase
-    |       |       |-- Execute prompt prefix caching
-    |       |       |-- Generate till EOS or tool call
-    |       |
-    |       +-- Environment Phase (OpenCTFTextEnv)
-    |       |       |-- parse tool calls
-    |       |       |-- execute via ToolExecutor (Subprocess)
-    |       |       |-- append results (max 50 iterations)
-    |       |
-    |       +-- CTFReward scores full trajectory
-    |
-    +-- DAPO Policy Gradient Phase (FSDP2)
+```mermaid
+flowchart TB
+    subgraph skyrl["SkyRL BasePPOExp (Ray)"]
+        direction TB
+        vllm["vLLM Generator\nPrefix caching · Continuous batching"] --> env
+        subgraph env["OpenCTFTextEnv (per worker)"]
+            direction LR
+            parse["Parse tool calls"] --> exec["ToolExecutor\n(subprocess)"]
+            exec --> obs["Observation\n+ reward"]
+        end
+        env --> reward["CTFReward\n6 signals + penalty"]
+        reward --> trainer["FSDP2 Policy Update\nDAPO loss · No KL penalty"]
+        trainer -.->|"updated weights"| vllm
+    end
 ```
 
 ### Project Structure
 
 ```
 open-ctf-env/
-├── data/                        # Training data (generated)
-│   ├── sft.jsonl                # 1,120 successful traces
-│   ├── grpo.jsonl               # 1,369 traces with flags
-│   └── README.md                # Filter criteria + quality metrics
+├── configs/
+│   ├── challenges/cybench.yaml      # 40 CyBench challenges (docker + static)
+│   ├── llamafactory/                # Per-model SFT configs
+│   └── skyrl/                       # Per-model GRPO configs
+├── data/                            # Training data (generated)
+│   ├── sft.jsonl                    # 820 successful traces
+│   ├── grpo_cybench40.jsonl         # 87 CyBench traces with flags
+│   └── dataset_info.json            # LlamaFactory dataset metadata
+├── docker/Dockerfile                # Multi-stage (targets: base, sft, grpo)
 ├── src/open_ctf/
-│   ├── cli/                     # CLI entry points (train, convert, split, etc.)
-│   ├── configs/                 # training.yaml, training_dgx.yaml
-│   ├── data/                    # Trace converter + dataset splitter
-│   │   ├── converter.py         # BoxPwnr -> ChatML (lossless, 13 tools)
-│   │   └── splitter.py          # Success -> SFT, All -> GRPO
+│   ├── agent/                       # Pluggable agent protocol (CTFAgent)
+│   ├── challenges/                  # ChallengeRegistry + ChallengeManager
+│   ├── cli/                         # CLI entry points
+│   ├── data/                        # BoxPwnr trace converter + splitter
 │   ├── envs/
-│   │   └── skyrl/               # SkyRL Gym integration
-│   │       └── openctf_env.py   # BaseTextEnv subclass with live tools
-│   ├── rewards/reward.py        # CTFReward (6 signals + penalty)
+│   │   ├── tool_executor.py         # SubprocessExecutor (13 tools)
+│   │   └── skyrl/openctf_env.py     # SkyRL BaseTextEnv bridge
+│   ├── formatters/                  # Model chat template formatters
+│   ├── rewards/reward.py            # CTFReward (6 signals + penalty)
 │   └── training/
-│       ├── sft.py               # SFT via LlamaFactory
-│       ├── grpo.py              # Online GRPO via SkyRL
-│       └── gepa.py              # GEPA prompt optimizer (DSPy + ReAct)
-├── scripts/
-│   ├── run_cybench_benchmark.py # Full CyBench benchmark runner
-│   └── spawn_all_cybench.py     # Docker setup for all 40 challenges
-├── tests/
-│   ├── test_rewards.py          # Reward function tests
-│   └── test_openenv.py          # OpenEnv integration tests
-├── Dockerfile                   # Unified container (vLLM + TRL + Unsloth)
-└── references/
-    └── boxpwnr/                 # BoxPwnr agent framework
+│       ├── sft.py                   # LlamaFactory SFT orchestrator
+│       ├── grpo.py                  # SkyRL GRPO orchestrator
+│       ├── gepa.py                  # GEPA prompt optimizer (DSPy)
+│       └── step_reward.py           # CTFReward adapter for SkyRL
+├── tests/                           # Reward, executor, registry, drift tests
+└── references/                      # SkyRL, LlamaFactory, BoxPwnr sources
 ```
 
 ## BoxPwnr Tool Set
@@ -350,13 +347,13 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 
 | Command | Purpose |
 |---------|---------|
-| `open-ctf-train sft` | Stage 1: Supervised fine-tuning with Unsloth |
+| `open-ctf-train sft` | Stage 1: SFT via LlamaFactory |
 | `open-ctf-train merge` | Merge LoRA adapter into base model |
-| `open-ctf-train grpo` | Stage 2: Online GRPO with live tool execution |
+| `open-ctf-train grpo` | Stage 2: Online GRPO via SkyRL |
 | `open-ctf-train gepa` | Stage 3: GEPA prompt optimization (no weight updates) |
 | `open-ctf-convert` | Convert BoxPwnr traces to training format |
 | `open-ctf-split` | Split datasets into SFT and GRPO sets |
-| `open-ctf-agent` | Run agent against CyBench challenges |
+| `open-ctf-challenges` | Manage challenge containers (setup / status / teardown) |
 | `open-ctf-eval` | Evaluate and compare models on CyBench |
 | `open-ctf-validate` | Validate pipeline without GPU |
 | `open-ctf-export` | Export LoRA adapter to GGUF |
@@ -365,7 +362,7 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 
 ### Phase 1: Pipeline + Infrastructure (Done)
 - [x] Lossless trace converter (tool-calling + chat-command formats)
-- [x] Training data: 1,120 SFT + 1,369 GRPO traces from BoxPwnr across 8 platforms
+- [x] Training data: 820 SFT + 87 online GRPO traces from BoxPwnr across 8 platforms
 - [x] SFT Training with LlamaFactory
 - [x] Multi-signal CTF reward function (6 signals + hallucination penalty)
 - [x] Online GRPO Training with SkyRL (Ray + vLLM)
@@ -381,7 +378,7 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 - [x] CyBench 40-challenge baseline (GLM-4.7-Flash Q8_0 via BoxPwnr) -- 7/40 (17.5%)
 
 **Train**
-- [x] Stage 1: SFT (1,120 traces, BF16 LoRA, 3 epochs)
+- [x] Stage 1: SFT (820 traces, BF16 LoRA, 5 epochs)
 - [x] Merge LoRA adapter
 - [ ] Stage 2: Online GRPO (live tool execution, DAPO, 4 generations, vLLM colocate)
 - [ ] Stage 3: GEPA prompt optimization (evolve system prompt, no weight updates)
@@ -399,12 +396,11 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 
 - [CyBench](https://cybench.github.io/) -- Cybersecurity benchmark, 40 challenges, ICLR 2025 Oral ([paper](https://arxiv.org/abs/2408.08926))
 - [BoxPwnr](https://github.com/0ca/BoxPwnr) -- LLM-powered CTF solver (data collection + evaluation)
-- [OpenEnv](https://github.com/OpenEnvs/OpenEnv) -- Gymnasium-style RL environments for LLM agents (online GRPO backend)
-- [Unsloth](https://github.com/unslothai/unsloth) -- Efficient fine-tuning with MoE Grouped GEMM
-- [TRL](https://github.com/huggingface/trl) -- Transformer Reinforcement Learning (GRPOTrainer + DAPO + tools=)
+- [SkyRL](https://github.com/NovaSky-AI/SkyRL) -- Ray-based RL training framework (online GRPO with vLLM)
+- [LlamaFactory](https://github.com/hiyouga/LlamaFactory) -- Unified fine-tuning framework (SFT backend)
 - [GEPA](https://arxiv.org/abs/2507.19457) -- Reflective prompt evolution, outperforms GRPO by ~6% (ICLR 2026 Oral)
 - [DSPy](https://github.com/stanfordnlp/dspy) -- Programming framework for LM pipelines (GEPA integration)
-- [DeepSeek R1](https://arxiv.org/abs/2501.12948) -- SFT -> GRPO pipeline inspiration
+- [DeepSeek R1](https://arxiv.org/abs/2501.12948) -- SFT → GRPO pipeline inspiration
 
 ## License
 

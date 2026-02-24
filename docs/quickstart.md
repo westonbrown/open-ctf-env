@@ -101,12 +101,12 @@ open-ctf-train merge \
     --base-model Nanbeige/Nanbeige4.1-3B \
     --output outputs/sft-merged
 
-# Stage 2: Online GRPO via SkyRL (requires OpenEnv server running)
-OPEN_CTF_ENV_URL=http://localhost:8100 \
+# Stage 2: Online GRPO via SkyRL
 open-ctf-train grpo \
     --model outputs/sft-merged \
     --data data/grpo.jsonl \
-    --output outputs/grpo
+    --output outputs/grpo \
+    --config configs/skyrl/nanbeige_3b.yaml
 
 # Stage 3: GEPA prompt optimization (no weight updates)
 open-ctf-train gepa \
@@ -135,7 +135,7 @@ docker compose run --rm sft
 # Merge LoRA
 docker compose run --rm merge
 
-# Stage 2: Online GRPO (set OPEN_CTF_ENV_URL in .env or environment)
+# Stage 2: Online GRPO
 docker compose run --rm grpo
 
 # Validate pipeline
@@ -151,7 +151,6 @@ docker compose run --rm export
 |----------|-------------|---------|
 | `OPEN_CTF_PROVIDER` | Model provider | `ollama` |
 | `OPEN_CTF_MODEL` | LLM model ID | `ollama/qwen3:8b` |
-| `OPEN_CTF_ENV_URL` | OpenEnv server URL (for GRPO) | `http://localhost:8100` |
 | `OLLAMA_HOST` | Ollama server URL | `http://localhost:11434` |
 | `OPEN_CTF_OUTPUT_DIR` | Output directory | `./outputs` |
 

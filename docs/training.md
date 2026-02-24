@@ -4,18 +4,23 @@ Open CTF uses a **3-stage training pipeline**: SFT (supervised fine-tuning) for 
 
 ## Pipeline Overview
 
-```
-BoxPwnr Traces ──> Convert ──> Split ──> SFT Data + GRPO Data
-                                              │           │
-                              LlamaFactory SFT│           │SkyRL Online GRPO
-                                              ▼           ▼
-                                    LoRA Adapter ──> Merge ──> GRPO Model ──> GEPA ──> Final
+```mermaid
+flowchart LR
+    traces["BoxPwnr Traces"] --> convert["Convert"] --> split["Split"]
+    split -->|"successes"| sft_data["SFT Data"]
+    split -->|"all + flags"| grpo_data["GRPO Data"]
+    sft_data --> sft["LlamaFactory SFT"]
+    sft --> merge["Merge LoRA"]
+    merge --> grpo["SkyRL GRPO"]
+    grpo_data --> grpo
+    grpo --> gepa["GEPA"]
+    gepa --> final["Final Model"]
 ```
 
 | Stage | Framework | What It Does | Weight Updates |
 |-------|-----------|--------------|----------------|
 | **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) | YAML-driven fine-tuning on expert traces. LoRA, packing, DeepSpeed ZeRO. | Yes |
-| **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online RL with live tool execution against OpenEnv. Ray-based, vLLM, DAPO. | Yes |
+| **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online RL with live tool execution via ToolExecutor (subprocess). Ray-based, vLLM, DAPO. | Yes |
 | **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection. Pareto-based candidate selection. ~6% better than GRPO with 4-35x fewer rollouts. | No |
 
 ## Data Preparation
@@ -153,25 +158,21 @@ open-ctf-train merge \
 
 ## Stage 2: Online GRPO (Reinforcement Learning)
 
-GRPO uses **SkyRL** to optimize for flag capture efficiency with live tool execution against the **OpenEnv** server. The model generates tool calls, OpenEnv executes them (shell, Python, file ops), and the CTF reward function scores the full trajectory.
+GRPO uses **SkyRL** to optimize for flag capture efficiency with live tool execution via the **ToolExecutor** (direct subprocess). The model generates tool calls, the ToolExecutor runs them locally (shell, Python, file ops), and the CTF reward function scores the full trajectory. No HTTP server required — SkyRL's per-worker process isolation handles everything.
 
 ### Prerequisites
 
-1. **OpenEnv server running**: Provides live tool execution for the agent.
-2. **Merged SFT model**: GRPO starts from the SFT checkpoint.
+1. **Merged SFT model**: GRPO starts from the SFT checkpoint.
+2. **CyBench challenge containers** (optional): For live challenge execution (`open-ctf-challenges setup`).
 
 ### Quick Start
 
 ```bash
-# Start OpenEnv server (in a separate terminal or Docker container)
-# ...
-
-# Run GRPO
-OPEN_CTF_ENV_URL=http://localhost:8100 \
 open-ctf-train grpo \
     --model outputs/sft-merged \
     --data data/grpo.jsonl \
-    --output outputs/grpo
+    --output outputs/grpo \
+    --config configs/skyrl/glm47_flash.yaml
 ```
 
 ### Configuration
@@ -203,15 +204,15 @@ trainer:
     optimizer_config:
       lr: 5.0e-6
   algorithm:
-    advantage_estimator: grpo
+    advantage_estimator: rloo_n
     kl_loss_coef: 0.0
 
 generator:
   backend: vllm
-  n_samples_per_prompt: 4
-  max_turns: 15
+  n_samples_per_prompt: 8
+  max_turns: 50
   sampling_params:
-    max_generate_length: 32768
+    max_generate_length: 8192
     temperature: 1.0
 
 environment:
@@ -220,19 +221,17 @@ environment:
 
 ### Reward Function
 
-The CTF reward scores completions on **8 signals + 1 penalty**:
+The CTF reward scores completions on **6 signals + 1 penalty**:
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
 | **Flag Capture** | 0.20 | Exact match (1.0) or pattern match (0.1) |
 | **Efficiency** | 0.25 | `min(optimal / actual, 1.0)` |
-| **Format** | 0.15 | Valid tool call JSON structure |
-| **Progression** | 0.10 | RECON -> ENUM -> EXPLOIT phase ordering |
-| **Exploration** | 0.08 | Novel tool usage weighted toward early trajectory |
-| **Uniqueness** | 0.07 | Command diversity (detects stuck loops) |
-| **Recovery** | 0.08 | Successful pivot after errors |
-| **Cognitive** | 0.07 | Reasoning depth (words per action) |
-| **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag |
+| **Format** | 0.20 | Valid tool call JSON structure |
+| **Progression** | 0.15 | RECON → ENUM → EXPLOIT phase ordering |
+| **Exploration** | 0.10 | Novel tool usage weighted toward early trajectory |
+| **Uniqueness** | 0.10 | Command diversity (detects stuck loops) |
+| **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag (decayed by similarity) |
 
 All process signals are ungated -- they provide gradient signal regardless of flag capture.
 
@@ -241,11 +240,11 @@ All process signals are ungated -- they provide gradient signal regardless of fl
 | Parameter | Recommended | Notes |
 |-----------|-------------|-------|
 | `lr` | 5e-6 | Much lower than SFT to avoid instability |
-| `n_samples_per_prompt` | 4 | Completions per prompt for ranking |
-| `max_turns` | 15 | Tool-calling iterations per generation |
-| `max_generate_length` | 32768 | Full-length completions |
+| `n_samples_per_prompt` | 8 | Completions per prompt for ranking |
+| `max_turns` | 50 | Tool-calling iterations per generation |
+| `max_generate_length` | 8192 | Per-turn generation limit |
 | `colocate_all` | true | Safe default, avoids weight sync issues |
-| `advantage_estimator` | grpo | Group Relative Policy Optimization |
+| `advantage_estimator` | rloo_n | RLOO-N (OpenThoughts-aligned) |
 | `kl_loss_coef` | 0.0 | No KL penalty (pure DAPO) |
 
 ### SkyRL Architecture
@@ -254,7 +253,7 @@ SkyRL uses Ray actors for fully async GRPO:
 
 - **Generator**: vLLM inference engine produces completions in a separate process.
 - **Trainer**: FSDP2 handles distributed training with gradient checkpointing.
-- **Environment**: `OpenCTFTextEnv` (in `skyrl_envs/openctf_env.py`) bridges SkyRL and OpenEnv via HTTP.
+- **Environment**: `OpenCTFTextEnv` (in `src/open_ctf/envs/skyrl/openctf_env.py`) bridges SkyRL and the `ToolExecutor` via direct subprocess calls. No HTTP server.
 - **Placement**: `colocate_all: true` offloads weights to CPU between gen/train phases. Slower but eliminates all weight sync bugs for MoE models.
 
 ## Stage 3: GEPA (Prompt Evolution)
@@ -271,7 +270,7 @@ open-ctf-train gepa \
     --reflection-model anthropic/claude-sonnet-4-20250514
 ```
 
-GEPA can run in offline mode (stub tools, scores structure) or online mode (real tools, scores flag capture). Online mode uses OpenEnv, same as GRPO.
+GEPA can run in offline mode (stub tools, scores structure) or online mode (real tools, scores flag capture). Online mode uses the same ToolExecutor as GRPO.
 
 ## Full Pipeline
 
@@ -286,9 +285,9 @@ open-ctf-train sft --model Nanbeige/Nanbeige4.1-3B --data data/sft.jsonl --outpu
 # 3. Merge
 open-ctf-train merge --adapter outputs/sft --base-model Nanbeige/Nanbeige4.1-3B --output outputs/sft-merged
 
-# 4. GRPO (start OpenEnv first)
-OPEN_CTF_ENV_URL=http://localhost:8100 \
-open-ctf-train grpo --model outputs/sft-merged --data data/grpo.jsonl --output outputs/grpo
+# 4. GRPO
+open-ctf-train grpo --model outputs/sft-merged --data data/grpo.jsonl --output outputs/grpo \
+    --config configs/skyrl/nanbeige_3b.yaml
 
 # 5. GEPA (optional)
 open-ctf-train gepa --model outputs/grpo/final --output outputs/gepa
@@ -329,5 +328,5 @@ output:
 | SFT | Nanbeige4.1-3B (QLoRA 4-bit) | 1x 24GB | 1x 80GB |
 | SFT | GLM-4.7-Flash (BF16 LoRA) | 1x 80GB | DGX Spark (128GB) |
 | GRPO | Nanbeige4.1-3B | DGX Spark (128GB) | 1x H200 (141GB) |
-| GRPO | GLM-4.7-Flash | 2x H200 (server mode) | 2x H200 |
-| GEPA | Any | No GPU required | - |
+| GRPO | GLM-4.7-Flash | DGX Spark (128GB) | 1x B200 (192GB) |
+| GEPA | Any | No GPU required | — |
