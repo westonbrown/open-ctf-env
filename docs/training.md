@@ -6,15 +6,26 @@ Open CTF uses a **3-stage training pipeline**: SFT (supervised fine-tuning) for 
 
 ```mermaid
 flowchart LR
-    traces["BoxPwnr Traces"] --> convert["Convert"] --> split["Split"]
-    split -->|"successes"| sft_data["SFT Data"]
-    split -->|"all + flags"| grpo_data["GRPO Data"]
-    sft_data --> sft["LlamaFactory SFT"]
+    traces["BoxPwnr traces"] --> convert["Convert traces"] --> split["Split datasets"]
+    split -->|"successes"| sft_data["SFT data"]
+    split -->|"all + flags"| grpo_data["GRPO data"]
+    sft_data --> sft["SFT stage<br/>(LlamaFactory or TRL)"]
     sft --> merge["Merge LoRA"]
-    merge --> grpo["SkyRL GRPO"]
+    merge --> grpo["GRPO stage<br/>(SkyRL)"]
     grpo_data --> grpo
-    grpo --> gepa["GEPA"]
-    gepa --> final["Final Model"]
+    grpo --> gepa["GEPA stage"]
+    gepa --> final["Final model package"]
+```
+
+### High-Level Training Sequence
+
+```mermaid
+flowchart LR
+    step1["1) Prepare datasets<br/>(SFT + GRPO)"] --> step2["2) Run SFT<br/>(LoRA adapter)"]
+    step2 --> step3["3) Merge adapter<br/>into base model"]
+    step3 --> step4["4) Run online GRPO<br/>(tools + reward)"]
+    step4 --> step5["5) Run GEPA (optional)<br/>prompt optimization"]
+    step5 --> step6["6) Final model + prompt package"]
 ```
 
 | Stage | Framework | What It Does | Weight Updates |

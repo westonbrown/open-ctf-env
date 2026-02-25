@@ -17,33 +17,31 @@ Base open-weight models understand security concepts but cannot execute multi-st
 
 ```mermaid
 flowchart LR
-    subgraph collect["1. Collect Traces"]
-        scaffold["BoxPwnr"] -- "prompt + tools" --> llm["Base Model"]
-        llm -- "tool calls" --> scaffold
-        scaffold -- "shell, python, files" --> challenges["CTF\nTargets"]
-        challenges -- "stdout, flags" --> scaffold
+    subgraph collect["1) Collect Traces"]
+        box["BoxPwnr Agent"] -- "prompt + tools" --> model["Base Model"]
+        model -- "tool calls" --> box
+        box -- "execute actions" --> targets["CTF Targets"]
+        targets -- "stdout + flags" --> box
     end
 
-    subgraph convert["2. Convert & Synthesize"]
-        traces["conversation.json\n+ stats.json"] --> converter["BoxPwnrConverter"]
-        converter --> sft_data["SFT Data\n(820 successes)"]
-        converter --> grpo_data["GRPO Data\n(87 CyBench traces + flags)"]
-
-        synth_manifest["WorldManifests\n(configs/)"] --> synth["Synthetic Data Generator"]
-        synth --> sft_data
+    subgraph convert["2) Build Datasets"]
+        traces["conversation.json + stats.json"] --> converter["BoxPwnrConverter"]
+        converter --> sft_data["SFT dataset<br/>(820 successes)"]
+        converter --> grpo_data["GRPO dataset<br/>(87 CyBench + flags)"]
+        synth["Synthetic Generator"] --> sft_data
         synth --> grpo_data
     end
 
-    subgraph train["3. Fine-Tune"]
-        direction TB
-        sft["Stage 1: SFT\n(LlamaFactory)"] --> merge["Merge LoRA"]
-        merge --> grpo["Stage 2: Online GRPO\n(SkyRL + ToolExecutor)"]
-        grpo --> gepa["Stage 3: GEPA\n(DSPy, no weight updates)"]
+    subgraph train["3) Train"]
+        direction LR
+        sft["Stage 1: SFT<br/>(LlamaFactory or TRL)"] --> merge["Merge LoRA"]
+        merge --> grpo["Stage 2: Online GRPO<br/>(SkyRL + ToolExecutor)"]
+        grpo --> gepa["Stage 3: GEPA<br/>(prompt optimization)"]
     end
 
-    subgraph deploy["4. Evaluate + Deploy"]
-        eval_model["Fine-Tuned\nCTF Agent"] --> eval_bench["CyBench Eval"]
-        eval_model --> export["GGUF Export"]
+    subgraph deploy["4) Evaluate + Deploy"]
+        final_model["Final CTF Agent"] --> eval_bench["CyBench Eval"]
+        final_model --> export["GGUF Export"]
     end
 
     collect --> convert --> train --> deploy
@@ -58,6 +56,17 @@ The same scaffold (BoxPwnr) runs both the baseline and fine-tuned models against
 | **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) / [TRL](https://github.com/huggingface/trl) | Supervised fine-tuning on expert traces (LoRA). LlamaFactory for broad tool-format support, TRL backend for newer model families (for example Qwen3.5). | Yes |
 | **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online reinforcement learning with live tool execution via ToolExecutor. Async Ray-based, vLLM inference, DAPO sampling. | Yes |
 | **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection -- no weight updates. Pareto-based candidate selection. Outperforms GRPO by ~6% with 4-35x fewer rollouts. | No |
+
+### Training Sequence (High Level)
+
+```mermaid
+flowchart LR
+    step1["1) Prepare datasets<br/>(SFT + GRPO)"] --> step2["2) Run SFT<br/>(LoRA adapter)"]
+    step2 --> step3["3) Merge adapter<br/>into base model"]
+    step3 --> step4["4) Run online GRPO<br/>(tools + reward)"]
+    step4 --> step5["5) Run GEPA (optional)<br/>prompt optimization"]
+    step5 --> step6["6) Final model + prompt package"]
+```
 
 **Online GRPO** executes tool calls via the built-in ToolExecutor during training. The model generates tool calls, the ToolExecutor runs them directly as subprocesses (shell commands, Python code, file operations), and the CTF reward function scores the full trajectory. No HTTP server required -- SkyRL's per-worker process isolation makes the former HTTP layer redundant.
 
@@ -302,18 +311,18 @@ GEPA produces an optimized system prompt at `outputs/gepa/optimized_prompt.txt` 
 ### Online GRPO Training Loop
 
 ```mermaid
-flowchart TB
+flowchart LR
     subgraph skyrl["SkyRL BasePPOExp (Ray)"]
-        direction TB
-        vllm["vLLM Generator\nPrefix caching · Continuous batching"] --> env
-        subgraph env["OpenCTFTextEnv (per Ray worker)"]
-            direction LR
-            parse["Parse tool calls"] --> exec["ToolExecutor\n(subprocess)"]
-            exec --> obs["Observation\n+ reward"]
-        end
-        env --> reward["CTFReward\n6 signals + penalty"]
-        reward --> trainer["FSDP2 Policy Update\nDAPO loss · No KL penalty"]
-        trainer -.->|"updated weights"| vllm
+        direction LR
+        vllm["vLLM Generator<br/>Prefix caching + continuous batching"]
+        parse["Parse tool calls"]
+        exec["ToolExecutor<br/>Subprocess execution"]
+        obs["Observation + tool output"]
+        reward["CTFReward<br/>6 signals + hallucination penalty"]
+        trainer["FSDP2 Policy Update<br/>DAPO loss (no KL penalty)"]
+
+        vllm --> parse --> exec --> obs --> reward --> trainer
+        trainer -. "updated weights" .-> vllm
     end
 ```
 
