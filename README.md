@@ -383,7 +383,7 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 | `open-ctf-eval` | Evaluate and compare models on CyBench |
 | `open-ctf-validate` | Validate pipeline without GPU |
 | `open-ctf-export` | Export LoRA adapter to GGUF |
-| `open-ctf-synthetic-data` | High-throughput offline data generator using 2026 World State Dynamics |
+| `open-ctf-synthetic-data` | High-throughput offline data generator |
 
 ## Roadmap
 
