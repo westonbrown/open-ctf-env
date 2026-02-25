@@ -109,6 +109,12 @@ class TestChallengeManager:
         assert "eval-me" in manager.get_running()
 
     @patch("subprocess.run")
+    def test_get_running_uses_canonical_id_for_alias_input(self, mock_run, manager):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        manager.setup("[Very Easy] eval-me")
+        assert "eval-me" in manager.get_running()
+
+    @patch("subprocess.run")
     def test_setup_all(self, mock_run, manager):
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         results = manager.setup_all()
@@ -142,3 +148,114 @@ class TestChallengeManager:
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="container error")
         with pytest.raises(RuntimeError, match="docker compose up failed"):
             manager.setup("eval-me")
+
+    @patch("subprocess.run")
+    def test_setup_resolves_nested_path_with_token_matching(self, mock_run, tmp_path):
+        """Manager should resolve nested benchmark dirs without hardcoded aliases."""
+        registry_data = {
+            "challenges": [
+                {
+                    "id": "the-three-eyed-oracle",
+                    "name": "[Medium] the-three-eyed-oracle",
+                    "category": "crypto",
+                    "difficulty": "hard",
+                    "infra_type": "docker",
+                    "port": 32801,
+                }
+            ]
+        }
+        registry_path = tmp_path / "registry.yaml"
+        with open(registry_path, "w") as f:
+            yaml.dump(registry_data, f)
+
+        nested = (
+            tmp_path
+            / "benchmark"
+            / "hackthebox"
+            / "cyber-apocalypse-2024"
+            / "pwn"
+            / "[Hard] Oracle"
+        )
+        nested.mkdir(parents=True)
+        (nested / "docker-compose.yml").write_text("version: '3'\nservices:\n  app:\n    image: test")
+
+        registry = ChallengeRegistry(str(registry_path))
+        mgr = ChallengeManager(registry=registry, bench_dir=str(tmp_path))
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        url = mgr.setup("the-three-eyed-oracle")
+        assert url == "http://localhost:32801"
+
+        # Ensure compose was launched from nested location.
+        compose_calls = [c for c in mock_run.call_args_list if "compose" in str(c)]
+        assert compose_calls, "expected docker compose invocation"
+
+    @patch("subprocess.run")
+    def test_setup_detects_generic_challenges_root(self, mock_run, tmp_path):
+        """Manager should work when benchmark content lives under ./challenges."""
+        registry_data = {
+            "challenges": [
+                {
+                    "id": "eval-me",
+                    "name": "[Very Easy] eval-me",
+                    "category": "misc",
+                    "difficulty": "very_easy",
+                    "infra_type": "docker",
+                    "port": 32805,
+                }
+            ]
+        }
+        registry_path = tmp_path / "registry.yaml"
+        with open(registry_path, "w") as f:
+            yaml.dump(registry_data, f)
+
+        eval_dir = tmp_path / "challenges" / "eval-me"
+        eval_dir.mkdir(parents=True)
+        (eval_dir / "docker-compose.yaml").write_text("version: '3'\nservices:\n  app:\n    image: test")
+
+        registry = ChallengeRegistry(str(registry_path))
+        mgr = ChallengeManager(registry=registry, bench_dir=str(tmp_path))
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        url = mgr.setup("eval-me")
+        assert url == "http://localhost:32805"
+
+    @patch("subprocess.run")
+    def test_setup_detects_nested_benchmark_root(self, mock_run, tmp_path):
+        """Manager should discover deeply nested benchmark roots (BoxPwnr-style layout)."""
+        registry_data = {
+            "challenges": [
+                {
+                    "id": "eval-me",
+                    "name": "[Very Easy] eval-me",
+                    "category": "misc",
+                    "difficulty": "very_easy",
+                    "infra_type": "docker",
+                    "port": 32805,
+                }
+            ]
+        }
+        registry_path = tmp_path / "registry.yaml"
+        with open(registry_path, "w") as f:
+            yaml.dump(registry_data, f)
+
+        benchmark_root = (
+            tmp_path
+            / "src"
+            / "boxpwnr"
+            / "platforms"
+            / "cybench"
+            / "cybench-repo"
+            / "benchmark"
+        )
+        challenge_dir = benchmark_root / "hackthebox" / "misc" / "[Very Easy] eval-me"
+        challenge_dir.mkdir(parents=True)
+        (challenge_dir / "docker-compose.yaml").write_text("version: '3'\nservices:\n  app:\n    image: test")
+
+        registry = ChallengeRegistry(str(registry_path))
+        mgr = ChallengeManager(registry=registry, bench_dir=str(tmp_path))
+
+        assert mgr._benchmark_root() == benchmark_root
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        url = mgr.setup("eval-me")
+        assert url == "http://localhost:32805"

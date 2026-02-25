@@ -34,7 +34,9 @@ Usage:
 """
 
 import argparse
+import json
 import logging
+import shutil
 from pathlib import Path
 
 import yaml
@@ -58,17 +60,79 @@ def load_config(path: Path) -> dict:
     return {}
 
 
+def _patch_merged_config_for_vllm(base_model_id: str, output_dir: str) -> bool:
+    """Patch merged config.json when PEFT merge drops multimodal config fields.
+
+    Returns:
+        True if config.json was replaced, False otherwise.
+    """
+    base_cfg_path = Path(base_model_id) / "config.json"
+    merged_cfg_path = Path(output_dir) / "config.json"
+    if not base_cfg_path.exists() or not merged_cfg_path.exists():
+        return False
+
+    with open(base_cfg_path) as f:
+        base_cfg = json.load(f)
+    with open(merged_cfg_path) as f:
+        merged_cfg = json.load(f)
+
+    should_patch = (
+        base_cfg.get("model_type") != merged_cfg.get("model_type")
+        and "vision_config" in base_cfg
+        and "vision_config" not in merged_cfg
+    )
+    if not should_patch:
+        return False
+
+    backup_path = Path(output_dir) / "config.text_backup.json"
+    shutil.copy2(merged_cfg_path, backup_path)
+    with open(merged_cfg_path, "w") as f:
+        json.dump(base_cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    logger.info(
+        "Replaced merged config.json with base config for vLLM compatibility "
+        "(backup saved to %s)",
+        backup_path,
+    )
+    return True
+
+
 # -----------------------------------------------------------------------
 # Sub-commands
 # -----------------------------------------------------------------------
 
 
-def cmd_sft(args: argparse.Namespace) -> None:
-    """Run SFT training via LlamaFactory."""
-    from open_ctf.training.sft import train_sft
+def _auto_detect_backend(model_id: str) -> str:
+    """Auto-detect the best SFT backend for a given model.
 
+    Returns 'trl' for models that need transformers >= 5.2.0 (e.g. Qwen3.5),
+    'llamafactory' for models with good LlamaFactory support.
+    """
+    model_lower = model_id.lower()
+    # Models requiring transformers >= 5.2.0 (LlamaFactory pins <= 4.57.1)
+    if any(p in model_lower for p in ("qwen3.5", "qwen3_5", "qwen/qwen3.5")):
+        return "trl"
+    # LlamaFactory has native support for these
+    return "llamafactory"
+
+
+def cmd_sft(args: argparse.Namespace) -> None:
+    """Run SFT training via LlamaFactory or TRL (selectable backend)."""
     config = load_config(args.config)
     model_id = args.model or config.get("model", {}).get("name", "Nanbeige/Nanbeige4.1-3B")
+
+    # Resolve backend: explicit flag > config > auto-detect
+    backend = (
+        args.backend
+        or config.get("sft", {}).get("backend")
+        or _auto_detect_backend(model_id)
+    )
+    logger.info("SFT backend: %s", backend)
+
+    if backend == "trl":
+        from open_ctf.training.sft_trl import train_sft
+    else:
+        from open_ctf.training.sft import train_sft
 
     train_sft(
         model_id=model_id,
@@ -93,6 +157,7 @@ def cmd_grpo(args: argparse.Namespace) -> None:
         config=config,
         resume_from=args.resume,
         challenge_registry=getattr(args, 'challenge_registry', None),
+        agent_class=getattr(args, 'agent', None),
     )
 
 
@@ -142,6 +207,14 @@ def cmd_merge(args: argparse.Namespace) -> None:
 
     model.save_pretrained(args.output, safe_serialization=True)
     tokenizer.save_pretrained(args.output)
+
+    # Qwen3.5 compatibility: PEFT merge can emit qwen3_5_text config, but vLLM
+    # expects qwen3_5 + vision_config for the renderer path.
+    try:
+        _patch_merged_config_for_vllm(base_model_id, args.output)
+    except Exception as exc:
+        logger.warning("Could not apply merged-config compatibility fix: %s", exc)
+
     logger.info("Merged via PEFT -> %s", args.output)
 
 
@@ -165,12 +238,21 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # -- sft (LlamaFactory) -----------------------------------------------
-    sft_parser = subparsers.add_parser("sft", help="Run SFT via LlamaFactory")
+    sft_parser = subparsers.add_parser(
+        "sft",
+        help="Run SFT (--backend trl for Qwen3.5+, llamafactory for others)",
+    )
     sft_parser.add_argument("--model", default=None, help="HF model id (overrides config)")
     sft_parser.add_argument("--data", required=True, help="Path to SFT JSONL data")
     sft_parser.add_argument("--val-data", default=None, help="Path to validation JSONL")
     sft_parser.add_argument("--output", required=True, help="Output directory")
     sft_parser.add_argument("--resume", default=None, help="Resume from checkpoint")
+    sft_parser.add_argument(
+        "--backend",
+        choices=["trl", "llamafactory"],
+        default=None,
+        help="SFT backend (default: auto-detect from model — trl for Qwen3.5+, llamafactory for others)",
+    )
     sft_parser.set_defaults(func=cmd_sft)
 
     # -- grpo (SkyRL) -----------------------------------------------------
@@ -182,6 +264,10 @@ def main() -> None:
     grpo_parser.add_argument(
         "--challenge-registry", default=None,
         help="Path to challenge registry YAML for target URL resolution",
+    )
+    grpo_parser.add_argument(
+        "--agent", default=None,
+        help="Dotted path to a StepAgent class for tool execution (e.g. my_module.MyAgent)",
     )
     grpo_parser.set_defaults(func=cmd_grpo)
 

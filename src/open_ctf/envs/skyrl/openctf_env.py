@@ -1,20 +1,20 @@
 """SkyRL-Gym BaseTextEnv subclass bridging SkyRL to execution environments.
 
-Each SkyRL agent loop gets its own env instance with a BaseExecutor
-(SubprocessExecutor or RemoteBatchExecutor) for tool execution.
+Each SkyRL agent loop gets its own env instance with a pluggable StepAgent
+for tool parsing + execution. The default agent (DefaultStepAgent) preserves
+the original behavior.
 
 Architecture:
     SkyRL SkyRLGymGenerator -> agent_loop()
-        -> env.init(prompt) -> BaseExecutor.reset()
-        -> env.step(action) -> parse tool calls, BaseExecutor.step(),
-                               compute reward via CTFReward
-        -> env.close() -> BaseExecutor.close()
+        -> env.init(prompt) -> agent.reset()
+        -> env.step(action) -> agent.step(), compute reward via CTFReward
+        -> env.close() -> agent.close()
 
-The env receives raw LLM text output, parses tool calls from it using
-regex patterns compatible with Hermes/GLM4/Qwen3 formats, executes
-them via BaseExecutor, and returns observations + rewards.
+The env receives raw LLM text output, delegates tool parsing + execution
+to the StepAgent, and computes rewards from agent state.
 """
 
+import importlib
 import json
 import logging
 import re
@@ -43,6 +43,14 @@ _GLM4_ARG_PATTERN = re.compile(
     r"<arg_key>(.*?)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL,
 )
 
+# Qwen3.5 Coder XML: <tool_call><function=func_name><parameter=k>v</parameter>...</function></tool_call>
+_QWEN35_CODER_PATTERN = re.compile(
+    r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>", re.DOTALL,
+)
+_QWEN35_PARAM_PATTERN = re.compile(
+    r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL,
+)
+
 # Bare JSON fallback: {"name": "...", "arguments": {...}}
 # Supports one level of nested braces in arguments (e.g. {"headers": {"X-UserId": "10052"}})
 _BARE_JSON_PATTERN = re.compile(
@@ -50,13 +58,25 @@ _BARE_JSON_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# Thinking block pattern: <think>...</think> (Qwen3.5, Qwen3, DeepSeek-R1, etc.)
+_THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
+
 
 def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
     """Extract tool calls from LLM output text.
 
-    Supports Hermes JSON, GLM4 XML, and bare JSON formats.
+    Strips ``<think>...</think>`` blocks first to prevent regex confusion
+    when thinking content contains tool-call-like patterns. The original
+    text is not modified — only the copy used for parsing is cleaned.
+
+    Supports Hermes JSON, Qwen3.5 Coder XML, GLM4 XML, and bare JSON formats.
     Returns list of {"name": str, "arguments": dict} dicts.
     """
+    # Strip thinking blocks before parsing (model generates <think>...</think>
+    # by default in Qwen3.5/Qwen3 thinking mode). Thinking content may contain
+    # JSON, XML, or tool-call-like patterns that confuse the parsers.
+    text = _THINK_PATTERN.sub("", text)
+
     tool_calls = []
 
     # 1. Hermes/Qwen3/Nanbeige JSON format
@@ -78,7 +98,25 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
     if tool_calls:
         return tool_calls
 
-    # 2. GLM-4 MoE XML format
+    # 2. Qwen3.5 Coder XML format
+    for m in _QWEN35_CODER_PATTERN.finditer(text):
+        name = m.group(1).strip()
+        args = {}
+        for pm in _QWEN35_PARAM_PATTERN.finditer(m.group(2)):
+            key = pm.group(1).strip()
+            val = pm.group(2).strip()
+            try:
+                val = json.loads(val)
+            except (ValueError, json.JSONDecodeError):
+                pass
+            args[key] = val
+        if name:
+            tool_calls.append({"name": name, "arguments": args})
+
+    if tool_calls:
+        return tool_calls
+
+    # 3. GLM-4 MoE XML format
     for m in _GLM4_TC_PATTERN.finditer(text):
         name = m.group(1).strip()
         args = {}
@@ -96,7 +134,7 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
     if tool_calls:
         return tool_calls
 
-    # 3. Bare JSON fallback
+    # 4. Bare JSON fallback
     for m in _BARE_JSON_PATTERN.finditer(text):
         name = m.group(1)
         try:
@@ -107,6 +145,28 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
             tool_calls.append({"name": name, "arguments": args})
 
     return tool_calls
+
+
+# ---------------------------------------------------------------------------
+# Agent class resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_class(dotpath: Optional[str]):
+    """Resolve a dotted path string to a class.
+
+    Example: "my_module.MyAgent" -> <class my_module.MyAgent>
+
+    Returns None if dotpath is None or empty.
+    Raises ImportError/AttributeError if the path is invalid.
+    """
+    if not dotpath:
+        return None
+    parts = dotpath.rsplit(".", 1)
+    if len(parts) == 2:
+        module = importlib.import_module(parts[0])
+        return getattr(module, parts[1])
+    # Single name — try importing as module (unlikely for a class)
+    return importlib.import_module(dotpath)
 
 
 # ---------------------------------------------------------------------------
@@ -131,10 +191,11 @@ _Base = _get_base_class()
 
 
 class OpenCTFTextEnv(_Base):
-    """SkyRL-Gym BaseTextEnv for CTF challenges via BaseExecutor.
+    """SkyRL-Gym BaseTextEnv for CTF challenges via pluggable StepAgent.
 
-    Each instance manages one episode with execution via SubprocessExecutor
-    or RemoteBatchExecutor. SkyRL creates a new instance per trajectory.
+    Each instance manages one episode. Tool parsing + execution is delegated
+    to a StepAgent (default: DefaultStepAgent). The env owns reward computation,
+    tool schema injection, and SkyRL protocol compliance.
 
     SkyRL's ``make()`` merges registered kwargs (static config) with
     per-sample kwargs from the dataset:
@@ -142,6 +203,8 @@ class OpenCTFTextEnv(_Base):
     - **Static** (from ``register(kwargs=...)``)::
 
         reward_config: dict of CTFReward weight overrides
+        agent_class: dotted path to StepAgent class (optional)
+        agent_kwargs: dict of kwargs for StepAgent constructor (optional)
 
     - **Per-sample** (from dataset ``extras``)::
 
@@ -173,12 +236,10 @@ class OpenCTFTextEnv(_Base):
 
         self._episode_id: Optional[str] = None
         self._done = False
-        self._tool_calls_history: List[Dict[str, str]] = []
-        self._tool_outputs: List[str] = []
-        self._all_text = ""
 
         # Tool call format for prompt injection.
         # "hermes" (default): <tool_call>{"name": ..., "arguments": ...}</tool_call>
+        # "qwen3_coder": <tool_call><function=name><parameter=k>v</parameter></function></tool_call>
         # "glm4":  <tool_call>func_name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
         self._tool_call_format: str = (
             extras.get("tool_call_format")
@@ -202,25 +263,48 @@ class OpenCTFTextEnv(_Base):
         self._optimal_steps: Optional[int] = extras.get("optimal_steps")
         self._challenge_id: Optional[str] = extras.get("challenge_id")
 
-        # Support different executor backends for BYOE
-        executor_type = extras.get("executor_type", kwargs.get("executor_type", "subprocess"))
-        
-        from open_ctf.envs.tool_executor import BaseExecutor, RemoteBatchExecutor, SubprocessExecutor
-        if executor_type == "remote":
-            self._executor: BaseExecutor = RemoteBatchExecutor(
-                target=extras.get("target", kwargs.get("target", "")),
-                ground_truth=self._ground_truth_flag or "",
-                max_steps=self.max_turns * 5,
-            )
-        else:
-            self._executor: BaseExecutor = SubprocessExecutor(
-                target=extras.get("target", kwargs.get("target", "")),
-                ground_truth=self._ground_truth_flag or "",
-                max_steps=self.max_turns * 5,  # generous step limit per episode
+        # Target URL for the challenge
+        self._target: str = extras.get("target", kwargs.get("target", ""))
+
+        # Resolve and create the pluggable StepAgent.
+        # agent_class is a dotted path string (Ray-safe serialization).
+        agent_class_path = kwargs.get("agent_class") or extras.get("agent_class")
+        agent_cls = _resolve_class(agent_class_path)
+        if agent_cls is None:
+            from open_ctf.agent.default_agent import DefaultStepAgent
+            agent_cls = DefaultStepAgent
+
+        agent_kwargs = dict(kwargs.get("agent_kwargs") or extras.get("agent_kwargs") or {})
+        # Pass executor config to agent if not already specified
+        if "executor_type" not in agent_kwargs:
+            agent_kwargs["executor_type"] = extras.get(
+                "executor_type", kwargs.get("executor_type", "subprocess")
             )
 
+        self._agent = agent_cls(**agent_kwargs)
+
+        # Let agent override tool schemas if it provides them
+        agent_tools = getattr(self._agent, "tools", None)
+        if agent_tools is not None:
+            self.tools = agent_tools
+
+    @property
+    def _all_text(self) -> str:
+        """Proxy to agent's all_text for backward compatibility."""
+        return getattr(self._agent, "all_text", "")
+
+    @property
+    def _tool_calls_history(self) -> list:
+        """Proxy to agent's tool_calls_history for backward compatibility."""
+        return getattr(self._agent, "tool_calls_history", [])
+
+    @property
+    def _tool_outputs(self) -> list:
+        """Proxy to agent's tool_outputs for backward compatibility."""
+        return getattr(self._agent, "tool_outputs", [])
+
     def init(self, prompt: ConversationType) -> tuple:
-        """Initialize episode: reset executor, return prompt with tool schemas.
+        """Initialize episode: reset agent, return prompt with tool schemas.
 
         Args:
             prompt: Initial conversation (system + user messages).
@@ -228,17 +312,15 @@ class OpenCTFTextEnv(_Base):
         Returns:
             (prompt, metadata) — prompt with tool schemas injected, metadata has episode_id.
         """
-        # Update ground truth if set per-episode
-        if self._ground_truth_flag:
-            self._executor.ground_truth = self._ground_truth_flag
+        self._agent.reset(
+            target=self._target,
+            ground_truth_flag=self._ground_truth_flag or "",
+            max_steps=self.max_turns,
+        )
 
-        resp = self._executor.reset()
         self._episode_id = None  # no longer tracked via server
         self.turns = 0
         self._done = False
-        self._tool_calls_history = []
-        self._tool_outputs = []
-        self._all_text = ""
 
         # Inject tool schemas into the system message so the model knows
         # what tools are available during GRPO rollouts. SkyRL's generator
@@ -293,6 +375,11 @@ class OpenCTFTextEnv(_Base):
                 "<arg_key>param</arg_key><arg_value>value</arg_value>"
                 "</tool_call>"
             ),
+            "qwen3_coder": (
+                "Call tools using: <tool_call><function=tool_name>"
+                "<parameter=param>value</parameter>"
+                "</function></tool_call>"
+            ),
         }
         fmt_instruction = _FORMAT_INSTRUCTIONS.get(
             self._tool_call_format, _FORMAT_INSTRUCTIONS["hermes"]
@@ -327,86 +414,22 @@ class OpenCTFTextEnv(_Base):
         return prompt
 
     def step(self, action: str) -> Dict[str, Any]:
-        """Process LLM output: parse tool calls, execute via executor.
+        """Process LLM output: delegate to agent, compute reward.
 
         Args:
             action: Raw LLM text output (may contain tool calls).
 
         Returns:
             BaseTextEnvStepOutput dict with observations, reward, done, metadata.
-            Observations use role="user" with tool name embedded in content
-            to match SkyRL's apply_chat_template expectations.
         """
         self.turns += 1
-        self._all_text += "\n" + action
+        result = self._agent.step(action)
 
-        # Parse tool calls from LLM output
-        tool_calls = parse_tool_calls(action)
+        # Sync done state from agent
+        if result.done:
+            self._done = hasattr(self._agent, "episode_done") and self._agent.episode_done
 
-        if not tool_calls:
-            # No tool calls — model just generated text.
-            # Use role="user" here since this is a system prompt, not a tool result.
-            done = self.turns >= self.max_turns
-            if done:
-                return {
-                    "observations": [],
-                    "reward": self._compute_reward(done),
-                    "done": True,
-                    "metadata": {"tool_calls": 0, "step": self.turns},
-                }
-            return {
-                "observations": [
-                    {"role": "user", "content": "No tool call detected. Use a tool to make progress."}
-                ],
-                "reward": 0.0,
-                "done": False,
-                "metadata": {"tool_calls": 0, "step": self.turns},
-            }
-
-        # Execute each tool call via executor
-        obs_messages: ConversationType = []
-        for tc in tool_calls:
-            if self._done:
-                output = "[EPISODE COMPLETE] Flag already submitted."
-            else:
-                # Track for reward computation
-                self._tool_calls_history.append({
-                    "name": tc["name"],
-                    "arguments": json.dumps(tc["arguments"]) if isinstance(tc["arguments"], dict) else str(tc["arguments"]),
-                })
-
-                try:
-                    resp = self._executor.step(tc["name"], tc["arguments"])
-                    stdout = resp.get("stdout", "")
-                    stderr = resp.get("stderr", "")
-                    env_done = resp.get("done", False)
-                except Exception as exc:
-                    logger.warning("Tool execution error: %s", exc)
-                    stdout = f"[ERROR] Tool execution failed: {exc}"
-                    stderr = ""
-                    env_done = False
-
-                output = stdout
-                if stderr:
-                    output += f"\n[stderr] {stderr}"
-
-                self._tool_outputs.append(output)
-                self._all_text += "\n" + output
-
-                # Check for flag submission success
-                if env_done or (tc["name"] == "flag_found" and "correct" in stdout.lower()):
-                    self._done = True
-                    logger.info("Episode done at step %d (flag submitted)", self.turns)
-
-            # Build observation with role="user" to match SkyRL's
-            # apply_chat_template expectations (all built-in SkyRL envs
-            # return observations with role="user").
-            obs_messages.append({
-                "role": "user",
-                "content": f"[Tool: {tc['name']}]\n{output}",
-            })
-
-        done = self._done or self.turns >= self.max_turns
+        done = result.done or self.turns >= self.max_turns
         reward = self._compute_reward(done)
 
         if done:
@@ -414,36 +437,39 @@ class OpenCTFTextEnv(_Base):
                 "observations": [],
                 "reward": reward,
                 "done": True,
-                "metadata": {
-                    "tool_calls": len(tool_calls),
-                    "step": self.turns,
-                    "episode_done": self._done,
-                },
+                "metadata": result.info,
             }
 
         return {
-            "observations": obs_messages,
+            "observations": result.observations,
             "reward": reward,
             "done": False,
-            "metadata": {
-                "tool_calls": len(tool_calls),
-                "step": self.turns,
-                "episode_done": self._done,
-            },
+            "metadata": result.info,
         }
 
     def _compute_reward(self, done: bool) -> float:
-        """Compute reward for the current step."""
+        """Compute reward for the current step.
+
+        Reads tool_calls_history, tool_outputs, all_text from the agent
+        for reward computation. Falls back gracefully if the agent doesn't
+        expose these attributes (custom agents may not).
+        """
+        # Read agent state (DefaultStepAgent exposes these; custom agents may not)
+        tool_calls_history = getattr(self._agent, "tool_calls_history", [])
+        tool_outputs = getattr(self._agent, "tool_outputs", [])
+        all_text = getattr(self._agent, "all_text", "")
+        episode_done = getattr(self._agent, "episode_done", False)
+
         if not done:
             from open_ctf.training.step_reward import per_step_reward
             return per_step_reward(
-                self._tool_calls_history, self.turns, self.max_turns,
+                tool_calls_history, self.turns, self.max_turns,
             )
 
         # Terminal: compute full reward
         if self._reward_fn is not None:
             completion_msgs = []
-            for i, tc in enumerate(self._tool_calls_history):
+            for i, tc in enumerate(tool_calls_history):
                 completion_msgs.append({
                     "role": "assistant",
                     "content": "",
@@ -454,15 +480,15 @@ class OpenCTFTextEnv(_Base):
                         }
                     }],
                 })
-                if i < len(self._tool_outputs):
+                if i < len(tool_outputs):
                     completion_msgs.append({
                         "role": "tool",
-                        "content": self._tool_outputs[i],
+                        "content": tool_outputs[i],
                         "name": tc["name"],
                     })
             completion_msgs.append({
                 "role": "assistant",
-                "content": self._all_text,
+                "content": all_text,
             })
 
             rewards = self._reward_fn(
@@ -473,21 +499,23 @@ class OpenCTFTextEnv(_Base):
             return rewards[0] if rewards else 0.0
 
         # Fallback: binary flag reward
-        return 1.0 if self._done else 0.0
+        return 1.0 if episode_done else 0.0
 
     def close(self):
         """Close the episode and release resources."""
-        if self._executor:
-            self._executor.close()
+        if self._agent:
+            self._agent.close()
         logger.debug("OpenCTFTextEnv closed (episode=%s)", self._episode_id)
 
     def get_metrics(self) -> Dict[str, Any]:
         """Return episode-level metrics."""
+        tool_calls_history = getattr(self._agent, "tool_calls_history", [])
+        episode_done = getattr(self._agent, "episode_done", False)
         return {
             "total_steps": self.turns,
-            "total_tool_calls": len(self._tool_calls_history),
-            "flag_found": self._done,
-            "unique_tools": len(set(tc["name"] for tc in self._tool_calls_history)),
+            "total_tool_calls": len(tool_calls_history),
+            "flag_found": episode_done,
+            "unique_tools": len(set(tc["name"] for tc in tool_calls_history)),
         }
 
     @staticmethod

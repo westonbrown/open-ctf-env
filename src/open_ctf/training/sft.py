@@ -40,6 +40,10 @@ _MODEL_CONFIG_MAP = {
     "glm4": "glm47_flash.yaml",
     "glm-4.7": "glm47_flash.yaml",
     "devstral": "devstral_24b.yaml",
+    # Qwen3.5 must be checked before Qwen3 (substring match order matters).
+    "qwen3.5": "qwen35_27b.yaml",
+    "qwen3_5": "qwen35_27b.yaml",
+    "qwen/qwen3.5": "qwen35_27b.yaml",
     "qwen3": "qwen3_8b.yaml",
     "qwen/qwen3": "qwen3_8b.yaml",
     "gpt-oss": "gptoss_20b.yaml",

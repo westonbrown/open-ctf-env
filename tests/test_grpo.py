@@ -14,6 +14,8 @@ from pathlib import Path
 from open_ctf.training.grpo import (
     _convert_grpo_data,
     _build_skyrl_config,
+    _should_force_legacy_inference,
+    _resolve_vllm_ready_model_path,
 )
 
 
@@ -231,15 +233,59 @@ class TestBuildSkyrlConfig:
         assert sp["max_generate_length"] == 4096  # From fixture's max_completion_length
         assert sp["temperature"] == 1.0
         assert sp["top_p"] == 0.95
+        assert "additional_kwargs" not in sp
 
     def test_generator_n_samples(self, config):
         result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
         # n_samples_per_prompt comes from config's num_generations (4 in fixture)
         assert result["generator"]["n_samples_per_prompt"] == 4
 
+    def test_generator_weight_sync_backend_local_defaults_nccl(self, config):
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        assert result["generator"]["run_engines_locally"] is True
+        assert result["generator"]["weight_sync_backend"] == "nccl"
+
     def test_generator_max_turns(self, config):
         result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
         assert result["generator"]["max_turns"] == 15
+
+    def test_generator_server_mode_without_url_uses_local_non_colocate(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["grpo"]["vllm_mode"] = "server"
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["trainer"]["placement"]["colocate_all"] is False
+        assert result["generator"]["run_engines_locally"] is True
+        assert result["generator"]["weight_sync_backend"] == "nccl"
+
+    def test_generator_remote_vllm_with_lora_falls_back_to_local(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["grpo"]["vllm_server_url"] = "http://127.0.0.1:9000"
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["trainer"]["placement"]["colocate_all"] is False
+        assert result["generator"]["run_engines_locally"] is True
+        assert result["generator"]["weight_sync_backend"] == "nccl"
+        assert result["generator"]["remote_inference_engine_urls"] == ["127.0.0.1:8001"]
+        assert result["generator"]["sampling_params"]["logprobs"] == 0
+
+    def test_custom_chat_template_forces_logprobs_none(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["grpo"]["chat_template"] = "qwen3_without_thinking"
+        cfg["grpo"]["logprobs"] = 0
+        cfg["grpo"]["eval_logprobs"] = 0
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["generator"]["sampling_params"]["logprobs"] is None
+        assert result["generator"]["eval_sampling_params"]["logprobs"] is None
+
+    def test_generator_remote_vllm_without_lora_uses_broadcast_sync(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["lora"]["r"] = 0
+        cfg["grpo"]["vllm_server_url"] = "https://127.0.0.1:9000/"
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["trainer"]["placement"]["colocate_all"] is False
+        assert result["generator"]["run_engines_locally"] is False
+        assert result["generator"]["weight_sync_backend"] == "broadcast"
+        assert result["generator"]["remote_inference_engine_urls"] == ["127.0.0.1:9000"]
+        assert result["generator"]["sampling_params"]["logprobs"] is None
 
     def test_environment_env_class(self, config):
         result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
@@ -251,12 +297,49 @@ class TestBuildSkyrlConfig:
         assert lora["rank"] == 64
         assert lora["alpha"] == 128
         assert lora["dropout"] == 0.0
+        assert lora["target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+    def test_lora_target_modules_string_passthrough(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["lora"]["target_modules"] = "q_proj,k_proj"
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        lora = result["trainer"]["policy"]["model"]["lora"]
+        assert lora["target_modules"] == ["q_proj", "k_proj"]
+
+    def test_lora_target_modules_default_all_linear(self):
+        cfg = {
+            "model": {"max_seq_length": 4096},
+            "lora": {"r": 32, "alpha": 64, "dropout": 0.0},
+            "grpo": {"batch_size": 1, "epochs": 1, "num_generations": 2},
+            "output": {"save_steps": 50},
+        }
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        lora = result["trainer"]["policy"]["model"]["lora"]
+        assert lora["target_modules"] == "all-linear"
 
     def test_kl_loss_enabled_when_beta_positive(self, config):
         result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
         assert algo["use_kl_loss"] is True
         assert algo["kl_loss_coef"] == 0.001
+
+    def test_algorithm_clip_range_uses_grpo_config(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["grpo"]["epsilon_low"] = 0.15
+        cfg["grpo"]["epsilon_high"] = 0.28
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        algo = result["trainer"]["algorithm"]
+        assert algo["eps_clip_low"] == 0.15
+        assert algo["eps_clip_high"] == 0.28
+
+    def test_algorithm_clip_high_defaults_to_low_when_unspecified(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["grpo"]["epsilon_low"] = 0.12
+        cfg["grpo"].pop("epsilon_high", None)
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        algo = result["trainer"]["algorithm"]
+        assert algo["eps_clip_low"] == 0.12
+        assert algo["eps_clip_high"] == 0.12
 
     def test_missing_grpo_section_uses_defaults(self):
         """Config without grpo section should still produce valid output."""
@@ -282,6 +365,102 @@ class TestBuildSkyrlConfig:
         }
         result = _build_skyrl_config("/model", "/out", config, "/data.jsonl")
         assert result["environment"]["env_class"] == "openctf"
+
+
+class TestInferenceBackendSelection:
+    def test_force_legacy_for_text_config(self, monkeypatch):
+        import transformers
+
+        class Qwen3_5TextConfig:
+            pass
+
+        class DummyAutoConfig:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                return Qwen3_5TextConfig()
+
+        monkeypatch.setattr(transformers, "AutoConfig", DummyAutoConfig)
+        assert _should_force_legacy_inference("/model") is True
+
+    def test_keep_new_inference_for_standard_config(self, monkeypatch):
+        import transformers
+
+        class LlamaConfig:
+            pass
+
+        class DummyAutoConfig:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                return LlamaConfig()
+
+        monkeypatch.setattr(transformers, "AutoConfig", DummyAutoConfig)
+        assert _should_force_legacy_inference("/model") is False
+
+    def test_config_probe_failure_does_not_force_legacy(self, monkeypatch):
+        import transformers
+
+        class DummyAutoConfig:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(transformers, "AutoConfig", DummyAutoConfig)
+        assert _should_force_legacy_inference("/model") is False
+
+
+class TestModelPathResolution:
+    def test_text_wrapper_switches_to_sibling_vllm_path(self, monkeypatch, tmp_path):
+        import transformers
+
+        base_path = tmp_path / "model"
+        vllm_path = tmp_path / "model_vllm"
+        base_path.mkdir()
+        vllm_path.mkdir()
+
+        class Qwen3_5TextConfig:
+            model_type = "qwen3_5_text"
+
+        class Qwen3_5Config:
+            model_type = "qwen3_5"
+
+        class DummyAutoConfig:
+            @staticmethod
+            def from_pretrained(path, **kwargs):
+                if str(path).endswith("_vllm"):
+                    return Qwen3_5Config()
+                return Qwen3_5TextConfig()
+
+        monkeypatch.setattr(transformers, "AutoConfig", DummyAutoConfig)
+        resolved = _resolve_vllm_ready_model_path(str(base_path))
+        assert resolved == str(vllm_path)
+
+    def test_non_text_wrapper_keeps_original_path(self, monkeypatch):
+        import transformers
+
+        class LlamaConfig:
+            model_type = "llama"
+
+        class DummyAutoConfig:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                return LlamaConfig()
+
+        monkeypatch.setattr(transformers, "AutoConfig", DummyAutoConfig)
+        assert _resolve_vllm_ready_model_path("/model") == "/model"
+
+    def test_text_wrapper_without_sibling_keeps_original_path(self, monkeypatch):
+        import transformers
+
+        class Qwen3_5TextConfig:
+            model_type = "qwen3_5_text"
+
+        class DummyAutoConfig:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                return Qwen3_5TextConfig()
+
+        monkeypatch.setattr(transformers, "AutoConfig", DummyAutoConfig)
+        assert _resolve_vllm_ready_model_path("/model") == "/model"
 
 
 class TestTargetExtraction:

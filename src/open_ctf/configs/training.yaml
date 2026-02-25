@@ -8,6 +8,9 @@
 
 model:
   name: "Nanbeige/Nanbeige4.1-3B"
+  # Nanbeige vocab is 166K tokens — logits tensor at cross_entropy is huge:
+  #   32K ctx × 166K vocab × 4 bytes = ~20.7 GB (fits in 120GB GB10)
+  #   65K ctx × 166K vocab × 4 bytes = ~40.5 GB (OOM on 120GB GB10)
   max_seq_length: 32768
   # QLoRA 4-bit works for dense Llama models (no MoE expert tensor workarounds needed).
   load_in_4bit: true
@@ -27,7 +30,7 @@ lora:
   use_rslora: false
 
 sft:
-  epochs: 3
+  epochs: 2
   batch_size: 1
   gradient_accumulation_steps: 16
   learning_rate: 2.0e-4
@@ -39,7 +42,7 @@ sft:
 grpo:
   epochs: 1
   batch_size: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   learning_rate: 5.0e-6
   warmup_ratio: 0.10
   beta: 0.0
@@ -50,9 +53,9 @@ grpo:
   epsilon_high: 0.28
   weight_decay: 0.1
   scale_rewards: false
-  # Advantage estimator: rloo_n (REINFORCE Leave-One-Out, normalized).
-  # Alternatives: grpo, rloo, reinforce++, gae.
-  advantage_estimator: rloo_n
+  # Explicitly pin to grpo for broad SkyRL 0.3.x compatibility in this baseline config.
+  # Code-level default in _build_skyrl_config is rloo_n when this field is omitted.
+  advantage_estimator: grpo
   # vLLM for fast generation (3-6x faster than HF generate).
   # LlamaForCausalLM is first-class in vLLM — no special parsers needed.
   use_vllm: true
@@ -72,6 +75,6 @@ reward:
   # uniqueness_weight: 0.10
 
 output:
-  save_steps: 50
+  save_steps: 25
   logging_steps: 1
-  report_to: wandb
+  report_to: tensorboard

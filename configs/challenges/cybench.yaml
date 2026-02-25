@@ -75,6 +75,9 @@ challenges:
     category: crypto
     difficulty: medium
     infra_type: docker
+    # cybench-patched uses a different nested naming scheme.
+    aliases:
+      - "[Hard] Oracle"
     port: 32801
 
   - id: "tsb"
@@ -88,6 +91,8 @@ challenges:
     category: crypto
     difficulty: hard
     infra_type: docker
+    aliases:
+      - "[Hard] Permuted"
     port: 32802
 
   - id: "RsaCtfTool"
@@ -174,6 +179,8 @@ challenges:
     category: misc
     difficulty: medium
     infra_type: docker
+    aliases:
+      - "[Medium] Data Siege"
     port: 32808
 
   - id: "MultiDigilingual"
@@ -223,6 +230,8 @@ challenges:
     category: web
     difficulty: easy
     infra_type: docker
+    aliases:
+      - "[Easy] Labyrinth Linguist"
     port: 32814
 
   - id: "LoveTok"
@@ -230,6 +239,8 @@ challenges:
     category: web
     difficulty: easy
     infra_type: docker
+    aliases:
+      - "[Medium] LockTalk"
     port: 32815
 
   # ---- Rev (5 challenges) ----

@@ -1,6 +1,7 @@
 """Challenge lifecycle manager — launch/stop Docker containers for CTF challenges."""
 
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -40,10 +41,269 @@ class ChallengeManager:
         self.host = host
         self.network = network
         self._running: Dict[str, str] = {}  # challenge_id -> target_url
+        self._candidate_dirs_cache: Optional[List[Path]] = None
+        self._benchmark_root_cache: Optional[Path] = None
+
+    @staticmethod
+    def _normalize(value: str) -> str:
+        """Normalize text for challenge path matching."""
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    @staticmethod
+    def _tokenize(value: str) -> set[str]:
+        """Tokenize text for loose path matching across benchmark variants."""
+        stop_tokens = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "very",
+            "easy",
+            "medium",
+            "hard",
+            "challenge",
+            "ctf",
+            "benchmark",
+        }
+        return {
+            tok
+            for tok in re.split(r"[^a-z0-9]+", value.lower())
+            if tok and tok not in stop_tokens and not tok.isdigit()
+        }
+
+    @staticmethod
+    def _looks_like_challenge_dir(path: Path) -> bool:
+        """Heuristic: return True when a directory resembles a challenge root."""
+        markers = (
+            "metadata",
+            "challenge",
+            "dist",
+            "release",
+            "env",
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "start_docker.sh",
+        )
+        return any((path / marker).exists() for marker in markers)
+
+    def _challenge_root_score(self, root: Path) -> int:
+        """Score how likely a directory is a benchmark challenge root."""
+        if not root.is_dir():
+            return 0
+        try:
+            direct_dirs = [item for item in root.iterdir() if item.is_dir()]
+        except OSError:
+            return 0
+        if not direct_dirs:
+            return 0
+
+        score = 0
+        for child in direct_dirs:
+            if self._looks_like_challenge_dir(child):
+                score += 5
+                continue
+            # Common benchmark layout: category/challenge.
+            try:
+                grandchildren = [item for item in child.iterdir() if item.is_dir()]
+            except OSError:
+                continue
+            if any(self._looks_like_challenge_dir(grandchild) for grandchild in grandchildren):
+                score += 3
+
+        # Prefer roots with enough immediate subdirs to represent categories/tasks.
+        score += min(10, len(direct_dirs))
+        return score
+
+    def _benchmark_root(self) -> Path:
+        """Return the benchmark root directory."""
+        if self._benchmark_root_cache is not None:
+            return self._benchmark_root_cache
+
+        # Prefer explicit benchmark layout if present.
+        explicit = self.bench_dir / "benchmark"
+        if explicit.exists() and self._challenge_root_score(explicit) > 0:
+            self._benchmark_root_cache = explicit
+            return explicit
+
+        # Generic benchmark repos often keep challenges under one of these roots.
+        roots: List[Path] = [
+            self.bench_dir / name
+            for name in ("benchmarks", "challenges", "tasks", "ctf", "data")
+            if (self.bench_dir / name).is_dir()
+        ]
+
+        # Some repos (for example BoxPwnr) keep benchmark under nested
+        # platform folders like src/.../cybench-repo/benchmark.
+        skip_parts = {".git", ".venv", "__pycache__", "node_modules"}
+        for candidate in self.bench_dir.rglob("benchmark"):
+            if not candidate.is_dir():
+                continue
+            if any(part in skip_parts for part in candidate.parts):
+                continue
+            roots.append(candidate)
+
+        scored = []
+        for root in roots:
+            score = self._challenge_root_score(root)
+            if score > 0:
+                scored.append((score, -len(root.parts), str(root), root))
+
+        if scored:
+            _, _, _, best_root = max(scored)
+            self._benchmark_root_cache = best_root
+            return best_root
+
+        self._benchmark_root_cache = self.bench_dir
+        return self.bench_dir
+
+    def _list_candidate_dirs(self) -> List[Path]:
+        """Index challenge-like directories in benchmark tree."""
+        if self._candidate_dirs_cache is not None:
+            return self._candidate_dirs_cache
+
+        root = self._benchmark_root()
+        if not root.exists():
+            self._candidate_dirs_cache = []
+            return self._candidate_dirs_cache
+
+        candidates: List[Path] = []
+        for path in root.rglob("*"):
+            if not path.is_dir():
+                continue
+            if any(
+                (path / marker).exists()
+                for marker in ("metadata", "challenge", "dist", "release", "env")
+            ):
+                candidates.append(path)
+                continue
+            if any(
+                (path / marker).exists()
+                for marker in ("docker-compose.yml", "docker-compose.yaml", "start_docker.sh")
+            ):
+                candidates.append(path)
+
+        # Include flat challenge directories for legacy layout.
+        for path in root.iterdir():
+            if path.is_dir():
+                candidates.append(path)
+
+        self._candidate_dirs_cache = sorted(set(candidates), key=lambda p: (len(p.parts), str(p)))
+        return self._candidate_dirs_cache
+
+    def _score_candidate(self, query: str, candidate: Path) -> int:
+        """Score how well a candidate directory matches a challenge query."""
+        if not query:
+            return 0
+
+        query_norm = self._normalize(query)
+        query_tokens = self._tokenize(query)
+        base = self._normalize(candidate.name)
+        rel_text = str(candidate.relative_to(self._benchmark_root()))
+        rel = self._normalize(rel_text)
+        base_tokens = self._tokenize(candidate.name)
+        rel_tokens = self._tokenize(rel_text)
+        candidate_tokens = base_tokens | rel_tokens
+        if not base:
+            return 0
+
+        score = 0
+        if query_norm == base:
+            score = max(score, 100)
+        elif query_norm in base:
+            score = max(score, 88)
+        elif base in query_norm:
+            score = max(score, 83)
+        elif query_norm in rel:
+            score = max(score, 80)
+
+        if query_tokens and base_tokens:
+            overlap = len(query_tokens & base_tokens)
+            if overlap:
+                precision = overlap / len(base_tokens)
+                recall = overlap / len(query_tokens)
+                score = max(score, int(63 + 30 * max(precision, recall)))
+                if base_tokens.issubset(query_tokens):
+                    score = max(score, 84 + min(6, len(base_tokens)))
+                if query_tokens.issubset(base_tokens):
+                    score = max(score, 82 + min(6, len(query_tokens)))
+
+        if query_tokens and candidate_tokens:
+            overlap = len(query_tokens & candidate_tokens)
+            if overlap:
+                precision = overlap / len(candidate_tokens)
+                recall = overlap / len(query_tokens)
+                score = max(score, int(58 + 25 * max(precision, recall)))
+
+        # Prefer paths that already contain launch artifacts.
+        if score > 0 and self._find_first(candidate, ["docker-compose.yaml", "docker-compose.yml", "start_docker.sh"]):
+            score += 5
+        return score
 
     def _challenge_dir(self, challenge_id: str) -> Path:
-        """Get the directory for a challenge in the benchmark repo."""
-        return self.bench_dir / "benchmark" / challenge_id
+        """Resolve challenge directory in benchmark tree (flat or nested)."""
+        info = self.registry.get(challenge_id)
+        benchmark_root = self._benchmark_root()
+
+        # 1) path_hint override from registry config.
+        if info.path_hint:
+            hint = Path(info.path_hint)
+            hint_path = hint if hint.is_absolute() else benchmark_root / hint
+            if hint_path.exists():
+                return hint_path
+
+        # 2) Legacy flat layout path.
+        legacy_path = benchmark_root / info.id
+        if legacy_path.exists():
+            return legacy_path
+
+        # 3) Nested-path discovery using id/name/aliases.
+        queries = [info.id, info.name, *info.aliases]
+        queries = [q for q in queries if q]
+
+        best_path: Optional[Path] = None
+        best_score = 0
+        second_score = 0
+        for candidate in self._list_candidate_dirs():
+            for query in queries:
+                score = self._score_candidate(query, candidate)
+                if score > best_score:
+                    second_score = best_score
+                    best_score = score
+                    best_path = candidate
+                elif score > second_score and candidate != best_path:
+                    second_score = score
+
+        if best_path is None or best_score < 80:
+            raise RuntimeError(
+                f"Could not resolve benchmark path for challenge '{challenge_id}' "
+                f"(name='{info.name}') under {benchmark_root}. "
+                "Set path_hint/aliases in configs/challenges/cybench.yaml."
+            )
+
+        if second_score >= best_score - 2 and best_score < 95:
+            raise RuntimeError(
+                f"Ambiguous benchmark path resolution for challenge '{challenge_id}' "
+                f"(best_score={best_score}, second_score={second_score}) under {benchmark_root}. "
+                "Set path_hint in challenge registry to make the mapping deterministic."
+            )
+
+        logger.info("Resolved challenge %s -> %s (score=%d)", challenge_id, best_path, best_score)
+        return best_path
+
+    def _find_first(self, challenge_dir: Path, names: List[str]) -> Optional[Path]:
+        """Find launch artifact in challenge dir (first direct, then recursive)."""
+        for name in names:
+            direct = challenge_dir / name
+            if direct.exists():
+                return direct
+
+        matches: List[Path] = []
+        for name in names:
+            matches.extend(challenge_dir.rglob(name))
+        if not matches:
+            return None
+
+        return sorted(set(matches), key=lambda p: (len(p.parts), str(p)))[0]
 
     def setup(self, challenge_id: str) -> str:
         """Launch a challenge's Docker container and return the target URL.
@@ -69,12 +329,12 @@ class ChallengeManager:
         challenge_dir = self._challenge_dir(challenge_id)
 
         # Run init_script.sh if present (builds images, etc.)
-        init_script = challenge_dir / "init_script.sh"
-        if init_script.exists():
+        init_script = self._find_first(challenge_dir, ["init_script.sh"])
+        if init_script:
             logger.info("Running init script for %s", challenge_id)
             result = subprocess.run(
                 ["bash", str(init_script)],
-                cwd=str(challenge_dir),
+                cwd=str(init_script.parent),
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -83,31 +343,31 @@ class ChallengeManager:
                 logger.warning("init_script.sh failed for %s: %s", challenge_id, result.stderr)
 
         # Start with docker compose
-        compose_file = challenge_dir / "docker-compose.yaml"
-        if not compose_file.exists():
-            compose_file = challenge_dir / "docker-compose.yml"
-
-        if compose_file.exists():
+        compose_file = self._find_first(challenge_dir, ["docker-compose.yaml", "docker-compose.yml"])
+        if compose_file:
             logger.info("Starting docker compose for %s", challenge_id)
-            result = subprocess.run(
-                ["docker", "compose", "-f", str(compose_file), "up", "-d"],
-                cwd=str(challenge_dir),
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
+            try:
+                result = subprocess.run(
+                    ["docker", "compose", "-f", str(compose_file), "up", "-d"],
+                    cwd=str(compose_file.parent),
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError("docker command not found; install Docker on the host first.") from exc
             if result.returncode != 0:
                 raise RuntimeError(
                     f"docker compose up failed for {challenge_id}: {result.stderr}"
                 )
         else:
             # Try start_docker.sh fallback
-            start_script = challenge_dir / "start_docker.sh"
-            if start_script.exists():
+            start_script = self._find_first(challenge_dir, ["start_docker.sh"])
+            if start_script:
                 logger.info("Running start_docker.sh for %s", challenge_id)
                 result = subprocess.run(
                     ["bash", str(start_script)],
-                    cwd=str(challenge_dir),
+                    cwd=str(start_script.parent),
                     capture_output=True,
                     text=True,
                     timeout=120,
@@ -121,11 +381,19 @@ class ChallengeManager:
                     f"No docker-compose.yaml or start_docker.sh found in {challenge_dir}"
                 )
 
-        target_url = self.registry.get_target_url(challenge_id, host=self.host)
+        target_url = self.registry.get_target_url(info.id, host=self.host)
         if target_url:
-            self._running[challenge_id] = target_url
+            self._running[info.id] = target_url
+            return target_url
 
-        return target_url or f"http://{self.host}:{info.port}"
+        if info.port is None:
+            raise RuntimeError(
+                f"Challenge {info.id} started but no port is configured. "
+                "Set port in the registry entry or provide a benchmark-specific target resolver."
+            )
+        fallback_url = f"http://{self.host}:{info.port}"
+        self._running[info.id] = fallback_url
+        return fallback_url
 
     def teardown(self, challenge_id: str) -> None:
         """Stop a challenge's Docker container.
@@ -139,21 +407,21 @@ class ChallengeManager:
 
         challenge_dir = self._challenge_dir(challenge_id)
 
-        compose_file = challenge_dir / "docker-compose.yaml"
-        if not compose_file.exists():
-            compose_file = challenge_dir / "docker-compose.yml"
-
-        if compose_file.exists():
+        compose_file = self._find_first(challenge_dir, ["docker-compose.yaml", "docker-compose.yml"])
+        if compose_file:
             logger.info("Stopping docker compose for %s", challenge_id)
-            subprocess.run(
-                ["docker", "compose", "-f", str(compose_file), "down"],
-                cwd=str(challenge_dir),
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
+            try:
+                subprocess.run(
+                    ["docker", "compose", "-f", str(compose_file), "down"],
+                    cwd=str(compose_file.parent),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            except FileNotFoundError:
+                logger.warning("docker command not found while tearing down %s", challenge_id)
 
-        self._running.pop(challenge_id, None)
+        self._running.pop(info.id, None)
 
     def setup_all(self, ids: Optional[List[str]] = None) -> Dict[str, str]:
         """Launch multiple challenges. Returns {challenge_id: target_url}.

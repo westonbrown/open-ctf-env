@@ -36,22 +36,39 @@ def _shell(cmd: str) -> dict:
 
 
 def _make_env(**kwargs):
-    """Create an OpenCTFTextEnv with a mocked executor."""
-    with patch("open_ctf.envs.tool_executor.SubprocessExecutor") as MockExec:
-        mock_exec = MagicMock()
-        mock_exec.reset.return_value = {}
-        mock_exec.close.return_value = None
-        MockExec.return_value = mock_exec
+    """Create an OpenCTFTextEnv with a mocked executor inside the agent.
 
-        env = OpenCTFTextEnv(
-            extras={
-                "ground_truth_flag": kwargs.get("ground_truth_flag", "FLAG{test}"),
-                "optimal_steps": kwargs.get("optimal_steps", 5),
-                "max_turns": kwargs.get("max_turns", 10),
-            },
-        )
-        env._executor = mock_exec
-        return env
+    Overrides the agent's reset() to preserve the mock executor across
+    init() calls. The mock is injected once and never replaced.
+    """
+    mock_exec = MagicMock()
+    mock_exec.reset.return_value = {}
+    mock_exec.close.return_value = None
+    mock_exec.step.return_value = {"stdout": "", "stderr": "", "done": False}
+
+    env = OpenCTFTextEnv(
+        extras={
+            "ground_truth_flag": kwargs.get("ground_truth_flag", "FLAG{test}"),
+            "optimal_steps": kwargs.get("optimal_steps", 5),
+            "max_turns": kwargs.get("max_turns", 10),
+        },
+    )
+    # Inject mock executor into the agent
+    env._agent._executor = mock_exec
+
+    # Override agent.reset() so it clears state without replacing the mock
+    def _mock_reset(target="", ground_truth_flag="", max_steps=30, **kw):
+        env._agent.tool_calls_history = []
+        env._agent.tool_outputs = []
+        env._agent.all_text = ""
+        env._agent.episode_done = False
+        env._agent.turns = 0
+        env._agent.max_steps = max_steps
+    env._agent.reset = _mock_reset
+
+    # Alias for backward-compatible test access
+    env._executor = mock_exec
+    return env
 
 
 # ===========================================================================

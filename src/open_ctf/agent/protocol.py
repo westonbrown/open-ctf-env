@@ -15,6 +15,99 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 
+# ---------------------------------------------------------------------------
+# StepAgent — pluggable tool-execution agent for GRPO training loop
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StepResult:
+    """Result of a single agent step (tool parsing + execution).
+
+    The env owns reward computation (SkyRL contract). The agent returns
+    observations and done status only.
+    """
+
+    observations: List[Dict[str, str]]  # [{role: "user", content: "[Tool: name]\noutput"}]
+    done: bool
+    info: Dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class StepAgent(Protocol):
+    """Pluggable agent for the GRPO training loop.
+
+    During GRPO training, SkyRL owns generation (vLLM). The StepAgent
+    owns tool parsing + execution. This lets users swap in custom tool
+    handlers, different parsing logic, or entirely different execution
+    backends without touching the env or reward code.
+
+    Example::
+
+        class MyAgent:
+            def reset(self, target="", ground_truth_flag="", max_steps=30, **kw):
+                self.target = target
+
+            def step(self, action: str) -> StepResult:
+                # Parse tool calls YOUR way
+                # Execute tools YOUR way
+                return StepResult(observations=[...], done=False)
+
+            def close(self):
+                pass
+
+            @property
+            def tools(self):
+                # Return None to use defaults, or provide your own:
+                return [{"type": "function", "function": {"name": "my_tool", ...}}]
+
+        assert isinstance(MyAgent(), StepAgent)
+    """
+
+    def reset(
+        self,
+        target: str = "",
+        ground_truth_flag: str = "",
+        max_steps: int = 30,
+        **kwargs: Any,
+    ) -> None:
+        """Reset agent state for a new episode."""
+        ...
+
+    def step(self, action: str) -> StepResult:
+        """Parse tool calls from LLM output and execute them.
+
+        Args:
+            action: Raw LLM text output (may contain tool calls).
+
+        Returns:
+            StepResult with observations and done flag.
+        """
+        ...
+
+    def close(self) -> None:
+        """Release resources."""
+        ...
+
+    @property
+    def tools(self) -> Optional[List[Dict[str, Any]]]:
+        """Tool schemas for prompt injection (OpenAI function format).
+
+        Return None to use the environment's default tool schemas.
+        Return a list of tool dicts to override with your own tools.
+
+        Each dict should follow OpenAI function calling format::
+
+            {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# CTFAgent — full agent protocol for eval/GEPA (owns generation too)
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class AgentResult:
     """Result of an agent solving a CTF challenge."""

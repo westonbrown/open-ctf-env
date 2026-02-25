@@ -1,10 +1,11 @@
 # Open CTF Environment - Docker Compose
 #
 # Single Dockerfile with multi-stage build targets:
-#   docker/Dockerfile → targets: base, sft, grpo
+#   docker/Dockerfile → targets: base, sft, sft-trl, grpo
 #
 # Usage:
 #   docker compose run --rm sft        # Stage 1: SFT
+#   docker compose run --rm sft-trl    # Stage 1: SFT (TRL backend)
 #   docker compose run --rm merge      # Merge LoRA adapter
 #   docker compose run --rm grpo       # Stage 2: GRPO
 #   docker compose run --rm validate   # Validate pipeline
@@ -39,6 +40,23 @@ services:
     command: >
       open-ctf-train sft
         --model ${MODEL:-Nanbeige/Nanbeige4.1-3B}
+        --data /workspace/data/${SFT_DATA:-sft.jsonl}
+        --output /workspace/outputs/sft
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+
+  # Stage 1: SFT via TRL backend (for newer model families, e.g. Qwen3.5)
+  sft-trl:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: sft-trl
+    <<: [*gpu, *volumes]
+    command: >
+      open-ctf-train sft
+        --backend trl
+        --model ${MODEL:-Qwen/Qwen3.5-27B}
         --data /workspace/data/${SFT_DATA:-sft.jsonl}
         --output /workspace/outputs/sft
     environment:

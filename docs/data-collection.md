@@ -139,7 +139,25 @@ open-ctf-split \
   --max-grpo-tokens 32768
 ```
 
-## Step 5: Validate Data Format
+## Step 5: (Optional) Mass Scale with Synthetic Data Generation
+Because hitting real Docker containers or Live APIs (Step 2) is expensive and slow, we provide an offline **Synthetic Data Generator** powered by the latest 2026 World State modeling techniques (incorporating Google MapTrace's spatial constraints and Kubernetes fault injections).
+
+Instead of dealing with real exploit latency, you configure `YAML` manifests of the environment, and a Teacher LLM rapidly creates massive, uniquely randomized datasets of successful and failed agent trajectories.
+
+```bash
+open-ctf-synthetic-data \
+    --config configs/synthetic_data_generation/default.yaml \
+    --teacher-model "openrouter/openai/gpt-4o" \
+    --num-traces 500 \
+    --sft-out data/sft_synthetic.jsonl
+```
+
+**Why do this?**
+- **Speed**: Over 1,000x faster than rolling out inside a slow Docker container.
+- **Topological Logic**: You can enforce `world_state_dynamics.enforce_topology=true` to force agents to navigate VLAN segmentation securely, natively teaching them networking constructs.
+- **Data Uniqueness**: Every clone of the environment injects a uniquely generated `FLAG{uuid}` across all mocked files, processes, and network DBs, entirely preventing sequence memorization during training.
+
+## Step 6: Validate Data Format
 
 ```bash
 # Validate ChatML format and tool calls

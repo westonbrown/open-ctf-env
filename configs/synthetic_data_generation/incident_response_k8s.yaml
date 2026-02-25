@@ -1,0 +1,51 @@
+name: "k8s_cryptominer_incident"
+description: "Incident Response scenario: Detect and analyze a rogue cryptomining pod in Kubernetes."
+ground_truth_flag: "FLAG{xmrig_process_identified_and_killed}"
+
+world_state_dynamics:
+  enforce_topology: true
+  namespaces:
+    - name: "kube-system"
+      allowed_egress: ["all"]
+    - name: "default"
+      allowed_egress: ["kube-system"]
+    - name: "rogue-namespace"
+      allowed_egress: ["internet"]
+      
+  synthetic_faults:
+    pod_eviction_rate: 0.10 # 10% chance an exec command fails due to pod eviction
+    latency_jitter_ms: 100
+
+context_depth: "high"
+env_vars:
+  KUBECONFIG: "/root/.kube/config"
+
+hosts:
+  - hostname: "k8s-apiserver"
+    ip: "10.96.0.1"
+    os_type: "linux"
+    services:
+      - port: 443
+        name: "https"
+        version: "Kubernetes v1.30.0"
+
+files:
+  - path: "/var/log/syslog"
+    content: |
+        k8s-node-1 kubelet: High CPU usage detected on pod unexpected-worker-3a9f
+        k8s-node-1 kernel: TCP connection established to 104.21.16.89:3333 (pool.minexmr.com)
+
+tool_responses:
+  "shell_command":
+    "kubectl get pods --all-namespaces": |
+      NAMESPACE       NAME                                READY   STATUS    RESTARTS   AGE
+      kube-system     coredns-5d78c9869d-v5h44            1/1     Running   0          10d
+      kube-system     kube-proxy-8jmq7                    1/1     Running   0          10d
+      rogue-namespace unexpected-worker-3a9f              1/1     Running   0          2h
+    "kubectl exec -n rogue-namespace unexpected-worker-3a9f -- ps aux": |
+      USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+      root           1  0.0  0.0   2416   512 ?        Ss   10:00   0:00 /bin/sh -c xmrig -o pool.minexmr.com:3333
+      root           7 99.9  1.2 145232 45812 ?        Rl   10:00 119:23 xmrig -o pool.minexmr.com:3333
+    "kubectl delete pod unexpected-worker-3a9f -n rogue-namespace": |
+      pod "unexpected-worker-3a9f" deleted
+      FLAG{xmrig_process_identified_and_killed}

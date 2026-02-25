@@ -1,4 +1,4 @@
-# SkyRL GRPO config for Qwen/Qwen3-8B (8B dense, external vLLM)
+# SkyRL GRPO config for Qwen/Qwen3-8B (8B dense, local non-colocated vLLM)
 # Matches SkyRLConfig dataclass schema.
 # Used as reference — actual config is built by grpo.py from training_qwen3_8b.yaml.
 
@@ -26,7 +26,7 @@ trainer:
   logger: none
 
   placement:
-    colocate_all: true
+    colocate_all: false
 
   ref:
     model:
@@ -57,11 +57,10 @@ trainer:
 generator:
   model_dtype: bfloat16
   backend: vllm
-  # External vLLM: 8B model benefits from dedicated inference server.
-  run_engines_locally: false
+  # Keep local engines when LoRA is enabled (remote mode cannot sync LoRA).
+  run_engines_locally: true
   num_inference_engines: 1
-  remote_inference_engine_urls:
-    - "127.0.0.1:8001"
+  weight_sync_backend: nccl
   # 4 samples per prompt (reduced from 8 for 8B model memory).
   n_samples_per_prompt: 4
   max_input_length: 8192

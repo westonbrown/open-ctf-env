@@ -10,7 +10,6 @@ Fix: Change `bf16=False` to `bf16=self.cfg.trainer.bf16` for the policy model in
 The ref model (line 363) already uses configurable bf16.
 """
 import pathlib
-import sys
 
 WORKER_PATH = pathlib.Path(
     "/usr/local/lib/python3.12/dist-packages/skyrl_train/workers/fsdp/fsdp_worker.py"
@@ -18,31 +17,26 @@ WORKER_PATH = pathlib.Path(
 
 def main():
     if not WORKER_PATH.exists():
-        print(f"ERROR: {WORKER_PATH} not found")
-        sys.exit(1)
+        print(f"   Patch (bf16 policy init): SKIP - {WORKER_PATH} not found")
+        return
 
     content = WORKER_PATH.read_text()
-    lines = content.split("\n")
+    lines = content.splitlines()
 
-    # Find the FIRST occurrence of bf16=False (policy model, around line 130)
-    patched = False
+    if "bf16=self.cfg.trainer.bf16" in content:
+        print("   Patch (bf16 policy init): already applied")
+        return
+
+    # Patch only the first policy-model occurrence to avoid changing ref-model behavior.
     for i, line in enumerate(lines):
-        if "bf16=False" in line and not patched:
-            # Only patch the first occurrence (policy model)
-            lines[i] = line.replace("bf16=False", "bf16=self.cfg.trainer.bf16")
-            patched = True
-            print(f"   Patch (bf16 policy init): APPLIED at line {i+1}")
-            break
+        if "bf16=False" in line:
+            lines[i] = line.replace("bf16=False", "bf16=self.cfg.trainer.bf16", 1)
+            WORKER_PATH.write_text("\n".join(lines) + "\n")
+            print(f"   Patch (bf16 policy init): APPLIED at line {i + 1}")
+            return
 
-    if patched:
-        WORKER_PATH.write_text("\n".join(lines))
-    else:
-        # Check if already patched
-        if lines[129] and "bf16=self.cfg.trainer.bf16" in lines[129]:
-            print("   Patch (bf16 policy init): already applied")
-        else:
-            print("   Patch (bf16 policy init): no matching pattern found")
-            sys.exit(1)
+    # Upstream may have already refactored this callsite.
+    print("   Patch (bf16 policy init): no matching pattern found, skipping")
 
 
 if __name__ == "__main__":

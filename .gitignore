@@ -36,6 +36,8 @@ pip-delete-this-directory.txt
 htmlcov/
 .tox/
 .nox/
+.mypy_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 .cache
@@ -48,7 +50,7 @@ coverage.xml
 
 # Environments
 .env
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -71,17 +73,33 @@ scripts/start_*.sh
 # OS
 .DS_Store
 Thumbs.db
+.ipynb_checkpoints/
 
 # Project specific
 references/        # External repos (users clone BoxPwnr here)
 benchmarks/        # Challenge benchmarks (users clone CyBench here)
 targets/           # Agent trace outputs (created by demo/agent runs)
 outputs/
-data/*.jsonl
+logs/
+wandb/
+ray_results/
+
+# Keep lightweight metadata/docs in data/, ignore generated datasets.
+data/**/*.jsonl
+data/**/*.jsonl.gz
+data/**/*.parquet
+data/**/*.arrow
+data/**/*.csv
 data/archive/
+!data/.gitkeep
+!data/README.md
+!data/dataset_info.json
+
 checkpoints/
 *.ckpt
 *.pt
+*.pth
 *.bin
+*.safetensors
 models/
 *.gguf

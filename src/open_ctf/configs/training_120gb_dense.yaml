@@ -75,7 +75,7 @@ grpo:
   beta: 0.0
   loss_type: dapo
   num_generations: 8
-  advantage_estimator: rloo_n
+  advantage_estimator: grpo
   # 32K completion matches the model's max_seq_length.
   # 3B dense model at NF4 + vLLM colocate @ 0.4 util still fits DGX Spark.
   # KV cache: 32 layers × 2 × 32 heads × 128 dim × 32K × 8 gens × 2B ≈ 32 GB

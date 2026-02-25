@@ -1,7 +1,7 @@
 # Open CTF Training Configuration -- E2E Smoke Test
 # ==================================================
 # Minimal settings for fast pipeline validation on DGX Spark.
-# Used by: scripts/test_e2e_dgx.sh
+# Used by: fast local/CI smoke tests.
 #
 # Differences from default training.yaml:
 #   - max_seq_length: 2048 (vs 32768) for speed

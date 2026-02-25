@@ -6,9 +6,11 @@ Open CTF Environment is a **3-stage post-training pipeline** for fine-tuning LLM
 
 ```mermaid
 flowchart TB
-    subgraph data["Data Collection"]
+    subgraph data["Data Collection & Synthesis"]
         boxpwnr["BoxPwnr Agent"] --> traces["conversation.json\n+ stats.json"]
         traces --> converter["BoxPwnrConverter\n(lossless, 13 tools)"]
+        synth["Synthetic Generator\n(World Manifests)"] --> sft_data
+        synth --> grpo_data
         converter --> sft_data["SFT Data\n(820 successes)"]
         converter --> grpo_data["GRPO Data\n(87 CyBench traces + flags)"]
     end
@@ -55,6 +57,10 @@ src/open_ctf/
 │   └── skyrl/
 │       ├── openctf_env.py       # OpenCTFTextEnv (SkyRL BaseTextEnv subclass)
 │       └── tool_groups.py       # 13 tool schema definitions for SkyRL
+├── synthetic_data_generation/   # Offline World Manifests & Generators
+│   ├── manifest.py              # Enforces Spatial limits & K8s fault injects
+│   ├── executor.py              # CPU-bound tool execution mocking
+│   └── generator.py             # Orchestrates BaseAgentAdapters
 ├── formatters/
 │   ├── base.py                  # ModelFormatter abstract base + auto-detection
 │   ├── qwen3.py                 # ChatML + Hermes tool format
@@ -86,6 +92,8 @@ configs/
 ```mermaid
 flowchart LR
     boxpwnr["BoxPwnr\nTraces"] --> converter["BoxPwnrConverter"]
+    synth["Synthetic \nData Generator"] --> sft
+    synth --> grpo
     converter --> splitter["DatasetSplitter"]
     splitter -->|"successes"| sft["sft.jsonl"]
     splitter -->|"all + flags"| grpo["grpo_cybench40.jsonl"]
@@ -99,7 +107,7 @@ flowchart LR
 
 ## CTF Reward Function
 
-The reward function (`src/open_ctf/rewards/reward.py`) scores agent trajectories on 6 processreward signals plus a hallucination penalty. All process signals are **ungated** — they provide gradient signal regardless of flag capture to prevent reward sparsity during early training.
+The reward function (`src/open_ctf/rewards/reward.py`) scores agent trajectories on 6 process reward signals plus a hallucination penalty. All process signals are **ungated** — they provide gradient signal regardless of flag capture to prevent reward sparsity during early training.
 
 | Signal | Weight | What It Measures |
 |--------|--------|------------------|
@@ -141,7 +149,7 @@ flowchart TB
     subgraph skyrl["SkyRL BasePPOExp"]
         direction TB
         vllm["vLLM Generator\nPrefix caching · Continuous batching"]
-        subgraph env["OpenCTFTextEnv × N workers"]
+        subgraph env["OpenCTFTextEnv x N workers"]
             init["init(prompt)\n→ inject tool schemas\n→ reset executor"]
             step["step(action)\n→ parse tool calls\n→ ToolExecutor.step()\n→ compute reward"]
             close["close()\n→ ToolExecutor.close()"]
@@ -200,15 +208,17 @@ LlamaFactory and SkyRL configs use each framework's native format directly — n
 
 ## Container Strategy
 
-Two Docker targets from a single multi-stage Dockerfile, separated to avoid dependency conflicts between LlamaFactory and SkyRL transformer version pins:
+Three Docker targets from a single multi-stage Dockerfile, separated to avoid dependency conflicts between LlamaFactory, TRL, and SkyRL transformer version pins:
 
 | Target | Base | Purpose |
 |--------|------|---------|
 | `sft` | `nvcr.io/nvidia/pytorch:25.11-py3` | LlamaFactory SFT + merge + validate + export |
+| `sft-trl` | `nvcr.io/nvidia/pytorch:25.11-py3` | TRL SFT backend for newer model families (for example Qwen3.5) |
 | `grpo` | `nvcr.io/nvidia/pytorch:25.11-py3` | SkyRL GRPO + Ray + vLLM |
 
 ```bash
 docker build -t open-ctf:sft  --target sft  -f docker/Dockerfile .
+docker build -t open-ctf:sft-trl --target sft-trl -f docker/Dockerfile .
 docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
 ```
 
@@ -235,7 +245,7 @@ Evaluation uses the same BoxPwnr scaffold as data collection. The only variable 
 
 **Problem**: Custom GRPO script required 6 monkey-patches for GLM-4.7-Flash MoE on Blackwell GB10 (prefix check, dtype cast, weight sync translation, NCCL segfault, etc.).
 
-**Solution**: SkyRL uses Ray process isolation — vLLM runs in a separate process from training. This eliminates all 6 patches: no shared-process dtype collisions, no weight sync bugs, no NCCL group conflicts.
+**Solution**: SkyRL uses Ray process isolation — vLLM runs in a separate process from training. This removes the old in-repo monkey-patch-heavy GRPO loop. Remaining upstream compatibility fixes are isolated in `docker/patches/`.
 
 ### 3. BaseTextEnv Over SkyRL-Agent
 

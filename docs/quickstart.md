@@ -132,6 +132,9 @@ open-ctf-export \
 # Stage 1: SFT
 docker compose run --rm sft
 
+# Stage 1: SFT (TRL backend for newer models, e.g. Qwen3.5)
+docker compose run --rm sft-trl
+
 # Merge LoRA
 docker compose run --rm merge
 

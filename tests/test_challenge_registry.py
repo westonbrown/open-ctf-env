@@ -19,6 +19,7 @@ def registry_yaml(tmp_path):
                 "difficulty": "very_easy",
                 "infra_type": "docker",
                 "port": 32805,
+                "aliases": ["EvalMe", "Eval_Me"],
             },
             {
                 "id": "Dynastic",
@@ -92,12 +93,70 @@ class TestChallengeRegistry:
     def test_contains(self, registry_yaml):
         reg = ChallengeRegistry(registry_yaml)
         assert "eval-me" in reg
+        assert "Eval_Me" in reg
         assert "nonexistent" not in reg
+
+    def test_get_by_display_name(self, registry_yaml):
+        reg = ChallengeRegistry(registry_yaml)
+        info = reg.get("[Very Easy] eval-me")
+        assert info.id == "eval-me"
+
+    def test_get_by_alias(self, registry_yaml):
+        reg = ChallengeRegistry(registry_yaml)
+        info = reg.get("EvalMe")
+        assert info.id == "eval-me"
 
     def test_list_all(self, registry_yaml):
         reg = ChallengeRegistry(registry_yaml)
         all_challenges = reg.list_all()
         assert len(all_challenges) == 3
+
+    def test_token_overlap_resolution(self, tmp_path):
+        data = {
+            "challenges": [
+                {
+                    "id": "the-three-eyed-oracle",
+                    "name": "[Medium] the-three-eyed-oracle",
+                    "category": "crypto",
+                    "difficulty": "medium",
+                    "infra_type": "docker",
+                    "port": 32801,
+                }
+            ]
+        }
+        path = tmp_path / "token_match.yaml"
+        with open(path, "w") as f:
+            yaml.dump(data, f)
+        reg = ChallengeRegistry(str(path))
+        assert reg.get("oracle").id == "the-three-eyed-oracle"
+
+    def test_ambiguous_resolution_returns_not_found(self, tmp_path):
+        data = {
+            "challenges": [
+                {
+                    "id": "first-oracle",
+                    "name": "[Hard] Oracle One",
+                    "category": "crypto",
+                    "difficulty": "hard",
+                    "infra_type": "docker",
+                    "port": 32801,
+                },
+                {
+                    "id": "second-oracle",
+                    "name": "[Hard] Oracle Two",
+                    "category": "crypto",
+                    "difficulty": "hard",
+                    "infra_type": "docker",
+                    "port": 32802,
+                },
+            ]
+        }
+        path = tmp_path / "ambiguous.yaml"
+        with open(path, "w") as f:
+            yaml.dump(data, f)
+        reg = ChallengeRegistry(str(path))
+        with pytest.raises(KeyError, match="oracle"):
+            reg.get("oracle")
 
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
@@ -110,6 +169,8 @@ class TestChallengeInfo:
         assert info.name == ""
         assert info.port is None
         assert info.ground_truth_flag is None
+        assert info.aliases == []
+        assert info.path_hint is None
 
     def test_full_construction(self):
         info = ChallengeInfo(
@@ -120,6 +181,10 @@ class TestChallengeInfo:
             name="Test Challenge",
             port=8080,
             ground_truth_flag="FLAG{test}",
+            aliases=["alias-one"],
+            path_hint="benchmark/test",
         )
         assert info.port == 8080
         assert info.ground_truth_flag == "FLAG{test}"
+        assert info.aliases == ["alias-one"]
+        assert info.path_hint == "benchmark/test"

@@ -44,7 +44,7 @@ trainer:
       max_grad_norm: 5.0
 
   algorithm:
-    advantage_estimator: rloo_n
+    advantage_estimator: grpo
     policy_loss_type: regular
     kl_loss_coef: 0.0
     use_kl_loss: false

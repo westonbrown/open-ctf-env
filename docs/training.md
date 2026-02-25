@@ -19,7 +19,7 @@ flowchart LR
 
 | Stage | Framework | What It Does | Weight Updates |
 |-------|-----------|--------------|----------------|
-| **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) | YAML-driven fine-tuning on expert traces. LoRA, packing, DeepSpeed ZeRO. | Yes |
+| **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) / [TRL](https://github.com/huggingface/trl) | YAML-driven LlamaFactory SFT by default, with TRL backend support for newer model families (for example Qwen3.5). | Yes |
 | **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online RL with live tool execution via ToolExecutor (subprocess). Ray-based, vLLM, DAPO. | Yes |
 | **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection. Pareto-based candidate selection. ~6% better than GRPO with 4-35x fewer rollouts. | No |
 
@@ -79,7 +79,7 @@ open-ctf-split \
 
 ## Stage 1: Supervised Fine-Tuning (SFT)
 
-SFT uses **LlamaFactory** to teach the model domain knowledge, tool schemas, and reasoning patterns. Configuration is entirely YAML-driven -- no Python changes between experiments.
+SFT uses **LlamaFactory by default** to teach domain knowledge, tool schemas, and reasoning patterns. For newer model families requiring newer Transformers support (for example Qwen3.5), use the **TRL backend** via `--backend trl`.
 
 ### Quick Start
 
@@ -88,6 +88,13 @@ open-ctf-train sft \
     --model Nanbeige/Nanbeige4.1-3B \
     --data data/sft.jsonl \
     --output outputs/sft
+
+# Example: force TRL backend (Qwen3.5+ and other newer models)
+open-ctf-train sft \
+    --model Qwen/Qwen3.5-27B \
+    --data data/sft.jsonl \
+    --output outputs/sft-qwen35 \
+    --backend trl
 ```
 
 ### Configuration
@@ -301,6 +308,9 @@ open-ctf-export --adapter outputs/grpo/final --base-model Nanbeige/Nanbeige4.1-3
 ```bash
 # Stage 1: SFT (LlamaFactory image)
 docker compose run --rm sft
+
+# Stage 1: SFT (TRL backend image, for newer model families)
+docker compose run --rm sft-trl
 
 # Merge LoRA
 docker compose run --rm merge

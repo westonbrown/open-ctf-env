@@ -21,15 +21,36 @@ python3 "$PATCH_DIR/patch_skyrl_bf16_policy_init.py"
 # 3. NCCL weight sync skip for LoRA + remote engines (prevents deadlock)
 python3 "$PATCH_DIR/patch_skyrl_weight_sync.py"
 
-# 4. BatchEncoding wrapping (fixes Nanbeige tokenizer compatibility)
+# 4. BatchEncoding-safe token normalization (fixes token_ids corruption)
 python3 "$PATCH_DIR/patch_skyrl_batchencoding.py"
+
+# 5. MixedPrecisionPolicy export (fsdp_utils.py missing re-export)
+python3 "$PATCH_DIR/patch_skyrl_fsdp_mixed_precision.py"
+
+# --- vLLM compatibility shims ---
+
+# 6. vLLM 0.16+ compat shims (SkyRL expects 0.13-0.15 import paths)
+python3 "$PATCH_DIR/patch_vllm_compat_shims.py"
+
+# 7. vLLM 0.16 serving API changes (model_config removed from constructors)
+python3 "$PATCH_DIR/patch_vllm_serving_api.py"
+
+# --- Ray compatibility ---
+
+# 8. Ray 2.54+ compat (ray.experimental.collective.util removed)
+python3 "$PATCH_DIR/patch_ray_collective_compat.py"
+
+# --- Stub packages ---
+
+# 9. flash_attn stub (real flash_attn not compiled for GB10 sm_121a)
+python3 "$PATCH_DIR/patch_flash_attn_stub.py"
+
+# 10. torchaudio stub (NGC PyTorch ABI incompatibility)
+python3 "$PATCH_DIR/patch_torchaudio_stub.py"
 
 # --- LlamaFactory patches (for SFT) ---
 
-# 5. torchaudio stub (NGC PyTorch ABI incompatibility)
-python3 "$PATCH_DIR/patch_torchaudio_stub.py"
-
-# 6. tool_calls None guard (HuggingFace datasets schema normalization)
+# 11. tool_calls None guard (HuggingFace datasets schema normalization)
 python3 "$PATCH_DIR/patch_llamafactory_tool_calls.py"
 
 # --- Cleanup ---

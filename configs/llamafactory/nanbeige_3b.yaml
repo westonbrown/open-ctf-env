@@ -38,8 +38,8 @@ overwrite_output_dir: true
 report_to: none
 
 ### Hyperparameters
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 8
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
 learning_rate: 2.0e-4
 num_train_epochs: 5
 lr_scheduler_type: cosine

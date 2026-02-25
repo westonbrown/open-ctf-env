@@ -20,11 +20,12 @@ dependencies = [
 
 [project.optional-dependencies]
 # LoRA merge + GGUF export (open-ctf-train merge, open-ctf-export)
+# Qwen3.5-27B requires transformers>=5.2.0 for Qwen3_5ForConditionalGeneration.
 merge = [
-    "torch>=2.4.0",
-    "transformers>=4.45.0",
+    "torch>=2.5.0",
+    "transformers>=5.2.0",
     "peft>=0.15.0",
-    "accelerate>=0.34.0",
+    "accelerate>=1.4.0",
 ]
 # Stage 1: LlamaFactory SFT
 # NOTE: LlamaFactory pins transformers<=4.57.1, accelerate<=1.2.1,
@@ -37,16 +38,30 @@ sft = [
     "deepspeed>=0.15.0",
     "wandb",
 ]
+# Stage 1 (alt): TRL SFT — for models needing transformers >= 5.2.0 (Qwen3.5).
+# Use instead of 'sft' extra when LlamaFactory's transformers pin is too old.
+# Compatible with GRPO/merge extras (same transformers version).
+sft-trl = [
+    "trl>=0.28.0",
+    "torch>=2.5.0",
+    "transformers>=5.2.0",
+    "peft>=0.15.0",
+    "accelerate>=1.4.0",
+    "datasets>=3.0.0",
+    "bitsandbytes>=0.45.0",
+    "wandb",
+]
 # Stage 2: SkyRL GRPO (online RL)
 # NOTE: skyrl-train is NOT on PyPI. Install from source:
 #   pip install git+https://github.com/SkyRL-Team/SkyRL-Train.git
+# Qwen3.5-27B requires transformers>=5.2.0, accelerate>=1.4.0 (FSDP2).
 grpo = [
     "skyrl-gym>=0.1.0",
     "ray[default]>=2.40.0",
     "torch>=2.5.0",
-    "transformers>=4.45.0",
+    "transformers>=5.2.0",
     "peft>=0.15.0",
-    "accelerate>=0.34.0",
+    "accelerate>=1.4.0",
     "omegaconf",
     "hydra-core",
     "wandb",
@@ -76,7 +91,7 @@ open-ctf-eval = "open_ctf.cli.evaluate:main"
 open-ctf-validate = "open_ctf.cli.validate_pipeline:main"
 open-ctf-export = "open_ctf.cli.export_gguf:main"
 open-ctf-challenges = "open_ctf.cli.challenges:main"
-
+open-ctf-synthetic-data = "open_ctf.cli.synthetic_data_generation:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -89,3 +104,27 @@ dev-dependencies = [
     "pytest",
     "ruff",
 ]
+# SFT and GRPO/merge extras have incompatible transformers versions:
+#   SFT (LlamaFactory) pins transformers ≤4.57.1
+#   GRPO/merge need transformers ≥5.2.0 (Qwen3.5)
+# Docker separates these into different environments. Tell uv they're exclusive.
+conflicts = [
+    [
+        { extra = "sft" },
+        { extra = "grpo" },
+    ],
+    [
+        { extra = "sft" },
+        { extra = "merge" },
+    ],
+    [
+        { extra = "sft" },
+        { extra = "sft-trl" },
+    ],
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["src"]
+norecursedirs = ["references", "benchmarks", "outputs", ".venv", "venv"]

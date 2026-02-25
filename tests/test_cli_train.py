@@ -8,12 +8,13 @@ Validates:
 """
 
 import argparse
+import json
 import pytest
 from unittest.mock import patch
 
 # We test the CLI parser directly by importing main() and intercepting parse_args.
 # This avoids launching subprocess or importing heavy dependencies (torch, peft, etc.)
-from open_ctf.cli.train import main
+from open_ctf.cli.train import main, _patch_merged_config_for_vllm
 
 
 def _parse_args(argv):
@@ -218,6 +219,53 @@ class TestMergeParser:
     def test_merge_missing_output_raises(self):
         with pytest.raises(SystemExit):
             _parse_args(["merge", "--adapter", "/lora"])
+
+
+class TestMergeConfigPatch:
+    def test_patch_merged_config_for_vllm_replaces_text_config(self, tmp_path):
+        base_dir = tmp_path / "base"
+        out_dir = tmp_path / "out"
+        base_dir.mkdir()
+        out_dir.mkdir()
+
+        base_cfg = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "vision_config": {"type": "dummy"},
+        }
+        merged_cfg = {
+            "model_type": "qwen3_5_text",
+            "architectures": ["Qwen3_5ForCausalLM"],
+            "rope_parameters": {"rope_type": "default"},
+        }
+
+        (base_dir / "config.json").write_text(json.dumps(base_cfg))
+        (out_dir / "config.json").write_text(json.dumps(merged_cfg))
+
+        changed = _patch_merged_config_for_vllm(str(base_dir), str(out_dir))
+        assert changed is True
+        assert (out_dir / "config.text_backup.json").exists()
+        patched = json.loads((out_dir / "config.json").read_text())
+        assert patched["model_type"] == "qwen3_5"
+        assert "vision_config" in patched
+
+    def test_patch_merged_config_for_vllm_noop_when_already_compatible(self, tmp_path):
+        base_dir = tmp_path / "base"
+        out_dir = tmp_path / "out"
+        base_dir.mkdir()
+        out_dir.mkdir()
+
+        cfg = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "vision_config": {"type": "dummy"},
+        }
+        (base_dir / "config.json").write_text(json.dumps(cfg))
+        (out_dir / "config.json").write_text(json.dumps(cfg))
+
+        changed = _patch_merged_config_for_vllm(str(base_dir), str(out_dir))
+        assert changed is False
+        assert not (out_dir / "config.text_backup.json").exists()
 
 
 # ---------------------------------------------------------------------------

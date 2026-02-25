@@ -1,0 +1,143 @@
+# Qwen3.5-27B Training Configuration (B200 183GB HBM3e)
+# ==============================================================
+# Dense Qwen3.5 text model (27B params).
+# Fits on single B200 (183GB) in BF16 for SFT + SkyRL local non-colocated vLLM for GRPO.
+#
+# Key properties:
+#   - Dense model: QLoRA supported but unnecessary on B200 (use BF16 LoRA)
+#   - batch_size > 1 safe (no MoE routing NaN)
+#   - GRPO should use run_engines_locally=true with colocate_all=false (LoRA-safe)
+#   - ~54 GB BF16 inference weights
+#
+# Architecture: Qwen3_5ForConditionalGeneration (text-only path in GRPO/SFT)
+# Vocab: 248,320 (text config); tokenizer vocab is 248,044
+# Context: 262,144 max_position_embeddings
+# Tool calling: qwen3_coder format (XML-style tool calls)
+# Reasoning: <think> / </think> tags
+# Chat template: ChatML (<|im_start|> / <|im_end|>)
+
+model:
+  name: "Qwen/Qwen3.5-27B"
+  # 48K context balances long-horizon traces with stable memory headroom.
+  # This remains within the requested 32K-64K window and avoids recurrent
+  # 64K OOMs observed with Qwen3.5's large vocabulary logits.
+  max_seq_length: 49152
+  # BF16 LoRA: B200 has 183GB — no need for 4-bit quantization.
+  # ~54 GB BF16 weights + ~20 GB training overhead = ~74 GB, well within budget.
+  load_in_4bit: false
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  # Standard Qwen3 target modules (same linear layers as Qwen3-8B).
+  # Dense model: all FFN layers are safe to target.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+sft:
+  # 3 epochs: balances convergence vs training time.
+  epochs: 3
+  # batch_size=1: 248K vocab -> logits tensor is ~7.6 GiB at batch=1 x 8K seq.
+  # Could try batch=2 on B200 (183GB headroom), but batch=1 is safe default.
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  # Effective batch: 1 * 8 = 8
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+  # Flash Attention: B200 HBM3e supports FA natively.
+  flash_attn: true
+  use_sample_packing: false
+  # Memory budget for SFT on B200 (183 GB HBM3e) @ 48K context:
+  #   Model (BF16): ~54 GB
+  #   LoRA adapters (r=64, 7 modules): ~1.5 GB
+  #   Optimizer (8-bit AdamW): ~3 GB
+  #   Logits (1 x 48K x 248K x 4B): ~45.5 GiB
+  #   Gradient activations (checkpointed, 48K, batch=1): ~45 GB
+  #   Framework/OS: ~5 GB
+  #   Total: ~154 GiB (safe on one B200; more headroom on dual-B200 sharding)
+  #   If OOM: reduce to max_seq_length=40960.
+
+grpo:
+  epochs: 1
+  batch_size: 1
+  # batch_size(1) * grad_accum(4) must be divisible by num_gen(4): 4 % 4 = 0 (valid)
+  gradient_accumulation_steps: 4
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  beta: 0.0
+  loss_type: dapo
+  # 4 generations per prompt: balances sample efficiency and vLLM memory.
+  num_generations: 4
+  advantage_estimator: rloo
+  # 8K completion captures 98.9% of observed GRPO trajectories.
+  max_completion_length: 8192
+  # 40 tool iterations for long-horizon BoxPwnr-style runs.
+  max_tool_calling_iterations: 40
+  # Use SkyRL's new HTTP inference path to avoid legacy Ray-wrapped vLLM
+  # LoRA startup regressions on Qwen3.5.
+  use_new_inference: true
+  # Cap prompt length for GRPO/vLLM memory while preserving long trajectories.
+  max_prompt_length: 16384
+  # Explicit vLLM max model len for stable KV-cache sizing.
+  vllm_max_model_len: 24576
+  # Qwen3.5 uses a conditional-generation config in merged checkpoints.
+  # Force text-only vLLM path so local engines do not initialize vision processors.
+  vllm_language_model_only: true
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+  # Use local non-colocated vLLM engines so LoRA weight sync stays on SkyRL's
+  # supported path (NCCL/CUDA IPC). This still allows trainer and generator to
+  # use separate GPUs via Ray placement.
+  use_vllm: true
+  vllm_mode: server
+  vllm_server_url: null
+  # Dedicated GPU0 vLLM server: use higher utilization for larger KV cache.
+  gpu_memory_utilization: 0.70
+  # Flash Attention: B200 HBM3e native support.
+  flash_attn: true
+  use_sample_packing: false
+  # Tool call format for vLLM: use qwen3_coder parser.
+  tool_call_format: qwen3_coder
+  # Thinking mode: Qwen3.5 generates <think>...</think> before tool calls.
+  # SkyRL uses qwen3_without_thinking template: strips thinking from history,
+  # preserves on last turn. Loss mask includes thinking on final turn only.
+  # OpenThoughts-Agent pattern: enable_thinking + response_prefix seeds generation.
+  chat_template: "qwen3_without_thinking"
+  chat_template_kwargs:
+    enable_thinking: true
+  # Memory budget for GRPO on B200 (183 GB HBM3e), server mode:
+  #   Policy model (BF16): ~54 GB
+  #   Ref model (BF16, CPU offload when beta=0): ~0 GB (offloaded)
+  #   LoRA + optimizer: ~5 GB
+  #   Logits (1 x 8K x 248K x 4B): ~7.6 GiB
+  #   Gradient activations (checkpointed, 8K): ~25 GB
+  #   Framework/OS: ~5 GB
+  #   Training total: ~94 GB
+  #
+  #   vLLM engine worker (non-colocated local actor, 50% of 183GB = ~92 GB):
+  #     Model (BF16): ~54 GB
+  #     KV cache (4 seqs x 12K): ~15 GB
+  #     Overhead: ~5 GB
+  #     Total: ~74 GB -> ~18 GB headroom
+  #
+  #   If on same GPU: Training ~94 GB + vLLM ~92 GB = 186 GB (tight!).
+  #   Recommended: use 2 GPUs, or reduce gpu_memory_utilization to 0.35.
+
+output:
+  save_steps: 25
+  logging_steps: 1
+  report_to: none

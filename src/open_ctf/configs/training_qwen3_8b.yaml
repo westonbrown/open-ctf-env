@@ -85,18 +85,18 @@ grpo:
   epsilon_high: 0.28
   weight_decay: 0.1
   scale_rewards: false
-  # External vLLM recommended for 8B: colocate uses too much shared memory.
-  # Use skyrl_vllm_server.py on port 8001 with --gpu-memory-utilization 0.20.
+  # Use local non-colocated vLLM engines (LoRA-safe path in upstream SkyRL).
+  # This keeps trainer and generator on separate Ray workers/GPUs when available.
   use_vllm: true
   vllm_mode: server
-  vllm_server_url: "http://127.0.0.1:8001"
+  vllm_server_url: null
   gpu_memory_utilization: 0.20
   # flash_attn disabled: GB10 sm_121a incompatibility.
   flash_attn: false
   use_sample_packing: false
   # Memory budget for GRPO on DGX Spark (119 GB unified):
   #   Model (NF4): ~4 GB
-  #   vLLM (external, 20% util): ~24 GB (17GB weights + 7GB KV cache)
+  #   vLLM engine worker (non-colocated local, 20% util): ~24 GB (17GB weights + 7GB KV cache)
   #   LoRA + optimizer: ~2 GB
   #   Logits (1 x 8K x 152K x 4B): ~5 GB
   #   Gradient activations (checkpointed, 8K): ~20 GB

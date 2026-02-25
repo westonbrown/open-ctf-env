@@ -24,10 +24,14 @@ flowchart LR
         challenges -- "stdout, flags" --> scaffold
     end
 
-    subgraph convert["2. Convert"]
+    subgraph convert["2. Convert & Synthesize"]
         traces["conversation.json\n+ stats.json"] --> converter["BoxPwnrConverter"]
         converter --> sft_data["SFT Data\n(820 successes)"]
         converter --> grpo_data["GRPO Data\n(87 CyBench traces + flags)"]
+
+        synth_manifest["WorldManifests\n(configs/)"] --> synth["Synthetic Data Generator"]
+        synth --> sft_data
+        synth --> grpo_data
     end
 
     subgraph train["3. Fine-Tune"]
@@ -51,7 +55,7 @@ The same scaffold (BoxPwnr) runs both the baseline and fine-tuned models against
 
 | Stage | Framework | What It Does | Weight Updates |
 |-------|-----------|--------------|----------------|
-| **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) | Supervised fine-tuning on expert traces (LoRA). YAML-driven, 11 native tool formats, packing, DeepSpeed ZeRO. | Yes |
+| **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) / [TRL](https://github.com/huggingface/trl) | Supervised fine-tuning on expert traces (LoRA). LlamaFactory for broad tool-format support, TRL backend for newer model families (for example Qwen3.5). | Yes |
 | **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online reinforcement learning with live tool execution via ToolExecutor. Async Ray-based, vLLM inference, DAPO sampling. | Yes |
 | **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection -- no weight updates. Pareto-based candidate selection. Outperforms GRPO by ~6% with 4-35x fewer rollouts. | No |
 
@@ -110,6 +114,9 @@ cd open-ctf-env
 # Install core + SFT dependencies
 pip install -e ".[sft]"
 
+# For newer model families (for example Qwen3.5), use TRL SFT backend deps
+pip install -e ".[sft-trl]"
+
 # Or for GRPO (requires Ray + SkyRL)
 pip install git+https://github.com/SkyRL-Team/SkyRL-Train.git
 pip install -e ".[grpo]"
@@ -125,6 +132,9 @@ git clone https://github.com/0ca/BoxPwnr.git references/boxpwnr
 ```bash
 # SFT Builder (LlamaFactory + merge + export support)
 docker build -t open-ctf:sft --target sft -f docker/Dockerfile .
+
+# SFT Builder (TRL backend for Qwen3.5+ / newer Transformers)
+docker build -t open-ctf:sft-trl --target sft-trl -f docker/Dockerfile .
 
 # GRPO Builder (SkyRL + Ray + vLLM)
 docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
@@ -146,6 +156,12 @@ open-ctf-split \
     --input data/combined.jsonl \
     --sft-output data/sft.jsonl \
     --grpo-output data/grpo.jsonl
+
+# Synthesize Massively Parallel Agent Traces
+open-ctf-synthetic-data \
+    --config configs/synthetic_data_generation/default.yaml \
+    --num-traces 500 \
+    --teacher-model "openrouter/openai/gpt-4o"
 ```
 
 ### Train
@@ -290,7 +306,7 @@ flowchart TB
     subgraph skyrl["SkyRL BasePPOExp (Ray)"]
         direction TB
         vllm["vLLM Generator\nPrefix caching · Continuous batching"] --> env
-        subgraph env["OpenCTFTextEnv (per worker)"]
+        subgraph env["OpenCTFTextEnv (per Ray worker)"]
             direction LR
             parse["Parse tool calls"] --> exec["ToolExecutor\n(subprocess)"]
             exec --> obs["Observation\n+ reward"]
@@ -322,6 +338,7 @@ open-ctf-env/
 │   ├── envs/
 │   │   ├── tool_executor.py         # SubprocessExecutor (13 tools)
 │   │   └── skyrl/openctf_env.py     # SkyRL BaseTextEnv bridge
+│   ├── synthetic_data_generation/   # Offline World Manifests & Generators
 │   ├── formatters/                  # Model chat template formatters
 │   ├── rewards/reward.py            # CTFReward (6 signals + penalty)
 │   └── training/
@@ -357,6 +374,7 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 | `open-ctf-eval` | Evaluate and compare models on CyBench |
 | `open-ctf-validate` | Validate pipeline without GPU |
 | `open-ctf-export` | Export LoRA adapter to GGUF |
+| `open-ctf-synthetic-data` | High-throughput offline data generator using 2026 World State Dynamics |
 
 ## Roadmap
 

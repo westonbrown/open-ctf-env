@@ -1,13 +1,15 @@
 # Open CTF Environment - Unified Dockerfile
 #
 # Multi-stage build with targets for each pipeline stage:
-#   - base:     Core package (data tools, reward, formatters, ToolExecutor)
-#   - sft:      LlamaFactory SFT (Stage 1) + merge + validate + export
-#   - grpo:     SkyRL GRPO (Stage 2) + Ray + vLLM
+#   - base:      Core package (data tools, reward, formatters, ToolExecutor)
+#   - sft:       LlamaFactory-based SFT + merge + validate + export
+#   - sft-trl:   TRL-based SFT for Qwen3.5+/newer Transformers models
+#   - grpo:      SkyRL GRPO + Ray + vLLM
 #
 # Build:
-#   docker build -t open-ctf:sft  --target sft  -f docker/Dockerfile .
-#   docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
+#   docker build -t open-ctf:sft      --target sft      -f docker/Dockerfile .
+#   docker build -t open-ctf:sft-trl  --target sft-trl  -f docker/Dockerfile .
+#   docker build -t open-ctf:grpo     --target grpo     -f docker/Dockerfile .
 #
 # Run:
 #   docker compose run --rm sft
@@ -38,33 +40,31 @@ ENV PYTHONPATH=/workspace/open-ctf-env/src:$PYTHONPATH
 # ============================================================
 FROM base AS sft
 
-RUN pip install --no-cache-dir \
-    "llamafactory>=0.9.0" \
-    "transformers>=5.0.0,!=5.1.0" \
-    "peft>=0.14.0" \
-    "accelerate>=1.4.0" \
-    "bitsandbytes>=0.48.0" \
-    "datasets>=3.0.0" \
-    "deepspeed>=0.15.0" \
-    "wandb"
+RUN pip install --no-cache-dir -e ".[sft]"
 
 CMD ["open-ctf-train", "sft", "--help"]
+
+# ============================================================
+# SFT-TRL stage — TRL backend for newer model families
+# ============================================================
+FROM base AS sft-trl
+
+RUN pip install --no-cache-dir -e ".[sft-trl]"
+
+CMD ["open-ctf-train", "sft", "--backend", "trl", "--help"]
 
 # ============================================================
 # GRPO stage — SkyRL + Ray + vLLM
 # ============================================================
 FROM base AS grpo
 
+# skyrl-train is currently source-installed from GitHub (not published on PyPI).
 RUN pip install --no-cache-dir \
+    "git+https://github.com/SkyRL-Team/SkyRL-Train.git" \
+    -e ".[grpo]" \
     "skyrl-gym>=0.1.0" \
     "ray[default]>=2.40.0" \
-    "peft>=0.14.0" \
-    "accelerate>=1.4.0" \
-    "bitsandbytes>=0.48.0" \
-    "datasets>=3.0.0" \
-    "transformers>=5.0.0,!=5.1.0" \
-    "omegaconf" "hydra-core" \
-    "wandb" "colorama"
+    "colorama"
 
 ENV BNB_CUDA_VERSION=130 \
     TORCHINDUCTOR_MAX_AUTOTUNE_PRUNE_CHOICES_BASED_ON_SHARED_MEM=1
