@@ -94,12 +94,18 @@ class TestChallengeManager:
 
     @patch("subprocess.run")
     def test_health_check_returns_true(self, mock_run, manager):
-        mock_run.return_value = MagicMock(returncode=0, stdout="200", stderr="")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="0.0.0.0:32805->1337/tcp\n", stderr=""),  # docker ps
+            MagicMock(returncode=0, stdout="200", stderr=""),  # curl
+        ]
         assert manager.health_check("eval-me") is True
 
     @patch("subprocess.run")
     def test_health_check_returns_false_on_timeout(self, mock_run, manager):
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="curl", timeout=5)
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="0.0.0.0:32805->1337/tcp\n", stderr=""),  # docker ps
+            subprocess.TimeoutExpired(cmd="curl", timeout=5),
+        ]
         assert manager.health_check("eval-me") is False
 
     @patch("subprocess.run")
@@ -145,7 +151,15 @@ class TestChallengeManager:
 
     @patch("subprocess.run")
     def test_setup_failure_raises(self, mock_run, manager):
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="container error")
+        def _run(*args, **kwargs):
+            cmd = args[0]
+            if cmd[:3] == ["docker", "network", "ls"]:
+                return MagicMock(returncode=0, stdout="shared_net\nbridge\n", stderr="")
+            if "compose" in cmd:
+                return MagicMock(returncode=1, stdout="", stderr="container error")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        mock_run.side_effect = _run
         with pytest.raises(RuntimeError, match="docker compose up failed"):
             manager.setup("eval-me")
 
@@ -259,3 +273,80 @@ class TestChallengeManager:
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         url = mgr.setup("eval-me")
         assert url == "http://localhost:32805"
+
+    @patch("subprocess.run")
+    def test_setup_preflight_fails_fast_on_unshare_block(self, mock_run, manager):
+        """Preflight should surface actionable nested-Docker error."""
+        def _run(*args, **kwargs):
+            cmd = args[0]
+            if cmd[:2] == ["docker", "info"]:
+                return MagicMock(returncode=0, stdout="OK", stderr="")
+            if cmd[:2] == ["docker", "import"]:
+                return MagicMock(
+                    returncode=1,
+                    stdout="",
+                    stderr="failed to register layer: unshare: operation not permitted",
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        mock_run.side_effect = _run
+        with pytest.raises(RuntimeError, match="nested container support"):
+            manager.setup("eval-me")
+
+    def test_benchmark_root_prefers_high_hint_coverage(self, tmp_path):
+        """When hints exist, manager should pick root with highest path-hint coverage."""
+        workspace = tmp_path / "workspace"
+        bench_dir = workspace / "benchmarks" / "cybench"
+        bench_root_partial = bench_dir / "benchmark"
+        bench_root_partial.mkdir(parents=True)
+        (bench_root_partial / "project-sekai-ctf" / "sekaictf-2023" / "crypto" / "noisier-crc").mkdir(parents=True)
+        (bench_root_partial / "project-sekai-ctf" / "sekaictf-2023" / "crypto" / "noisier-crc" / "docker-compose.yml").write_text(
+            "version: '3'\nservices:\n  app:\n    image: test"
+        )
+
+        boxpwnr_root = (
+            workspace
+            / "BoxPwnr"
+            / "src"
+            / "boxpwnr"
+            / "platforms"
+            / "cybench"
+            / "cybench-repo"
+            / "benchmark"
+        )
+        full_a = boxpwnr_root / "project-sekai-ctf" / "sekaictf-2023" / "crypto" / "noisier-crc"
+        full_b = boxpwnr_root / "project-sekai-ctf" / "sekaictf-2023" / "misc" / "just-another-pickle-jail"
+        full_a.mkdir(parents=True)
+        full_b.mkdir(parents=True)
+        (full_a / "docker-compose.yml").write_text("version: '3'\nservices:\n  app:\n    image: test")
+        (full_b / "docker-compose.yml").write_text("version: '3'\nservices:\n  app:\n    image: test")
+
+        registry_data = {
+            "challenges": [
+                {
+                    "id": "noisier-crc",
+                    "name": "noisier-crc",
+                    "category": "crypto",
+                    "difficulty": "hard",
+                    "infra_type": "docker",
+                    "port": 9999,
+                    "path_hint": "benchmark/project-sekai-ctf/sekaictf-2023/crypto/noisier-crc",
+                },
+                {
+                    "id": "just-another-pickle-jail",
+                    "name": "just-another-pickle-jail",
+                    "category": "misc",
+                    "difficulty": "hard",
+                    "infra_type": "docker",
+                    "port": 1337,
+                    "path_hint": "benchmark/project-sekai-ctf/sekaictf-2023/misc/just-another-pickle-jail",
+                },
+            ]
+        }
+        registry_path = tmp_path / "registry_hints.yaml"
+        with open(registry_path, "w") as f:
+            yaml.dump(registry_data, f)
+
+        registry = ChallengeRegistry(str(registry_path))
+        mgr = ChallengeManager(registry=registry, bench_dir=str(bench_dir))
+        assert mgr._benchmark_root() == boxpwnr_root

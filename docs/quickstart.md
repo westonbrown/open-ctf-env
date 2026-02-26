@@ -5,6 +5,7 @@ Get up and running with Open CTF Environment in minutes.
 ## Prerequisites
 
 - Docker and Docker Compose
+- If running inside another container (for example RunPod), Docker must have privileges to create networks and run nested containers (`docker network create` and `docker run` must work)
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 - An LLM backend (Ollama, llama.cpp, vLLM, or any OpenAI-compatible API)
@@ -106,14 +107,15 @@ open-ctf-train grpo \
     --model outputs/sft-merged \
     --data data/grpo.jsonl \
     --output outputs/grpo \
-    --config configs/skyrl/nanbeige_3b.yaml
+    --config src/open_ctf/configs/training.yaml
 
 # Stage 3: GEPA prompt optimization (no weight updates)
 open-ctf-train gepa \
     --model openai/ctf-agent \
     --data data/grpo.jsonl \
     --output outputs/gepa \
-    --reflection-model anthropic/claude-sonnet-4-20250514
+    --reflection-model openai/ctf-reflection \
+    --challenge-registry configs/challenges/cybench.yaml
 ```
 
 ### Export for Deployment

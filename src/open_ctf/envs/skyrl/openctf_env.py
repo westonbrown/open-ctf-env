@@ -14,6 +14,7 @@ The env receives raw LLM text output, delegates tool parsing + execution
 to the StepAgent, and computes rewards from agent state.
 """
 
+import ast
 import importlib
 import json
 import logging
@@ -61,6 +62,96 @@ _BARE_JSON_PATTERN = re.compile(
 # Thinking block pattern: <think>...</think> (Qwen3.5, Qwen3, DeepSeek-R1, etc.)
 _THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
 
+# Python-style function call fallback (e.g. shell_command(command="ls -la"))
+_PY_CALL_LINE_PATTERN = re.compile(r"^\s*([A-Za-z_]\w*)\((.*)\)\s*$")
+_TOOL_ARG_ORDER: Dict[str, List[str]] = {
+    "shell_command": ["command", "timeout"],
+    "execute_command": ["command", "timeout"],
+    "python_code": ["code", "timeout"],
+    "read_file": ["file_path", "line_numbers"],
+    "grep": ["pattern", "path", "include"],
+    "file_search": ["pattern", "path"],
+    "apply_patch": ["patch"],
+    "flag_found": ["content"],
+    "submit_flag": ["content"],
+    "web_search": ["query"],
+    "exec_command": ["cmd", "workdir", "yield_time"],
+    "write_stdin": ["session_id", "chars", "yield_time"],
+    "list_sessions": [],
+    "close_session": ["session_id"],
+}
+_KNOWN_TOOL_NAMES = set(_TOOL_ARG_ORDER.keys())
+
+
+def _coerce_scalar(raw: str) -> Any:
+    """Best-effort parse of scalar argument text."""
+    text = raw.strip()
+    if not text:
+        return ""
+    try:
+        return ast.literal_eval(text)
+    except Exception:
+        pass
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def _parse_python_style_calls(text: str) -> List[Dict[str, Any]]:
+    """Parse python-style tool calls from assistant text.
+
+    Supports lines like:
+      shell_command(command="ls -la")
+      read_file("/root/challenge/index.php")
+      flag_found(content="HTB{...}")
+    """
+    calls: List[Dict[str, Any]] = []
+    cleaned = text.replace("```python", "").replace("```json", "").replace("```", "")
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = line.lstrip("-*").strip()
+        m = _PY_CALL_LINE_PATTERN.match(line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if name not in _TOOL_ARG_ORDER:
+            continue
+        args_src = m.group(2).strip()
+        args: Dict[str, Any] = {}
+
+        # Parse kwargs/positional args robustly with AST first.
+        call_src = f"{name}({args_src})"
+        try:
+            parsed = ast.parse(call_src, mode="eval")
+            expr = parsed.body
+            if isinstance(expr, ast.Call):
+                positional = []
+                for node in expr.args:
+                    seg = ast.get_source_segment(call_src, node) or ""
+                    positional.append(_coerce_scalar(seg))
+                ordered = _TOOL_ARG_ORDER.get(name, [])
+                for idx, value in enumerate(positional):
+                    key = ordered[idx] if idx < len(ordered) else f"arg{idx}"
+                    args[key] = value
+                for kw in expr.keywords:
+                    if kw.arg is None:
+                        continue
+                    seg = ast.get_source_segment(call_src, kw.value) or ""
+                    args[kw.arg] = _coerce_scalar(seg)
+        except Exception:
+            # Fallback for malformed-but-common style: read_file(/path/file)
+            if args_src:
+                ordered = _TOOL_ARG_ORDER.get(name, [])
+                key = ordered[0] if ordered else "arg0"
+                args[key] = _coerce_scalar(args_src)
+
+        calls.append({"name": name, "arguments": args})
+
+    return calls
+
 
 def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
     """Extract tool calls from LLM output text.
@@ -90,7 +181,7 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-            if name:
+            if name in _KNOWN_TOOL_NAMES:
                 tool_calls.append({"name": name, "arguments": args})
         except json.JSONDecodeError:
             continue
@@ -110,7 +201,7 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
             except (ValueError, json.JSONDecodeError):
                 pass
             args[key] = val
-        if name:
+        if name in _KNOWN_TOOL_NAMES:
             tool_calls.append({"name": name, "arguments": args})
 
     if tool_calls:
@@ -128,7 +219,7 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
             except (ValueError, json.JSONDecodeError):
                 pass
             args[key] = val
-        if name:
+        if name in _KNOWN_TOOL_NAMES:
             tool_calls.append({"name": name, "arguments": args})
 
     if tool_calls:
@@ -141,8 +232,16 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
             args = json.loads(m.group(2))
         except json.JSONDecodeError:
             args = {}
-        if name:
+        if name in _KNOWN_TOOL_NAMES:
             tool_calls.append({"name": name, "arguments": args})
+
+    if tool_calls:
+        return tool_calls
+
+    # 5. Python-style fallback (common in BoxPwnr-authored prompts)
+    tool_calls = _parse_python_style_calls(text)
+    if tool_calls:
+        return tool_calls
 
     return tool_calls
 
@@ -247,15 +346,22 @@ class OpenCTFTextEnv(_Base):
         )
 
         # Reconstruct reward function from serializable config dict.
-        reward_config = kwargs.get("reward_config") or extras.get("reward_config")
-        if reward_config and isinstance(reward_config, dict):
-            try:
-                from open_ctf.training.step_reward import create_reward_fn
-                self._reward_fn = create_reward_fn({"reward": reward_config})
-            except Exception as exc:
-                logger.warning("Failed to create reward function: %s — using binary fallback", exc)
-                self._reward_fn = None
-        else:
+        # If reward_config is missing/empty, use CTFReward defaults instead of
+        # silently falling back to binary terminal reward.
+        reward_config = kwargs.get("reward_config", extras.get("reward_config", {}))
+        if reward_config is None:
+            reward_config = {}
+        if not isinstance(reward_config, dict):
+            logger.warning(
+                "Invalid reward_config type %s; using CTFReward defaults.",
+                type(reward_config).__name__,
+            )
+            reward_config = {}
+        try:
+            from open_ctf.training.step_reward import create_reward_fn
+            self._reward_fn = create_reward_fn({"reward": reward_config})
+        except Exception as exc:
+            logger.warning("Failed to create reward function: %s — using binary fallback", exc)
             self._reward_fn = None
 
         # Per-episode data (set from dataset sample extras)
@@ -265,6 +371,33 @@ class OpenCTFTextEnv(_Base):
 
         # Target URL for the challenge
         self._target: str = extras.get("target", kwargs.get("target", ""))
+
+        # Trajectory logging (optional, for post-run analysis).
+        # The output_dir is a plain string path, not a logger object, because
+        # this must be serializable through Ray. Each env worker creates its
+        # own TrajectoryLogger instance writing to the shared output dir.
+        self._trajectory_output_dir: Optional[str] = (
+            kwargs.get("trajectory_output_dir")
+            or extras.get("trajectory_output_dir")
+        )
+        self._trajectory_logger = None
+        if self._trajectory_output_dir:
+            try:
+                from open_ctf.training.trajectory_logger import TrajectoryLogger
+                self._trajectory_logger = TrajectoryLogger(
+                    self._trajectory_output_dir, enabled=True
+                )
+            except Exception as exc:
+                logger.warning("Failed to create TrajectoryLogger: %s", exc)
+
+        # Global step counter (set from env extras per sample).
+        self._global_step: int = extras.get("global_step", 0)
+        self._generation_idx: int = extras.get("generation_idx", 0)
+        # Challenge metadata for logging
+        self._category: Optional[str] = extras.get("category")
+        self._difficulty: Optional[str] = extras.get("difficulty")
+        # Prompt messages for logging (set in init())
+        self._prompt_messages: Optional[list] = None
 
         # Resolve and create the pluggable StepAgent.
         # agent_class is a dotted path string (Ray-safe serialization).
@@ -327,6 +460,9 @@ class OpenCTFTextEnv(_Base):
         # may pass tools= to apply_chat_template for structured tool calling,
         # but for text-based parsing the model needs schemas in the prompt.
         prompt = self._inject_tool_schemas(prompt)
+
+        # Capture prompt for trajectory logging (shallow copy to avoid mutation).
+        self._prompt_messages = list(prompt)
 
         logger.debug(
             "OpenCTFTextEnv initialized: challenge=%s",
@@ -398,11 +534,35 @@ class OpenCTFTextEnv(_Base):
         # Find or create system message
         if prompt and prompt[0].get("role") == "system":
             sys_content = prompt[0].get("content", "")
-            # Skip if tool schemas already present
-            if "# Available Tools" not in sys_content:
+            # Skip if tool schemas already present (check multiple variants:
+            # "# Available Tools" from our injection, "Available tools:" from
+            # GRPO training data system prompts, "<tools>" from Nanbeige/Qwen
+            # native format).  Prevents double injection that wastes ~800
+            # context tokens.
+            has_tools = (
+                "# Available Tools" in sys_content
+                or "Available tools:" in sys_content
+                or "Available tools\n" in sys_content
+                or "<tools>" in sys_content
+            )
+            has_format_instruction = (
+                "Call tools using:" in sys_content
+                or "<tool_call>" in sys_content
+            )
+            if not has_tools:
                 prompt[0] = {
                     **prompt[0],
                     "content": sys_content + tools_block,
+                }
+            elif not has_format_instruction:
+                prompt[0] = {
+                    **prompt[0],
+                    "content": (
+                        sys_content
+                        + "\n\n# Tool Call Format\n\n"
+                        + fmt_instruction
+                        + "\n"
+                    ),
                 }
         else:
             # No system message — prepend one with tool schemas
@@ -433,6 +593,23 @@ class OpenCTFTextEnv(_Base):
         reward = self._compute_reward(done)
 
         if done:
+            # Minimal episode-level logging for diagnostics (avoid huge payloads).
+            tool_calls = getattr(self._agent, "tool_calls_history", [])
+            tool_outputs = getattr(self._agent, "tool_outputs", [])
+            last_calls = [tc.get("name", "") for tc in tool_calls[-5:]]
+            last_outputs = [out[:200] for out in tool_outputs[-3:]]
+            logger.info(
+                "Episode done: challenge=%s target=%s steps=%s tool_calls=%s unique_tools=%s flag_found=%s "
+                "last_tools=%s last_outputs=%s",
+                self._challenge_id,
+                self._target,
+                self.turns,
+                len(tool_calls),
+                len(set(tc.get("name", "") for tc in tool_calls)),
+                getattr(self._agent, "episode_done", False),
+                last_calls,
+                last_outputs,
+            )
             return {
                 "observations": [],
                 "reward": reward,
@@ -467,6 +644,9 @@ class OpenCTFTextEnv(_Base):
             )
 
         # Terminal: compute full reward
+        reward = 0.0
+        breakdown = None
+
         if self._reward_fn is not None:
             completion_msgs = []
             for i, tc in enumerate(tool_calls_history):
@@ -491,15 +671,110 @@ class OpenCTFTextEnv(_Base):
                 "content": all_text,
             })
 
-            rewards = self._reward_fn(
-                completions=[completion_msgs],
-                ground_truth_flag=[self._ground_truth_flag],
-                optimal_steps=[self._optimal_steps],
-            )
-            return rewards[0] if rewards else 0.0
+            # Use compute_with_breakdown if available for trajectory logging.
+            if self._trajectory_logger and hasattr(self._reward_fn, "compute_with_breakdown"):
+                results = self._reward_fn.compute_with_breakdown(
+                    completions=[completion_msgs],
+                    ground_truth_flag=[self._ground_truth_flag],
+                    optimal_steps=[self._optimal_steps],
+                )
+                if results:
+                    reward, breakdown = results[0]
+            else:
+                rewards = self._reward_fn(
+                    completions=[completion_msgs],
+                    ground_truth_flag=[self._ground_truth_flag],
+                    optimal_steps=[self._optimal_steps],
+                )
+                reward = rewards[0] if rewards else 0.0
+        else:
+            # Fallback: binary flag reward
+            reward = 1.0 if episode_done else 0.0
 
-        # Fallback: binary flag reward
-        return 1.0 if episode_done else 0.0
+        # Log trajectory data when episode ends.
+        self._log_episode_trajectory(
+            reward_total=reward,
+            reward_breakdown=breakdown,
+            tool_calls_history=tool_calls_history,
+            tool_outputs=tool_outputs,
+            all_text=all_text,
+            episode_done=episode_done,
+        )
+
+        return reward
+
+    def _log_episode_trajectory(
+        self,
+        reward_total: float,
+        reward_breakdown: Optional[Dict[str, float]],
+        tool_calls_history: list,
+        tool_outputs: list,
+        all_text: str,
+        episode_done: bool,
+    ) -> None:
+        """Log episode trajectory and update challenge scoreboard."""
+        if not self._trajectory_logger:
+            return
+
+        try:
+            # Build structured tool call list for logging
+            logged_tool_calls = []
+            for i, tc in enumerate(tool_calls_history):
+                entry = {
+                    "name": tc.get("name", ""),
+                    "args": tc.get("arguments", ""),
+                }
+                if i < len(tool_outputs):
+                    # Truncate long outputs to avoid huge JSONL files
+                    output = tool_outputs[i]
+                    if len(output) > 2000:
+                        output = output[:2000] + "... [truncated]"
+                    entry["output"] = output
+                logged_tool_calls.append(entry)
+
+            # Detect flag_submitted from tool calls
+            flag_submitted = None
+            for tc in tool_calls_history:
+                if tc.get("name") in ("flag_found", "submit_flag"):
+                    try:
+                        args = tc.get("arguments", "")
+                        if isinstance(args, str):
+                            import json as _json
+                            args = _json.loads(args)
+                        flag_submitted = args.get("content", "") if isinstance(args, dict) else str(args)
+                    except Exception:
+                        flag_submitted = str(tc.get("arguments", ""))
+
+            self._trajectory_logger.log_generation(
+                global_step=self._global_step,
+                generation_idx=self._generation_idx,
+                challenge_id=self._challenge_id,
+                category=self._category,
+                difficulty=self._difficulty,
+                target=self._target,
+                prompt_messages=self._prompt_messages,
+                model_output=all_text,
+                tool_calls=logged_tool_calls,
+                reward_total=reward_total,
+                reward_breakdown=reward_breakdown,
+                flag_found=episode_done,
+                flag_submitted=flag_submitted,
+                ground_truth_flag=self._ground_truth_flag,
+                response_length=len(all_text),
+                num_tool_calls=len(tool_calls_history),
+            )
+
+            # Update challenge scoreboard
+            if self._challenge_id:
+                self._trajectory_logger.log_challenge_result(
+                    challenge_id=self._challenge_id,
+                    category=self._category,
+                    difficulty=self._difficulty,
+                    reward=reward_total,
+                    flag_found=episode_done,
+                )
+        except Exception as exc:
+            logger.warning("Trajectory logging failed: %s", exc)
 
     def close(self):
         """Close the episode and release resources."""

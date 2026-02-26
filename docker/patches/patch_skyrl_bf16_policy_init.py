@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Patch SkyRL fsdp_worker.py to use configurable bf16 for policy model init.
+"""Patch SkyRL fsdp_worker.py to use configurable bf16 for train-time workers.
 
-Problem: FSDPPolicyWorkerBase.init_model() hardcodes bf16=False for the policy model,
-forcing fp32 initialization (~12GB for a 3B model vs ~6GB in bf16). Combined with
-FSDP state dict copies and vLLM allocation, this causes OOM on memory-constrained
-systems like DGX Spark GB10.
+Problem:
+SkyRL hardcodes ``bf16=False`` in policy/critic init callsites, forcing fp32
+initialization and causing large transient memory spikes during FSDP2 state
+loading.
 
-Fix: Change `bf16=False` to `bf16=self.cfg.trainer.bf16` for the policy model init.
-The ref model (line 363) already uses configurable bf16.
+Fix:
+Rewrite ``bf16=False`` to ``bf16=self.cfg.trainer.bf16`` only inside
+``FSDPPolicyWorkerBase`` and ``FSDPCriticWorkerBase``. Keep ref-worker behavior
+unchanged.
 """
 import pathlib
 
@@ -22,21 +24,36 @@ def main():
 
     content = WORKER_PATH.read_text()
     lines = content.splitlines()
+    target_classes = {"FSDPPolicyWorkerBase", "FSDPCriticWorkerBase"}
+    current_class = None
+    changed_lines = []
 
-    if "bf16=self.cfg.trainer.bf16" in content:
-        print("   Patch (bf16 policy init): already applied")
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("class ") and "(" in stripped:
+            current_class = stripped.split()[1].split("(")[0]
+
+        if (
+            current_class in target_classes
+            and "bf16=False" in line
+        ):
+            lines[idx] = line.replace(
+                "bf16=False",
+                "bf16=self.cfg.trainer.bf16",
+                1,
+            )
+            changed_lines.append(idx + 1)
+
+    if changed_lines:
+        WORKER_PATH.write_text("\n".join(lines) + "\n")
+        print(
+            "   Patch (bf16 policy init): APPLIED at lines "
+            + ", ".join(str(n) for n in changed_lines)
+        )
         return
 
-    # Patch only the first policy-model occurrence to avoid changing ref-model behavior.
-    for i, line in enumerate(lines):
-        if "bf16=False" in line:
-            lines[i] = line.replace("bf16=False", "bf16=self.cfg.trainer.bf16", 1)
-            WORKER_PATH.write_text("\n".join(lines) + "\n")
-            print(f"   Patch (bf16 policy init): APPLIED at line {i + 1}")
-            return
-
-    # Upstream may have already refactored this callsite.
-    print("   Patch (bf16 policy init): no matching pattern found, skipping")
+    # Idempotent pass: nothing left to rewrite in targeted classes.
+    print("   Patch (bf16 policy init): already applied or pattern not found")
 
 
 if __name__ == "__main__":

@@ -187,51 +187,56 @@ GRPO uses **SkyRL** to optimize for flag capture efficiency with live tool execu
 
 ```bash
 open-ctf-train grpo \
-    --model outputs/sft-merged \
-    --data data/grpo.jsonl \
-    --output outputs/grpo \
-    --config configs/skyrl/glm47_flash.yaml
+    --model outputs/sft-qwen35-merged \
+    --data data/grpo_cybench40.jsonl \
+    --output outputs/grpo-qwen35 \
+    --config src/open_ctf/configs/training_qwen35_27b.yaml \
+    --challenge-registry configs/challenges/cybench.yaml
+```
+
+For remote challenge infrastructure (for example DGX containers tunneled to RunPod), generate a live challenge target map on the challenge host and pass it to GRPO:
+
+```bash
+# On the host running challenge containers (DGX)
+PYTHONPATH=src python3 scripts/generate_live_target_map.py \
+    --registry configs/challenges/cybench.yaml \
+    --benchmark-root /workspace/cybench \
+    --port-offset 10200 \
+    --output /tmp/cybench_targets.json
+
+# On the trainer host (RunPod)
+OPEN_CTF_TARGET_MAP_PATH=/tmp/cybench_targets.json \
+open-ctf-train grpo \
+    --model outputs/sft-qwen35-merged \
+    --data data/grpo_cybench40.jsonl \
+    --output outputs/grpo-qwen35 \
+    --config src/open_ctf/configs/training_qwen35_27b.yaml \
+    --challenge-registry configs/challenges/cybench.yaml
 ```
 
 ### Configuration
 
-GRPO configs live in `configs/skyrl/`:
+The GRPO launch profiles in this repo are the `src/open_ctf/configs/training*.yaml` files:
 
 | Model | Config | Placement | Notes |
 |-------|--------|-----------|-------|
-| **Nanbeige4.1-3B** | `nanbeige_3b.yaml` | `colocate_all: true` | Dense, fast iteration |
-| **GLM-4.7-Flash** | `glm47_flash.yaml` | `colocate_all: true` | MoE safe default |
+| **Qwen3.5-27B (current RunPod/B200 baseline)** | `src/open_ctf/configs/training_qwen35_27b.yaml` | `run_engines_locally: true`, `colocate_all: false` | Trainer and vLLM on separate GPUs |
+| **Nanbeige4.1-3B (legacy baseline)** | `src/open_ctf/configs/training.yaml` | `vllm_mode: colocate` | Single-GPU fallback profile |
 
-Example config (`configs/skyrl/nanbeige_3b.yaml`):
+Example generated SkyRL topology (from `training_qwen35_27b.yaml`):
 
 ```yaml
 trainer:
-  strategy: fsdp2
-  bf16: true
-  gradient_checkpointing: true
-  train_batch_size: 1
-  max_prompt_length: 32768
   placement:
-    colocate_all: true
-  policy:
-    model:
-      path: outputs/sft-merged/
-      lora:
-        rank: 64
-        alpha: 128
-    optimizer_config:
-      lr: 5.0e-6
-  algorithm:
-    advantage_estimator: rloo_n
-    kl_loss_coef: 0.0
+    colocate_all: false
 
 generator:
+  run_engines_locally: true
   backend: vllm
-  n_samples_per_prompt: 8
-  max_turns: 50
+  n_samples_per_prompt: 2
+  max_turns: 60
   sampling_params:
     max_generate_length: 8192
-    temperature: 1.0
 
 environment:
   env_class: openctf
@@ -239,16 +244,18 @@ environment:
 
 ### Reward Function
 
-The CTF reward scores completions on **6 signals + 1 penalty**:
+The CTF reward scores completions on **8 signals + 1 penalty**:
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
 | **Flag Capture** | 0.20 | Exact match (1.0) or pattern match (0.1) |
-| **Efficiency** | 0.25 | `min(optimal / actual, 1.0)` |
-| **Format** | 0.20 | Valid tool call JSON structure |
-| **Progression** | 0.15 | RECON → ENUM → EXPLOIT phase ordering |
-| **Exploration** | 0.10 | Novel tool usage weighted toward early trajectory |
-| **Uniqueness** | 0.10 | Command diversity (detects stuck loops) |
+| **Efficiency** | 0.20 | `min(optimal / actual, 1.0)` |
+| **Progression** | 0.12 | RECON → ENUM → EXPLOIT phase ordering |
+| **Exploration** | 0.08 | Novel tool usage weighted toward early trajectory |
+| **Uniqueness** | 0.08 | Command diversity (detects stuck loops) |
+| **Format** | 0.15 | Valid tool call structure and schema compliance |
+| **Recovery** | 0.07 | Recovery after failed commands |
+| **Cognitive** | 0.10 | Coherent reasoning/execution progression |
 | **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag (decayed by similarity) |
 
 All process signals are ungated -- they provide gradient signal regardless of flag capture.
@@ -258,11 +265,11 @@ All process signals are ungated -- they provide gradient signal regardless of fl
 | Parameter | Recommended | Notes |
 |-----------|-------------|-------|
 | `lr` | 5e-6 | Much lower than SFT to avoid instability |
-| `n_samples_per_prompt` | 8 | Completions per prompt for ranking |
-| `max_turns` | 50 | Tool-calling iterations per generation |
+| `n_samples_per_prompt` | 2 (Qwen3.5-27B) | Better wall-clock throughput on dual-B200 while retaining group-relative signal |
+| `max_turns` | 60 | Tool-calling iterations per generation for long-horizon trajectories |
 | `max_generate_length` | 8192 | Per-turn generation limit |
-| `colocate_all` | true | Safe default, avoids weight sync issues |
-| `advantage_estimator` | rloo_n | RLOO-N (OpenThoughts-aligned) |
+| `run_engines_locally` + `colocate_all` | `true` + `false` | Working LoRA-safe topology on RunPod B200 |
+| `advantage_estimator` | `rloo` | Stable with current SkyRL runtime |
 | `kl_loss_coef` | 0.0 | No KL penalty (pure DAPO) |
 
 ### SkyRL Architecture
@@ -272,20 +279,116 @@ SkyRL uses Ray actors for fully async GRPO:
 - **Generator**: vLLM inference engine produces completions in a separate process.
 - **Trainer**: FSDP2 handles distributed training with gradient checkpointing.
 - **Environment**: `OpenCTFTextEnv` (in `src/open_ctf/envs/skyrl/openctf_env.py`) bridges SkyRL and the `ToolExecutor` via direct subprocess calls. No HTTP server.
-- **Placement**: `colocate_all: true` offloads weights to CPU between gen/train phases. Slower but eliminates all weight sync bugs for MoE models.
+- **Placement**: Current Qwen3.5 production profile uses `run_engines_locally: true` + `colocate_all: false` so trainer and vLLM can be pinned to separate GPUs.
 
 ## Stage 3: GEPA (Prompt Evolution)
 
-GEPA optimizes the system prompt without changing model weights. It uses DSPy's reflective agent pattern with Pareto-based candidate selection.
+GEPA optimizes the system prompt without changing model weights. It uses DSPy's reflective agent pattern with Pareto-based candidate selection. Both the agent LM and the reflection LM default to the **same model** — no cloud APIs required. Both can point at a local vLLM server.
+
+### How GEPA Improves Over Time
+
+```
+Iteration 1:
+  Seed Prompt → Evaluate on minibatch (3 challenges) → Score each [0.8, 0.2, 0.5]
+       ↓
+  Reflection LM analyzes traces: "Agent found IDOR but never enumerated IDs"
+       ↓
+  Mutation: "When you discover an ID parameter, enumerate nearby IDs (±20)"
+       ↓
+  Candidate Prompt v1.1
+
+Iteration 2:
+  Evaluate BOTH prompts on next minibatch
+  Seed:   [0.3, 0.7, 0.4]
+  v1.1:   [0.6, 0.7, 0.8]  ← better on challenges A and C
+       ↓
+  Pareto Selection: v1.1 dominates seed → seed dropped
+       ↓
+Iteration 3...N:
+  Reflect on v1.1 failures → v1.2, v1.3 → Evaluate → Pareto select → repeat
+```
+
+Pareto selection keeps prompts that excel at **different challenges** (non-dominated solutions), avoiding local optima. The final output is the prompt with the best average score.
 
 ### Quick Start
 
 ```bash
+# Default: agent and reflection LM are the same local model
+# Set OPENAI_API_BASE=http://localhost:8001/v1 to point at local vLLM
+open-ctf-train gepa \
+    --model openai/ctf-agent \
+    --data data/grpo.jsonl \
+    --output outputs/gepa
+
+# Stronger reflection: serve a larger model on a separate port
 open-ctf-train gepa \
     --model openai/ctf-agent \
     --data data/grpo.jsonl \
     --output outputs/gepa \
-    --reflection-model anthropic/claude-sonnet-4-20250514
+    --reflection-model openai/larger-model
+
+# Custom agent mode: wrap any CTFAgent in a DSPy Module
+open-ctf-train gepa \
+    --model openai/ctf-agent \
+    --data data/grpo.jsonl \
+    --output outputs/gepa \
+    --agent my_module.MyAgent \
+    --challenge-registry configs/challenges/cybench.yaml \
+    --budget heavy
+```
+
+When `--agent` is set, GEPA wraps the CTFAgent in a `CTFAgentDSPyAdapter` so the DSPy optimizer can evolve the system prompt while the agent handles generation and tool execution.
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | (required) | LLM model id for `dspy.LM` (local vLLM recommended) |
+| `--data` | (required) | Path to GRPO JSONL data (challenges) |
+| `--output` | (required) | Output directory for optimized prompt |
+| `--reflection-model` | same as `--model` | LLM for reflection. For stronger mutations, use a larger local model. |
+| `--budget` | `medium` | Budget preset: `light`, `medium`, or `heavy` |
+| `--agent` | `None` | Dotted path to a CTFAgent class (e.g. `my_module.MyAgent`) |
+| `--challenge-registry` | `None` | Path to challenge registry YAML for target URL resolution |
+| `--val-data` | `None` | Validation JSONL (separate from train) |
+| `--max-samples` | `None` | Max training examples |
+
+### Configuration
+
+GEPA settings live in the `gepa:` section of `training.yaml`:
+
+```yaml
+gepa:
+  seed_prompt: null              # Override default CTF agent prompt (null = use built-in)
+  reflection_model: null         # Reflection LM (null = same as agent model)
+  max_iters: 20                  # Max tool-calling iterations per challenge
+  reflection_minibatch_size: 3   # Samples per GEPA reflection batch
+  seed: 42
+  budget: light                  # Budget preset: light / medium / heavy
+  num_threads: 1                 # Parallel challenge evaluations (1 = sequential)
+```
+
+### Two LMs, Two Roles
+
+| Role | Temperature | Max Tokens | Purpose |
+|------|-------------|------------|---------|
+| **Agent LM** | 0.7 | 4,096 | Solves CTF challenges (tool calls) |
+| **Reflection LM** | 1.0 | 32,000 | Analyzes traces, proposes prompt mutations |
+
+The higher temperature on the reflection LM encourages diverse prompt mutations. Both default to the same model. For better results, serve a larger model for reflection on a separate vLLM port:
+
+```bash
+# GPU 0: Agent model (fast, smaller)
+vllm serve my-3b-model --port 8001
+
+# GPU 1: Reflection model (smarter, larger)
+vllm serve my-27b-model --port 8002
+```
+
+Then configure:
+```yaml
+gepa:
+  reflection_model: "openai/my-27b-model"  # points to port 8002
 ```
 
 GEPA can run in offline mode (stub tools, scores structure) or online mode (real tools, scores flag capture). Online mode uses the same ToolExecutor as GRPO.
@@ -305,10 +408,10 @@ open-ctf-train merge --adapter outputs/sft --base-model Nanbeige/Nanbeige4.1-3B 
 
 # 4. GRPO
 open-ctf-train grpo --model outputs/sft-merged --data data/grpo.jsonl --output outputs/grpo \
-    --config configs/skyrl/nanbeige_3b.yaml
+    --config src/open_ctf/configs/training.yaml
 
-# 5. GEPA (optional)
-open-ctf-train gepa --model outputs/grpo/final --output outputs/gepa
+# 5. GEPA (optional — same model for agent + reflection, no cloud APIs)
+open-ctf-train gepa --model openai/ctf-agent --data data/grpo.jsonl --output outputs/gepa
 
 # 6. Export
 open-ctf-export --adapter outputs/grpo/final --base-model Nanbeige/Nanbeige4.1-3B --output models/ctf-agent.gguf --quant Q4_K_M

@@ -14,7 +14,11 @@ from unittest.mock import patch
 
 # We test the CLI parser directly by importing main() and intercepting parse_args.
 # This avoids launching subprocess or importing heavy dependencies (torch, peft, etc.)
-from open_ctf.cli.train import main, _patch_merged_config_for_vllm
+from open_ctf.cli.train import (
+    main,
+    _patch_merged_config_for_vllm,
+    _patch_merged_tokenizer_config,
+)
 
 
 def _parse_args(argv):
@@ -52,6 +56,8 @@ def _parse_args(argv):
         gepa_p.add_argument("--reflection-model", default=None)
         gepa_p.add_argument("--budget", choices=["light", "medium", "heavy"], default="medium")
         gepa_p.add_argument("--max-samples", type=int, default=None)
+        gepa_p.add_argument("--challenge-registry", default=None)
+        gepa_p.add_argument("--agent", default=None)
 
         merge_p = subparsers.add_parser("merge")
         merge_p.add_argument("--adapter", required=True)
@@ -186,6 +192,32 @@ class TestGEPAParser:
         ])
         assert args.max_samples == 100
 
+    def test_gepa_with_agent(self):
+        args = _parse_args([
+            "gepa", "--model", "m", "--data", "/d.jsonl",
+            "--output", "/out", "--agent", "my_module.MyAgent",
+        ])
+        assert args.agent == "my_module.MyAgent"
+
+    def test_gepa_with_challenge_registry(self):
+        args = _parse_args([
+            "gepa", "--model", "m", "--data", "/d.jsonl",
+            "--output", "/out", "--challenge-registry", "/path/to/registry.yaml",
+        ])
+        assert args.challenge_registry == "/path/to/registry.yaml"
+
+    def test_gepa_agent_defaults_to_none(self):
+        args = _parse_args([
+            "gepa", "--model", "m", "--data", "/d.jsonl", "--output", "/out",
+        ])
+        assert args.agent is None
+
+    def test_gepa_challenge_registry_defaults_to_none(self):
+        args = _parse_args([
+            "gepa", "--model", "m", "--data", "/d.jsonl", "--output", "/out",
+        ])
+        assert args.challenge_registry is None
+
 
 # ---------------------------------------------------------------------------
 # Merge subcommand
@@ -266,6 +298,47 @@ class TestMergeConfigPatch:
         changed = _patch_merged_config_for_vllm(str(base_dir), str(out_dir))
         assert changed is False
         assert not (out_dir / "config.text_backup.json").exists()
+
+    def test_patch_merged_tokenizer_config_replaces_tokenizers_backend(self, tmp_path):
+        base_dir = tmp_path / "base"
+        out_dir = tmp_path / "out"
+        base_dir.mkdir()
+        out_dir.mkdir()
+
+        base_tok_cfg = {
+            "tokenizer_class": "Qwen2TokenizerFast",
+            "clean_up_tokenization_spaces": False,
+        }
+        merged_tok_cfg = {
+            "tokenizer_class": "TokenizersBackend",
+            "clean_up_tokenization_spaces": False,
+        }
+
+        (base_dir / "tokenizer_config.json").write_text(json.dumps(base_tok_cfg))
+        (out_dir / "tokenizer_config.json").write_text(json.dumps(merged_tok_cfg))
+
+        changed = _patch_merged_tokenizer_config(str(base_dir), str(out_dir))
+        assert changed is True
+        assert (out_dir / "tokenizer_config.text_backup.json").exists()
+        patched = json.loads((out_dir / "tokenizer_config.json").read_text())
+        assert patched["tokenizer_class"] == "Qwen2TokenizerFast"
+
+    def test_patch_merged_tokenizer_config_noop_when_already_compatible(self, tmp_path):
+        base_dir = tmp_path / "base"
+        out_dir = tmp_path / "out"
+        base_dir.mkdir()
+        out_dir.mkdir()
+
+        tok_cfg = {
+            "tokenizer_class": "Qwen2TokenizerFast",
+            "clean_up_tokenization_spaces": False,
+        }
+        (base_dir / "tokenizer_config.json").write_text(json.dumps(tok_cfg))
+        (out_dir / "tokenizer_config.json").write_text(json.dumps(tok_cfg))
+
+        changed = _patch_merged_tokenizer_config(str(base_dir), str(out_dir))
+        assert changed is False
+        assert not (out_dir / "tokenizer_config.text_backup.json").exists()
 
 
 # ---------------------------------------------------------------------------

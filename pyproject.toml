@@ -55,11 +55,19 @@ sft-trl = [
 # NOTE: skyrl-train is NOT on PyPI. Install from source:
 #   pip install git+https://github.com/SkyRL-Team/SkyRL-Train.git
 # Qwen3.5-27B requires transformers>=5.2.0, accelerate>=1.4.0 (FSDP2).
+# Failure mode to avoid: having only flash_attn installed is not enough for
+# Qwen3.5 hybrid linear-attention blocks. Missing `fla`/`causal_conv1d`
+# triggers torch fallback kernels (`torch_chunk_gated_delta_rule`) that have
+# caused illegal memory access crashes in online GRPO.
 grpo = [
     "skyrl-gym>=0.1.0",
     "ray[default]>=2.40.0",
     "torch>=2.5.0",
     "transformers>=5.2.0",
+    # Qwen3.5 linear-attention fast path dependencies (module imports: fla, causal_conv1d)
+    # Pin known-good versions for SkyRL GRPO on CUDA 12.x hosts.
+    "flash-linear-attention==0.4.1; sys_platform == 'linux'",
+    "causal-conv1d==1.6.0; sys_platform == 'linux'",
     "peft>=0.15.0",
     "accelerate>=1.4.0",
     "omegaconf",
@@ -103,6 +111,12 @@ packages = ["src/open_ctf"]
 dev-dependencies = [
     "pytest",
     "ruff",
+]
+# Keep Qwen3.5 linear-attention deps at known-good minimums for Linux GRPO
+# envs, so fresh resolves don't silently downgrade below crash-fixed baseline.
+constraint-dependencies = [
+    "flash-linear-attention==0.4.1; sys_platform == 'linux'",
+    "causal-conv1d==1.6.0; sys_platform == 'linux'",
 ]
 # SFT and GRPO/merge extras have incompatible transformers versions:
 #   SFT (LlamaFactory) pins transformers ≤4.57.1

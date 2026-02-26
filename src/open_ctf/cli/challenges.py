@@ -37,19 +37,23 @@ def cmd_setup(args: argparse.Namespace) -> None:
         host=args.host,
     )
 
-    if args.id:
-        url = manager.setup(args.id)
-        print(f"  {args.id}: {url}")
-        if manager.health_check(args.id):
-            print(f"  Health check: OK")
+    try:
+        if args.id:
+            url = manager.setup(args.id)
+            print(f"  {args.id}: {url}")
+            if manager.health_check(args.id):
+                print(f"  Health check: OK")
+            else:
+                print(f"  Health check: PENDING (service may still be starting)")
         else:
-            print(f"  Health check: PENDING (service may still be starting)")
-    else:
-        results = manager.setup_all()
-        for cid, url in results.items():
-            status = "OK" if manager.health_check(cid) else "PENDING"
-            print(f"  {cid}: {url} [{status}]")
-        print(f"\nLaunched {len(results)} challenges")
+            results = manager.setup_all()
+            for cid, url in results.items():
+                status = "OK" if manager.health_check(cid) else "PENDING"
+                print(f"  {cid}: {url} [{status}]")
+            print(f"\nLaunched {len(results)} challenges")
+    except Exception as exc:
+        logger.error("Challenge setup failed: %s", exc)
+        raise SystemExit(1)
 
 
 def cmd_status(args: argparse.Namespace) -> None:

@@ -438,8 +438,8 @@ def _step(tool_name: str, arguments: dict) -> str:
     stderr = resp.get("stderr", "")
     done = resp.get("done", False)
 
-    # Detect successful flag submission
-    if done or (tool_name == "flag_found" and "Correct!" in stdout):
+    # Detect successful episode completion from executor signal only.
+    if done:
         _set_episode_done(True)
         logger.info(
             "Episode done after %d steps (flag submitted via %s)",

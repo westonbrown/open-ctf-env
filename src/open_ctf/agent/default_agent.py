@@ -37,6 +37,9 @@ class DefaultStepAgent:
         self._executor = None
         self._executor_type: str = kwargs.get("executor_type", "subprocess")
         self._executor_kwargs: Dict[str, Any] = kwargs
+        self.max_consecutive_no_tool_calls: int = int(
+            kwargs.get("max_consecutive_no_tool_calls", 3)
+        )
 
         # Episode state (exposed as properties for reward computation)
         self.tool_calls_history: List[Dict[str, str]] = []
@@ -45,6 +48,7 @@ class DefaultStepAgent:
         self.episode_done: bool = False
         self.turns: int = 0
         self.max_steps: int = 30
+        self._consecutive_no_tool_calls: int = 0
 
     def reset(
         self,
@@ -88,6 +92,7 @@ class DefaultStepAgent:
         self.episode_done = False
         self.turns = 0
         self.max_steps = max_steps
+        self._consecutive_no_tool_calls = 0
 
     def step(self, action: str) -> StepResult:
         """Parse tool calls from LLM output and execute them.
@@ -103,17 +108,34 @@ class DefaultStepAgent:
         tool_calls = parse_tool_calls(action)
 
         if not tool_calls:
+            self._consecutive_no_tool_calls += 1
             # No tool calls — model just generated text.
-            done = self.turns >= self.max_steps
+            done = (
+                self.turns >= self.max_steps
+                or self._consecutive_no_tool_calls >= self.max_consecutive_no_tool_calls
+            )
             if done:
-                return StepResult(observations=[], done=True, info={"tool_calls": 0, "step": self.turns})
+                return StepResult(
+                    observations=[],
+                    done=True,
+                    info={
+                        "tool_calls": 0,
+                        "step": self.turns,
+                        "consecutive_no_tool_calls": self._consecutive_no_tool_calls,
+                    },
+                )
             return StepResult(
                 observations=[
                     {"role": "user", "content": "No tool call detected. Use a tool to make progress."}
                 ],
                 done=False,
-                info={"tool_calls": 0, "step": self.turns},
+                info={
+                    "tool_calls": 0,
+                    "step": self.turns,
+                    "consecutive_no_tool_calls": self._consecutive_no_tool_calls,
+                },
             )
+        self._consecutive_no_tool_calls = 0
 
         # Execute each tool call via executor
         obs_messages: List[Dict[str, str]] = []
@@ -145,14 +167,25 @@ class DefaultStepAgent:
                 self.tool_outputs.append(output)
                 self.all_text += "\n" + output
 
-                # Check for flag submission success
-                if env_done or (tc["name"] == "flag_found" and "correct" in stdout.lower()):
+                # Mark episode completion only from explicit tool signal.
+                # String matching on stdout is unsafe (e.g. "Incorrect submission").
+                if env_done:
                     self.episode_done = True
-                    logger.info("Episode done at step %d (flag submitted)", self.turns)
+                    logger.info("Episode done at step %d (tool signaled completion)", self.turns)
 
+            # Wrap tool output in <tool_response> tags to match what ChatML
+            # models expect (Nanbeige4.1-3B, Qwen3, Qwen3.5).  The tokenizer
+            # chat template detects <tool_response> in user messages and treats
+            # them as tool results rather than human queries, enabling correct
+            # multi-turn tool-use handling and thinking-block management.
             obs_messages.append({
                 "role": "user",
-                "content": f"[Tool: {tc['name']}]\n{output}",
+                "content": (
+                    f"<tool_response>\n"
+                    f"[Tool: {tc['name']}]\n"
+                    f"{output}\n"
+                    f"</tool_response>"
+                ),
             })
 
         done = self.episode_done or self.turns >= self.max_steps

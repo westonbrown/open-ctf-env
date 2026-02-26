@@ -75,3 +75,23 @@ def test_glm4_tool_call_format():
 
     assert "<arg_key>" in sys_content, "GLM4 format instruction not injected."
     assert '"name": "tool_name"' not in sys_content, "Hermes instruction leaked into GLM4 format."
+
+
+def test_existing_tool_list_still_gets_format_instruction():
+    """If prompt already has an Available tools list, inject format guidance only."""
+    env = OpenCTFTextEnv(target="http://localhost:8000", tool_call_format="qwen3_coder")
+    prompt = [{
+        "role": "system",
+        "content": (
+            "You are a CTF agent.\n\n"
+            "Available tools:\n"
+            "- shell_command: Run commands\n"
+            "- read_file: Read files\n"
+        ),
+    }]
+    injected = env._inject_tool_schemas(prompt)
+    sys_content = injected[0]["content"]
+    assert "# Tool Call Format" in sys_content
+    assert "<function=tool_name>" in sys_content
+    # Should not duplicate full schema block when tools are already present.
+    assert sys_content.count("# Available Tools") == 0

@@ -20,11 +20,13 @@ Default test model: Nanbeige4.1-3B (dense LlamaForCausalLM).
 """
 
 import json
+import importlib.util
 import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse, urlunparse
 
 import yaml
 
@@ -32,6 +34,45 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _CONFIGS_DIR = _PROJECT_ROOT / "configs" / "skyrl"
+
+
+def _as_positive_int(name: str, raw_value: Any, default: int) -> int:
+    """Parse a positive int config value with warning-backed fallback."""
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; defaulting to %d.", name, raw_value, default)
+        return default
+    if value <= 0:
+        logger.warning("Invalid %s=%r (must be >0); defaulting to %d.", name, raw_value, default)
+        return default
+    return value
+
+
+def _detect_visible_gpu_count() -> Optional[int]:
+    """Best-effort count of GPUs visible to the current process."""
+    visible = os.getenv("CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        stripped = visible.strip()
+        if not stripped or stripped == "-1":
+            return 0
+        devices = [chunk.strip() for chunk in stripped.split(",") if chunk.strip()]
+        if devices:
+            return len(devices)
+
+    try:
+        import torch
+    except Exception:
+        return None
+
+    try:
+        if not torch.cuda.is_available():
+            return 0
+        return int(torch.cuda.device_count())
+    except Exception:
+        return None
 
 
 def _flash_attn_available() -> bool:
@@ -46,7 +87,102 @@ def _flash_attn_available() -> bool:
     )
 
 
-def _should_force_legacy_inference(model_path: str) -> bool:
+def _is_qwen3_5_config(hf_cfg: Any) -> bool:
+    """Return True if a HF config appears to be Qwen3.5."""
+    model_type = str(getattr(hf_cfg, "model_type", "")).lower()
+    cfg_cls_name = str(hf_cfg.__class__.__name__).lower()
+    architectures = [
+        str(arch).lower()
+        for arch in (getattr(hf_cfg, "architectures", None) or [])
+    ]
+    return (
+        "qwen3_5" in model_type
+        or "qwen3_5" in cfg_cls_name
+        or any("qwen3_5" in arch for arch in architectures)
+    )
+
+
+def _missing_qwen3_5_fast_path_deps() -> list[str]:
+    """Return missing Qwen3.5 linear-attention fast-path dependencies.
+
+    Qwen3.5 uses flash linear attention (`fla`) and causal-conv1d for
+    optimized linear-attention blocks. If missing, Transformers falls back
+    to a slow torch path (`torch_chunk_gated_delta_rule`) that is unstable
+    for long-horizon online RL workloads.
+    """
+    missing = []
+    try:
+        from transformers.utils.import_utils import (
+            is_causal_conv1d_available,
+            is_flash_linear_attention_available,
+        )
+
+        if not is_flash_linear_attention_available():
+            missing.append("flash-linear-attention (module: fla)")
+        if not is_causal_conv1d_available():
+            missing.append("causal-conv1d")
+        return missing
+    except Exception:
+        # Fallback for older Transformers that may not expose these helpers.
+        if importlib.util.find_spec("fla") is None:
+            missing.append("flash-linear-attention (module: fla)")
+        if importlib.util.find_spec("causal_conv1d") is None:
+            missing.append("causal-conv1d")
+        return missing
+
+
+def _validate_qwen3_5_runtime_dependencies(
+    hf_cfg: Any,
+    grpo_cfg: Dict[str, Any],
+) -> None:
+    """Fail fast when Qwen3.5 runtime dependencies are missing."""
+    if not _is_qwen3_5_config(hf_cfg):
+        return
+
+    missing = _missing_qwen3_5_fast_path_deps()
+    if not missing:
+        return
+
+    missing_str = ", ".join(missing)
+    msg = (
+        "Qwen3.5 detected but required linear-attention runtime deps are "
+        f"missing: {missing_str}. Install with: "
+        "`uv sync --extra grpo --frozen` (preferred) or "
+        "`pip install --no-deps flash-linear-attention==0.4.1 causal-conv1d==1.6.0`. "
+        "Without these libs, Transformers falls back to torch linear-attention "
+        "kernels that are unstable for long-context GRPO."
+    )
+    strict = bool(grpo_cfg.get("require_fast_linear_attention", True))
+    if strict:
+        raise RuntimeError(
+            msg
+            + " To bypass temporarily, set grpo.require_fast_linear_attention=false "
+            "(not recommended for production)."
+        )
+    logger.warning(
+        "%s Proceeding because grpo.require_fast_linear_attention=false.",
+        msg,
+    )
+
+
+def _resolve_reward_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize reward config and enforce a dict payload."""
+    reward_cfg = config.get("reward")
+    if reward_cfg is None:
+        logger.info("No reward config provided; using default CTFReward weights.")
+        return {}
+    if not isinstance(reward_cfg, dict):
+        raise TypeError(
+            f"config['reward'] must be a dict if provided, got {type(reward_cfg).__name__}."
+        )
+    return reward_cfg
+
+
+def _should_force_legacy_inference(
+    model_path: str,
+    *,
+    allow_qwen35_new_inference: bool = False,
+) -> bool:
     """Return True when SkyRL new inference should be disabled for model config.
 
     SkyRL's new inference server path currently initializes vLLM renderers in a
@@ -70,6 +206,15 @@ def _should_force_legacy_inference(model_path: str) -> bool:
             "Model config class %s detected at %s. Forcing SkyRL legacy "
             "inference path (new inference is incompatible with text-wrapper configs).",
             cfg_cls_name,
+            model_path,
+        )
+        return True
+    if _is_qwen3_5_config(hf_cfg) and not allow_qwen35_new_inference:
+        logger.warning(
+            "Qwen3.5 config detected at %s. Forcing SkyRL legacy inference path "
+            "(new inference shows intermittent /inference/v1/generate 400s and "
+            "engine-core exits on this stack). Set "
+            "grpo.allow_new_inference_for_qwen35=true to override.",
             model_path,
         )
         return True
@@ -218,18 +363,31 @@ def _resolve_generator_topology(grpo_cfg: Dict[str, Any], lora_rank: int) -> Dic
         )
         vllm_mode = "colocate"
 
-    # Upstream SkyRL remote inference mode cannot apply LoRA adapters.
-    # Fall back to local non-colocated engines to keep LoRA training supported.
-    if remote_requested and lora_rank > 0:
+    # Upstream SkyRL remote inference mode does not support NCCL LoRA sync.
+    # With our weight_sync patch (patch_skyrl_weight_sync.py), file-based
+    # LoRA sync (save adapter → HTTP /v1/load_lora_adapter) works instead.
+    # On constrained GPUs (e.g. GB10 unified memory), local non-colocated
+    # engines crash due to vLLM V1 subprocess issues — remote is the only
+    # working topology.  Set ``allow_remote_lora: true`` to keep remote mode.
+    allow_remote_lora = bool(grpo_cfg.get("allow_remote_lora", False))
+    if remote_requested and lora_rank > 0 and not allow_remote_lora:
         logger.warning(
             "grpo.vllm_server_url=%r requested with LoRA rank=%d. "
-            "SkyRL remote engines do not support LoRA weight sync; "
-            "falling back to local non-colocated vLLM engines.",
+            "SkyRL remote engines do not support NCCL LoRA weight sync; "
+            "falling back to local non-colocated vLLM engines. "
+            "Set grpo.allow_remote_lora=true to keep remote mode "
+            "(requires patch_skyrl_weight_sync.py for file-based sync).",
             requested_remote_url,
             lora_rank,
         )
         remote_requested = False
         vllm_mode = "server"
+    elif remote_requested and lora_rank > 0 and allow_remote_lora:
+        logger.info(
+            "Remote vLLM + LoRA: using file-based weight sync "
+            "(grpo.allow_remote_lora=true). Ensure patch_skyrl_weight_sync.py "
+            "is applied and vLLM server supports /v1/load_lora_adapter."
+        )
 
     run_engines_locally = not remote_requested
     colocate_all = run_engines_locally and vllm_mode in {"colocate", "local"}
@@ -248,7 +406,18 @@ def _resolve_generator_topology(grpo_cfg: Dict[str, Any], lora_rank: int) -> Dic
     }
 
 
-def _convert_grpo_data(data_path: str, output_dir: str, registry=None) -> str:
+def _convert_grpo_data(
+    data_path: str,
+    output_dir: str,
+    registry=None,
+    drop_unresolved_registry_samples: bool = False,
+    max_samples: Optional[int] = None,
+    max_samples_per_challenge: Optional[int] = None,
+    target_port_offset: int = 0,
+    target_host_override: Optional[str] = None,
+    fail_on_target_collisions: bool = False,
+    prefer_registry_target: bool = False,
+) -> str:
     """Convert our GRPO JSONL to SkyRL dataset format.
 
     SkyRL expects each sample to have:
@@ -263,6 +432,22 @@ def _convert_grpo_data(data_path: str, output_dir: str, registry=None) -> str:
     We extract the prompt (system + user messages before first assistant)
     and flatten metadata as top-level keys for SkyRL extras.
 
+    Args:
+        data_path: Source GRPO JSONL path.
+        output_dir: Output directory for converted JSONL.
+        registry: Optional ChallengeRegistry for challenge ID normalization.
+        drop_unresolved_registry_samples: If True and registry is provided,
+            samples whose challenge ID cannot be resolved are dropped.
+        max_samples: Optional cap on converted samples (after filtering).
+        max_samples_per_challenge: Optional per-challenge cap for balancing.
+        target_port_offset: Optional port offset applied to parsed target URLs.
+            Useful for SSH-forwarded challenge ranges (e.g., 328xx -> 430xx).
+        target_host_override: Optional host override for parsed target URLs.
+        fail_on_target_collisions: If True, raise when multiple challenge IDs
+            resolve to the same target URL.
+        prefer_registry_target: If True, use registry-resolved target URL when
+            available, even when a user message already contains a URL.
+
     Returns:
         Path to the converted JSONL file.
     """
@@ -272,8 +457,50 @@ def _convert_grpo_data(data_path: str, output_dir: str, registry=None) -> str:
     os.makedirs(output_dir, exist_ok=True)
 
     converted = 0
+    skipped = 0
+    unresolved_counts: Dict[str, int] = {}
+    missing_challenge_id = 0
+    per_challenge_counts: Dict[str, int] = {}
+    target_to_challenges: Dict[str, set[str]] = {}
+
+    def _rewrite_target(raw_url: str) -> str:
+        """Apply host/port overrides to a target URL."""
+        try:
+            parsed = urlparse(raw_url)
+        except Exception:
+            return raw_url
+        if not parsed.scheme or not parsed.netloc:
+            return raw_url
+
+        host = target_host_override or parsed.hostname or ""
+        port = parsed.port
+        if port is not None and target_port_offset:
+            port = port + int(target_port_offset)
+
+        netloc = host
+        if parsed.username:
+            auth = parsed.username
+            if parsed.password:
+                auth += f":{parsed.password}"
+            netloc = f"{auth}@{netloc}"
+        if port is not None:
+            netloc = f"{netloc}:{port}"
+
+        return urlunparse(
+            (
+                parsed.scheme,
+                netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+
     with jsonlines.open(data_path) as reader, jsonlines.open(output_path, "w") as writer:
         for sample in reader:
+            if max_samples and converted >= int(max_samples):
+                break
             messages = sample.get("messages", [])
 
             # Extract prompt: system + user messages before first assistant/tool
@@ -304,36 +531,182 @@ def _convert_grpo_data(data_path: str, output_dir: str, registry=None) -> str:
             target = None
             for msg in messages:
                 if msg.get("role") == "user":
-                    urls = re.findall(r'http://localhost:\d+', msg.get("content", ""))
+                    urls = re.findall(r"https?://[^\s)]+", msg.get("content", ""))
                     if urls:
                         target = urls[0]
                         break
             if not target:
                 target = metadata.get("target")
 
-            # Registry fallback: if no target in prompt/metadata, check registry
+            # Resolve challenge ID against registry when available.
             challenge_id = metadata.get("challenge_id") or metadata.get("challenge")
-            if not target and registry and challenge_id:
+            resolved_challenge_id = challenge_id
+            if registry:
+                if challenge_id:
+                    resolved = registry.resolve_id(str(challenge_id))
+                    if resolved is not None:
+                        resolved_challenge_id = resolved
+                    elif drop_unresolved_registry_samples:
+                        skipped += 1
+                        key = str(challenge_id)
+                        unresolved_counts[key] = unresolved_counts.get(key, 0) + 1
+                        continue
+                elif drop_unresolved_registry_samples:
+                    skipped += 1
+                    missing_challenge_id += 1
+                    continue
+
+            registry_target = None
+            if registry and resolved_challenge_id:
                 try:
-                    target = registry.get_target_url(challenge_id)
+                    registry_target = registry.get_target_url(resolved_challenge_id)
                 except KeyError:
-                    pass
+                    registry_target = None
+
+            # Prefer canonical registry target when configured (useful for
+            # remote/tunneled runs where prompts may contain stale localhost URLs).
+            if prefer_registry_target and registry_target:
+                target = registry_target
+            # Otherwise, only use registry target as fallback when no URL was parsed.
+            elif not target and registry_target:
+                target = registry_target
+            if target:
+                target = _rewrite_target(str(target))
+
+            if max_samples_per_challenge and resolved_challenge_id:
+                key = str(resolved_challenge_id)
+                current = per_challenge_counts.get(key, 0)
+                if current >= int(max_samples_per_challenge):
+                    skipped += 1
+                    continue
 
             row = {
                 "prompt": prompt,
                 "env_class": "openctf",
                 "ground_truth_flag": sample.get("ground_truth_flag"),
                 "optimal_steps": metadata.get("optimal_steps"),
-                "challenge_id": challenge_id,
+                "challenge_id": resolved_challenge_id,
                 "task_type": metadata.get("task_type", "ctf"),
                 "target": target,
             }
 
             writer.write(row)
             converted += 1
+            if resolved_challenge_id:
+                key = str(resolved_challenge_id)
+                per_challenge_counts[key] = per_challenge_counts.get(key, 0) + 1
+                if target:
+                    target_to_challenges.setdefault(str(target), set()).add(key)
+
+    if skipped:
+        logger.warning(
+            "Skipped %d/%d GRPO samples during conversion (registry filtering enabled=%s)",
+            skipped,
+            skipped + converted,
+            bool(registry and drop_unresolved_registry_samples),
+        )
+    if unresolved_counts:
+        top = sorted(unresolved_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        logger.warning("Top unresolved challenge IDs (sample count): %s", top)
+    if missing_challenge_id:
+        logger.warning(
+            "Skipped %d samples with missing challenge_id/challenge metadata.",
+            missing_challenge_id,
+        )
+    if converted == 0:
+        raise ValueError(
+            "No GRPO samples remained after conversion. "
+            "Check challenge registry mappings or disable drop_unresolved_registry_samples."
+        )
+
+    if max_samples_per_challenge:
+        logger.info(
+            "Per-challenge cap active: max_samples_per_challenge=%s (kept %d challenges)",
+            max_samples_per_challenge,
+            len(per_challenge_counts),
+        )
+    collisions = {
+        tgt: sorted(ids)
+        for tgt, ids in target_to_challenges.items()
+        if len(ids) > 1
+    }
+    if collisions:
+        top = sorted(collisions.items(), key=lambda x: len(x[1]), reverse=True)[:10]
+        logger.warning(
+            "Detected %d target URL collisions (multiple challenge IDs share one target). "
+            "This often indicates stale tunnel/port mapping. Top collisions: %s",
+            len(collisions),
+            top,
+        )
+        if fail_on_target_collisions:
+            raise ValueError(
+                "Target URL collisions detected during GRPO data conversion; "
+                "provide a challenge target map (OPEN_CTF_TARGET_MAP_PATH / "
+                "grpo.target_map_path) or disable fail_on_target_collisions."
+            )
 
     logger.info("Converted %d GRPO samples → %s", converted, output_path)
     return output_path
+
+
+def _resolve_skyrl_logger(report_to: str, output_dir: str) -> str:
+    """Map our ``report_to`` config value to a SkyRL logger backend name.
+
+    SkyRL tracking backends: wandb, mlflow, swanlab, tensorboard, console.
+    ``"none"`` is not supported and is mapped to ``"console"``.
+    ``"tensorboard"`` is supported natively; we also set the env var
+    ``TENSORBOARD_LOGDIR`` so SkyRL writes to the correct directory.
+    """
+    value = str(report_to).strip().lower()
+
+    _VALID_SKYRL_LOGGERS = {"wandb", "mlflow", "swanlab", "tensorboard", "console"}
+
+    if value in ("none", "", "null"):
+        return "console"
+
+    if value == "tensorboard":
+        tb_dir = os.path.join(output_dir, "tensorboard")
+        try:
+            os.makedirs(tb_dir, exist_ok=True)
+        except OSError:
+            # Output dir may not exist yet (unit tests use fake paths).
+            # The directory will be created later by train_grpo().
+            pass
+        # SkyRL's TensorBoardLogger reads TENSORBOARD_LOGDIR from env.
+        os.environ["TENSORBOARD_LOGDIR"] = tb_dir
+        return "tensorboard"
+
+    if value in _VALID_SKYRL_LOGGERS:
+        return value
+
+    logger.warning(
+        "Unrecognized report_to=%r; falling back to 'console'. "
+        "Valid options: %s",
+        report_to,
+        sorted(_VALID_SKYRL_LOGGERS),
+    )
+    return "console"
+
+
+def _setup_persistent_logging(output_dir: str) -> None:
+    """Configure file-based logging to ``{output_dir}/training.log``.
+
+    Adds a FileHandler to the root logger so that all log output
+    (including SkyRL, vLLM, and our own modules) is captured in a
+    persistent file alongside the usual console output.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "training.log")
+    handler = logging.FileHandler(log_path, mode="a")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logging.getLogger().addHandler(handler)
+    logger.info("Persistent training log: %s", log_path)
 
 
 def _build_skyrl_config(
@@ -393,9 +766,210 @@ def _build_skyrl_config(
             "use_sample_packing requested without flash_attn support; disabling sample packing."
         )
         use_sample_packing = False
-    max_prompt_length = grpo_cfg.get("max_prompt_length", model_cfg.get("max_seq_length", 8192))
-    vllm_max_model_len = grpo_cfg.get("vllm_max_model_len", model_cfg.get("max_seq_length", 8192))
+    model_max_seq_length = _as_positive_int(
+        "model.max_seq_length",
+        model_cfg.get("max_seq_length"),
+        8192,
+    )
+    max_completion_length = _as_positive_int(
+        "grpo.max_completion_length",
+        grpo_cfg.get("max_completion_length"),
+        8192,
+    )
+    max_prompt_length = _as_positive_int(
+        "grpo.max_prompt_length",
+        grpo_cfg.get("max_prompt_length"),
+        model_max_seq_length,
+    )
+    # Keep vLLM's max_model_len sized for actual rollout windows instead of the
+    # model's full context by default (for example 262K Qwen max pos emb), which
+    # can allocate excessive KV cache and OOM on otherwise-valid settings.
+    vllm_headroom_tokens = _as_positive_int(
+        "grpo.vllm_context_headroom_tokens",
+        grpo_cfg.get("vllm_context_headroom_tokens"),
+        1024,
+    )
+    min_required_vllm_len = max_prompt_length + max_completion_length
+    default_vllm_max_model_len = min(
+        model_max_seq_length,
+        min_required_vllm_len + vllm_headroom_tokens,
+    )
+    if default_vllm_max_model_len < min_required_vllm_len:
+        default_vllm_max_model_len = min_required_vllm_len
+    vllm_max_model_len = _as_positive_int(
+        "grpo.vllm_max_model_len",
+        grpo_cfg.get("vllm_max_model_len"),
+        default_vllm_max_model_len,
+    )
+    if vllm_max_model_len < min_required_vllm_len:
+        logger.warning(
+            "grpo.vllm_max_model_len=%d is smaller than max_prompt_length + "
+            "max_completion_length (%d + %d = %d); overriding to %d.",
+            vllm_max_model_len,
+            max_prompt_length,
+            max_completion_length,
+            min_required_vllm_len,
+            min_required_vllm_len,
+        )
+        vllm_max_model_len = min_required_vllm_len
     vllm_language_model_only = bool(grpo_cfg.get("vllm_language_model_only", False))
+    num_generations = _as_positive_int(
+        "grpo.num_generations",
+        grpo_cfg.get("num_generations"),
+        8,
+    )
+    max_num_seqs = _as_positive_int(
+        "grpo.max_num_seqs",
+        grpo_cfg.get("max_num_seqs"),
+        max(8, num_generations * 2),
+    )
+    if max_num_seqs < num_generations:
+        logger.warning(
+            "grpo.max_num_seqs=%d is smaller than num_generations=%d; "
+            "overriding max_num_seqs to %d.",
+            max_num_seqs,
+            num_generations,
+            num_generations,
+        )
+        max_num_seqs = num_generations
+    default_batched_tokens = min(
+        32768,
+        max(max_prompt_length, num_generations * max(1024, max_completion_length // 2)),
+    )
+    max_num_batched_tokens = _as_positive_int(
+        "grpo.max_num_batched_tokens",
+        grpo_cfg.get("max_num_batched_tokens"),
+        default_batched_tokens,
+    )
+    if max_num_batched_tokens < max_prompt_length:
+        logger.warning(
+            "grpo.max_num_batched_tokens=%d is smaller than max_prompt_length=%d; "
+            "overriding to %d.",
+            max_num_batched_tokens,
+            max_prompt_length,
+            max_prompt_length,
+        )
+        max_num_batched_tokens = max_prompt_length
+    max_prefill_capacity = max_prompt_length * max_num_seqs
+    if max_num_batched_tokens > max_prefill_capacity:
+        logger.warning(
+            "grpo.max_num_batched_tokens=%d exceeds max_prefill_capacity=%d "
+            "(max_prompt_length * max_num_seqs); clamping.",
+            max_num_batched_tokens,
+            max_prefill_capacity,
+        )
+        max_num_batched_tokens = max_prefill_capacity
+
+    num_inference_engines = _as_positive_int(
+        "grpo.num_inference_engines",
+        grpo_cfg.get("num_inference_engines"),
+        1,
+    )
+    inference_engine_tensor_parallel_size = _as_positive_int(
+        "grpo.inference_engine_tensor_parallel_size",
+        grpo_cfg.get("inference_engine_tensor_parallel_size"),
+        1,
+    )
+    inference_engine_pipeline_parallel_size = _as_positive_int(
+        "grpo.inference_engine_pipeline_parallel_size",
+        grpo_cfg.get("inference_engine_pipeline_parallel_size"),
+        1,
+    )
+    inference_engine_data_parallel_size = _as_positive_int(
+        "grpo.inference_engine_data_parallel_size",
+        grpo_cfg.get("inference_engine_data_parallel_size"),
+        1,
+    )
+    max_tool_calling_iterations = _as_positive_int(
+        "grpo.max_tool_calling_iterations",
+        grpo_cfg.get("max_tool_calling_iterations"),
+        15,
+    )
+    max_env_workers = _as_positive_int(
+        "grpo.max_env_workers",
+        grpo_cfg.get("max_env_workers"),
+        32,
+    )
+    use_ref_model = bool(grpo_cfg.get("beta", 0.0) > 0.0 or grpo_cfg.get("use_kl_in_reward", False))
+    policy_num_gpus_per_node = _as_positive_int(
+        "grpo.policy_num_gpus_per_node",
+        grpo_cfg.get("policy_num_gpus_per_node"),
+        1,
+    )
+    policy_num_nodes = _as_positive_int(
+        "grpo.policy_num_nodes",
+        grpo_cfg.get("policy_num_nodes"),
+        1,
+    )
+    critic_model_path = grpo_cfg.get("critic_model_path")
+    if critic_model_path:
+        critic_num_gpus_per_node = _as_positive_int(
+            "grpo.critic_num_gpus_per_node",
+            grpo_cfg.get("critic_num_gpus_per_node"),
+            1,
+        )
+    else:
+        critic_num_gpus_per_node = 0
+    critic_num_nodes = _as_positive_int(
+        "grpo.critic_num_nodes",
+        grpo_cfg.get("critic_num_nodes"),
+        1,
+    )
+    ref_num_nodes = _as_positive_int(
+        "grpo.ref_num_nodes",
+        grpo_cfg.get("ref_num_nodes"),
+        policy_num_nodes,
+    )
+    ref_num_gpus_per_node = _as_positive_int(
+        "grpo.ref_num_gpus_per_node",
+        grpo_cfg.get("ref_num_gpus_per_node"),
+        policy_num_gpus_per_node,
+    )
+    if not use_ref_model:
+        ref_num_gpus_per_node = 0
+    colocate_policy_ref = bool(grpo_cfg.get("colocate_policy_ref", True)) and use_ref_model
+
+    visible_gpu_count = _detect_visible_gpu_count()
+    if (
+        visible_gpu_count is not None
+        and visible_gpu_count > 0
+        and topology["run_engines_locally"]
+        and not topology["colocate_all"]
+    ):
+        policy_gpus = policy_num_nodes * policy_num_gpus_per_node
+        ref_gpus = ref_num_nodes * ref_num_gpus_per_node if use_ref_model else 0
+        critic_gpus = critic_num_nodes * critic_num_gpus_per_node if critic_model_path else 0
+        gpus_per_engine = (
+            inference_engine_tensor_parallel_size
+            * inference_engine_pipeline_parallel_size
+            * inference_engine_data_parallel_size
+        )
+        required_gpus = policy_gpus + ref_gpus + critic_gpus + (num_inference_engines * gpus_per_engine)
+        if required_gpus > visible_gpu_count:
+            explicit_num_engines = "num_inference_engines" in grpo_cfg
+            available_for_inference = max(0, visible_gpu_count - policy_gpus - ref_gpus - critic_gpus)
+            max_auto_engines = available_for_inference // max(1, gpus_per_engine)
+            if not explicit_num_engines and max_auto_engines > 0:
+                logger.warning(
+                    "Local non-colocated topology requests %d GPUs but only %d are visible. "
+                    "Auto-adjusting num_inference_engines from %d to %d.",
+                    required_gpus,
+                    visible_gpu_count,
+                    num_inference_engines,
+                    max_auto_engines,
+                )
+                num_inference_engines = max_auto_engines
+            else:
+                logger.warning(
+                    "Local non-colocated topology requests %d GPUs (%d policy + %d ref + %d critic + "
+                    "%d inference) but only %d are visible. Training may stall or OOM.",
+                    required_gpus,
+                    policy_gpus,
+                    ref_gpus,
+                    critic_gpus,
+                    num_inference_engines * gpus_per_engine,
+                    visible_gpu_count,
+                )
     chat_template_name = grpo_cfg.get("chat_template", None)
     default_logprobs = None if remote_vllm else 0
     train_logprobs = grpo_cfg.get("logprobs", default_logprobs)
@@ -433,6 +1007,7 @@ def _build_skyrl_config(
         "MistralForCausalLM": "MistralDecoderLayer",
         "GptOssForCausalLM": "GptOssDecoderLayer",
     }
+    auto_cfg = None
     transformer_layer_cls = None
     try:
         from transformers import AutoConfig
@@ -445,6 +1020,8 @@ def _build_skyrl_config(
             transformer_layer_cls = f"{base}DecoderLayer"
     except Exception:
         pass
+    if auto_cfg is not None:
+        _validate_qwen3_5_runtime_dependencies(auto_cfg, grpo_cfg)
 
     # Reference model path for KL divergence. Defaults to the policy model
     # (standard GRPO), but can be overridden for distillation.
@@ -491,9 +1068,8 @@ def _build_skyrl_config(
             "eval_before_train": False,
             "project_name": "open-ctf",
             "run_name": "grpo",
-            "logger": (
-                "console" if output_cfg.get("report_to", "none") == "none"
-                else output_cfg["report_to"]
+            "logger": _resolve_skyrl_logger(
+                output_cfg.get("report_to", "tensorboard"), output_dir
             ),
             "dump_data_batch": False,
             "dump_eval_results": False,
@@ -506,13 +1082,13 @@ def _build_skyrl_config(
                 # Non-colocated mode allows trainer and local engines to use
                 # separate GPUs while staying on SkyRL's supported LoRA path.
                 "colocate_all": topology["colocate_all"],
-                "colocate_policy_ref": True,
-                "policy_num_nodes": 1,
-                "policy_num_gpus_per_node": 1,
-                "critic_num_nodes": 1,
-                "critic_num_gpus_per_node": 1,
-                "ref_num_nodes": 1,
-                "ref_num_gpus_per_node": 1,
+                "colocate_policy_ref": colocate_policy_ref,
+                "policy_num_nodes": policy_num_nodes,
+                "policy_num_gpus_per_node": policy_num_gpus_per_node,
+                "critic_num_nodes": critic_num_nodes,
+                "critic_num_gpus_per_node": critic_num_gpus_per_node,
+                "ref_num_nodes": ref_num_nodes,
+                "ref_num_gpus_per_node": ref_num_gpus_per_node,
             },
 
             "fully_async": {
@@ -577,7 +1153,7 @@ def _build_skyrl_config(
 
             "critic": {
                 "model": {
-                    "path": None,
+                    "path": critic_model_path,
                     "lora": {
                         "rank": 0,
                         "alpha": 16,
@@ -661,33 +1237,33 @@ def _build_skyrl_config(
             "model_name": model_path,
             "model_dtype": "bfloat16",
             "run_engines_locally": topology["run_engines_locally"],
-            "num_inference_engines": 1,
+            "num_inference_engines": num_inference_engines,
             "backend": "vllm",
             "weight_sync_backend": topology["weight_sync_backend"],
             "weight_transfer_threshold_cuda_ipc_GB": 1.0,
-            "inference_engine_tensor_parallel_size": 1,
-            "inference_engine_pipeline_parallel_size": 1,
+            "inference_engine_tensor_parallel_size": inference_engine_tensor_parallel_size,
+            "inference_engine_pipeline_parallel_size": inference_engine_pipeline_parallel_size,
             "inference_engine_expert_parallel_size": 1,
-            "inference_engine_data_parallel_size": 1,
-            "n_samples_per_prompt": grpo_cfg.get("num_generations", 8),
+            "inference_engine_data_parallel_size": inference_engine_data_parallel_size,
+            "n_samples_per_prompt": num_generations,
             "async_engine": True,
             "batched": False,
             "max_input_length": max_prompt_length,
             "vllm_v1_disable_multiproc": True,
-            "enable_prefix_caching": True,
-            "enable_chunked_prefill": True,
-            "max_num_batched_tokens": 32768,
-            "enforce_eager": True,
+            "enable_prefix_caching": bool(grpo_cfg.get("enable_prefix_caching", True)),
+            "enable_chunked_prefill": bool(grpo_cfg.get("enable_chunked_prefill", True)),
+            "max_num_batched_tokens": max_num_batched_tokens,
+            "enforce_eager": bool(grpo_cfg.get("enforce_eager", True)),
             "fully_sharded_loras": False,
             "enable_ray_prometheus_stats": False,
             "gpu_memory_utilization": grpo_cfg.get("gpu_memory_utilization", 0.4),
-            "max_num_seqs": 32,
+            "max_num_seqs": max_num_seqs,
             "remote_inference_engine_urls": topology["remote_inference_engine_urls"],
             "enable_http_endpoint": False,
             "http_endpoint_host": "127.0.0.1",
             "http_endpoint_port": 8000,
             "served_model_name": None,
-            "max_turns": grpo_cfg.get("max_tool_calling_iterations", 15),
+            "max_turns": max_tool_calling_iterations,
             "chat_template": {
                 "source": "name",
                 "name_or_path": chat_template_name,
@@ -706,8 +1282,8 @@ def _build_skyrl_config(
             },
             "override_existing_update_group": "auto",
             "sampling_params": {
-                "max_generate_length": grpo_cfg.get("max_completion_length", 8192),
-                "repetition_penalty": 1.0,
+                "max_generate_length": max_completion_length,
+                "repetition_penalty": grpo_cfg.get("repetition_penalty", 1.0),
                 "temperature": 1.0,
                 "top_p": 0.95,
                 "min_p": 0.0,
@@ -720,8 +1296,8 @@ def _build_skyrl_config(
             "use_conversation_multi_turn": True,
             "append_eos_token_after_stop_str_in_multi_turn": True,
             "eval_sampling_params": {
-                "max_generate_length": grpo_cfg.get("max_completion_length", 8192),
-                "repetition_penalty": 1.0,
+                "max_generate_length": max_completion_length,
+                "repetition_penalty": grpo_cfg.get("repetition_penalty", 1.0),
                 "temperature": 0.6,
                 "top_p": 0.95,
                 "min_p": 0.0,
@@ -741,7 +1317,7 @@ def _build_skyrl_config(
         "environment": {
             "env_class": "openctf",
             "skyrl_gym": {
-                "max_env_workers": 32,
+                "max_env_workers": max_env_workers,
             },
         },
     }
@@ -827,6 +1403,10 @@ def train_grpo(
     """
     model_path = _resolve_vllm_ready_model_path(model_path)
 
+    # Set up persistent file logging before any other output.
+    os.makedirs(output_dir, exist_ok=True)
+    _setup_persistent_logging(output_dir)
+
     logger.info("=" * 60)
     logger.info("GRPO TRAINING (SkyRL)")
     logger.info("  Model:  %s", model_path)
@@ -835,17 +1415,57 @@ def train_grpo(
     logger.info("=" * 60)
 
     # 1. Convert data to SkyRL format
+    grpo_cfg = config.get("grpo", {})
     registry = None
+    target_map_path = (
+        os.getenv("OPEN_CTF_TARGET_MAP_PATH")
+        or grpo_cfg.get("target_map_path")
+        or None
+    )
     if challenge_registry:
         from open_ctf.challenges.registry import ChallengeRegistry
         registry = ChallengeRegistry(challenge_registry)
-    converted_data = _convert_grpo_data(data_path, output_dir, registry=registry)
+        if target_map_path:
+            strict_map = bool(
+                int(os.getenv("OPEN_CTF_TARGET_MAP_STRICT", "0"))
+            ) or bool(grpo_cfg.get("target_map_strict", False))
+            registry.load_target_overrides(str(target_map_path), strict=strict_map)
+    drop_unresolved = bool(
+        grpo_cfg.get("drop_unresolved_registry_samples", True)
+    )
+    port_offset = int(
+        os.getenv(
+            "OPEN_CTF_TARGET_PORT_OFFSET",
+            str(grpo_cfg.get("target_port_offset", 0)),
+        )
+    )
+    host_override = (
+        os.getenv("OPEN_CTF_TARGET_HOST_OVERRIDE")
+        or grpo_cfg.get("target_host_override")
+        or None
+    )
+    prefer_registry_target = bool(
+        grpo_cfg.get("prefer_registry_target", bool(target_map_path))
+    )
+    converted_data = _convert_grpo_data(
+        data_path,
+        output_dir,
+        registry=registry,
+        drop_unresolved_registry_samples=drop_unresolved,
+        max_samples=grpo_cfg.get("max_samples"),
+        max_samples_per_challenge=grpo_cfg.get("max_samples_per_challenge"),
+        target_port_offset=port_offset,
+        target_host_override=host_override,
+        fail_on_target_collisions=bool(grpo_cfg.get("fail_on_target_collisions", False)),
+        prefer_registry_target=prefer_registry_target,
+    )
 
     # 2. Build SkyRL config
     skyrl_config = _build_skyrl_config(model_path, output_dir, config, converted_data)
 
     if resume_from:
         skyrl_config["trainer"]["resume_path"] = resume_from
+        skyrl_config["trainer"]["resume_mode"] = "from_path"
 
     # 3. Write config for reference
     os.makedirs(output_dir, exist_ok=True)
@@ -855,11 +1475,24 @@ def train_grpo(
     logger.info("SkyRL config written to %s", config_path)
 
     # 4. Launch SkyRL training
-    reward_config = config.get("reward", {})
-    grpo_cfg = config.get("grpo", {})
+    reward_config = _resolve_reward_config(config)
     use_new_inference = bool(grpo_cfg.get("use_new_inference", False))
-    if use_new_inference and _should_force_legacy_inference(model_path):
+    allow_qwen35_new_inference = bool(
+        grpo_cfg.get("allow_new_inference_for_qwen35", False)
+    )
+    if use_new_inference and _should_force_legacy_inference(
+        model_path,
+        allow_qwen35_new_inference=allow_qwen35_new_inference,
+    ):
         use_new_inference = False
+
+    # Trajectory logging: pass output_dir through env kwargs (Ray-serializable string).
+    logging_cfg = config.get("grpo_logging", {})
+    enable_trajectory_logging = bool(
+        logging_cfg.get("enable_trajectory_logging", True)
+    )
+    trajectory_output_dir = output_dir if enable_trajectory_logging else None
+
     # Agent class from CLI flag > config file > None (DefaultStepAgent)
     resolved_agent_class = agent_class or grpo_cfg.get("agent_class")
     resolved_agent_kwargs = grpo_cfg.get("agent_kwargs", {})
@@ -869,12 +1502,22 @@ def train_grpo(
             agent_class=resolved_agent_class,
             agent_kwargs=resolved_agent_kwargs,
             use_new_inference=use_new_inference,
+            trajectory_output_dir=trajectory_output_dir,
         )
     except ImportError as e:
         logger.error(
             "SkyRL not installed. Install with: pip install skyrl-train skyrl-gym ray[default] vllm"
         )
         raise
+
+    # Save challenge scoreboard after training completes.
+    if trajectory_output_dir:
+        try:
+            from open_ctf.training.trajectory_logger import TrajectoryLogger
+            tl = TrajectoryLogger(trajectory_output_dir)
+            tl.save_scoreboard()
+        except Exception as exc:
+            logger.warning("Failed to save final scoreboard: %s", exc)
 
     logger.info("GRPO training complete. Output: %s", output_dir)
 
@@ -890,6 +1533,7 @@ def _run_skyrl_training(
     agent_class: Optional[str] = None,
     agent_kwargs: Optional[Dict[str, Any]] = None,
     use_new_inference: bool = False,
+    trajectory_output_dir: Optional[str] = None,
 ) -> None:
     """Launch SkyRL training with the given config.
 
@@ -902,6 +1546,8 @@ def _run_skyrl_training(
             into CTFReward inside each env instance).
         agent_class: Dotted path to a StepAgent class (Ray-safe string).
         agent_kwargs: Dict of primitives for the StepAgent constructor.
+        trajectory_output_dir: Output directory for trajectory JSONL logs.
+            Passed through as a string (Ray-serializable) to each env instance.
 
     Key: exp.run() already calls asyncio.run() internally -- do NOT wrap
     in another asyncio.run().
@@ -935,7 +1581,7 @@ def _run_skyrl_training(
     # Register env and run training inside a Ray remote task.
     # This ensures the env registration is visible to Ray workers.
     @ray.remote(num_cpus=1)
-    def _skyrl_entrypoint(cfg_dict, reward_config, agent_class, agent_kwargs, use_new_inference):
+    def _skyrl_entrypoint(cfg_dict, reward_config, agent_class, agent_kwargs, use_new_inference, trajectory_output_dir):
         import os as _os
         _os.environ["VLLM_USE_V1"] = "1"
         _os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -964,6 +1610,8 @@ def _run_skyrl_training(
             env_kwargs["agent_class"] = agent_class
         if agent_kwargs:
             env_kwargs["agent_kwargs"] = agent_kwargs
+        if trajectory_output_dir:
+            env_kwargs["trajectory_output_dir"] = trajectory_output_dir
 
         register(
             id="openctf",
@@ -983,5 +1631,6 @@ def _run_skyrl_training(
             agent_class,
             agent_kwargs or {},
             use_new_inference,
+            trajectory_output_dir,
         )
     )

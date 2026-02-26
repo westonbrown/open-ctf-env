@@ -1,6 +1,8 @@
 """Tests for ChallengeRegistry."""
 
-import os
+import json
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -90,6 +92,30 @@ class TestChallengeRegistry:
         url = reg.get_target_url("Dynastic")
         assert url is None
 
+    def test_target_overrides_file_takes_precedence(self, registry_yaml, tmp_path):
+        overrides_path = tmp_path / "targets.json"
+        overrides_path.write_text(
+            json.dumps({"challenge_targets": {"eval-me": "http://localhost:43012"}})
+        )
+        reg = ChallengeRegistry(
+            registry_yaml,
+            target_overrides_path=str(overrides_path),
+        )
+        assert reg.get_target_url("eval-me") == "http://localhost:43012"
+        # Localhost overrides still honor explicit host rewrites for callers.
+        assert reg.get_target_url("eval-me", host="127.0.0.2") == "http://127.0.0.2:43012"
+
+    def test_target_overrides_support_port_only_entries(self, registry_yaml):
+        reg = ChallengeRegistry(registry_yaml)
+        loaded = reg.set_target_overrides({"eval-me": 43055})
+        assert loaded == 1
+        assert reg.get_target_url("EvalMe") == "http://localhost:43055"
+
+    def test_target_overrides_strict_mode_raises_unknown_id(self, registry_yaml):
+        reg = ChallengeRegistry(registry_yaml)
+        with pytest.raises(KeyError, match="unknown-id"):
+            reg.set_target_overrides({"unknown-id": "http://localhost:43001"}, strict=True)
+
     def test_contains(self, registry_yaml):
         reg = ChallengeRegistry(registry_yaml)
         assert "eval-me" in reg
@@ -162,6 +188,26 @@ class TestChallengeRegistry:
         with pytest.raises(FileNotFoundError):
             ChallengeRegistry("/nonexistent/path.yaml")
 
+    def test_cybench_registry_covers_grpo_dataset(self):
+        """Guardrail: keep cybench registry IDs aligned with GRPO dataset challenge names."""
+        repo_root = Path(__file__).resolve().parents[1]
+        registry = ChallengeRegistry(str(repo_root / "configs/challenges/cybench.yaml"))
+        dataset_path = repo_root / "data/grpo_cybench40.jsonl"
+
+        missing = set()
+        with dataset_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                metadata = row.get("metadata", {})
+                challenge_id = metadata.get("challenge_id") or metadata.get("challenge")
+                if challenge_id and registry.resolve_id(str(challenge_id)) is None:
+                    missing.add(str(challenge_id))
+
+        assert not missing, f"Registry missing challenge IDs referenced by data: {sorted(missing)}"
+
 
 class TestChallengeInfo:
     def test_dataclass_defaults(self):
@@ -171,6 +217,7 @@ class TestChallengeInfo:
         assert info.ground_truth_flag is None
         assert info.aliases == []
         assert info.path_hint is None
+        assert info.target_url is None
 
     def test_full_construction(self):
         info = ChallengeInfo(
@@ -183,8 +230,10 @@ class TestChallengeInfo:
             ground_truth_flag="FLAG{test}",
             aliases=["alias-one"],
             path_hint="benchmark/test",
+            target_url="http://localhost:43001",
         )
         assert info.port == 8080
         assert info.ground_truth_flag == "FLAG{test}"
         assert info.aliases == ["alias-one"]
         assert info.path_hint == "benchmark/test"
+        assert info.target_url == "http://localhost:43001"

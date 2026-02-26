@@ -106,4 +106,8 @@ grpo:
 output:
   save_steps: 25
   logging_steps: 1
-  report_to: none
+  report_to: tensorboard
+
+grpo_logging:
+  # Trajectory logging: saves per-generation JSONL for post-run analysis.
+  enable_trajectory_logging: true

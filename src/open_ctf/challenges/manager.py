@@ -1,8 +1,12 @@
 """Challenge lifecycle manager — launch/stop Docker containers for CTF challenges."""
 
+import io
 import logging
+import os
 import re
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -43,6 +47,7 @@ class ChallengeManager:
         self._running: Dict[str, str] = {}  # challenge_id -> target_url
         self._candidate_dirs_cache: Optional[List[Path]] = None
         self._benchmark_root_cache: Optional[Path] = None
+        self._docker_preflight_ok = False
 
     @staticmethod
     def _normalize(value: str) -> str:
@@ -119,9 +124,11 @@ class ChallengeManager:
         if self._benchmark_root_cache is not None:
             return self._benchmark_root_cache
 
+        has_path_hints = any(info.path_hint for info in self.registry.list_all())
+
         # Prefer explicit benchmark layout if present.
         explicit = self.bench_dir / "benchmark"
-        if explicit.exists() and self._challenge_root_score(explicit) > 0:
+        if explicit.exists() and self._challenge_root_score(explicit) > 0 and not has_path_hints:
             self._benchmark_root_cache = explicit
             return explicit
 
@@ -132,29 +139,129 @@ class ChallengeManager:
             if (self.bench_dir / name).is_dir()
         ]
 
-        # Some repos (for example BoxPwnr) keep benchmark under nested
-        # platform folders like src/.../cybench-repo/benchmark.
+        # Some repos keep benchmark under nested platform folders
+        # like src/.../cybench-repo/benchmark.
         skip_parts = {".git", ".venv", "__pycache__", "node_modules"}
-        for candidate in self.bench_dir.rglob("benchmark"):
-            if not candidate.is_dir():
-                continue
-            if any(part in skip_parts for part in candidate.parts):
-                continue
-            roots.append(candidate)
+        search_bases = {self.bench_dir}
+        if has_path_hints and self.bench_dir.parent != self.bench_dir:
+            search_bases.add(self.bench_dir.parent)
+        if has_path_hints and self.bench_dir.parent.parent != self.bench_dir.parent:
+            search_bases.add(self.bench_dir.parent.parent)
+
+        for base in search_bases:
+            for candidate in base.rglob("benchmark"):
+                if not candidate.is_dir():
+                    continue
+                if any(part in skip_parts for part in candidate.parts):
+                    continue
+                roots.append(candidate)
+
+        # If registry path hints exist, prioritize roots with the highest
+        # path-hint coverage so mixed benchmark layouts resolve deterministically.
+        def _hint_coverage(root: Path) -> int:
+            covered = 0
+            for info in self.registry.list_all():
+                if not info.path_hint:
+                    continue
+                hint = Path(info.path_hint)
+                hint_path = hint if hint.is_absolute() else root.parent / hint
+                if hint_path.exists():
+                    covered += 1
+            return covered
 
         scored = []
         for root in roots:
-            score = self._challenge_root_score(root)
+            structure_score = self._challenge_root_score(root)
+            if structure_score <= 0:
+                continue
+            hint_score = _hint_coverage(root)
+            score = hint_score * 1000 + structure_score
             if score > 0:
-                scored.append((score, -len(root.parts), str(root), root))
+                scored.append((score, hint_score, -len(root.parts), str(root), root))
 
         if scored:
-            _, _, _, best_root = max(scored)
+            _, hint_score, _, _, best_root = max(scored)
+            if hint_score:
+                logger.info(
+                    "Selected benchmark root %s using path-hint coverage (%d matches)",
+                    best_root,
+                    hint_score,
+                )
             self._benchmark_root_cache = best_root
             return best_root
 
         self._benchmark_root_cache = self.bench_dir
         return self.bench_dir
+
+    @staticmethod
+    def _truncate_stderr(stderr: str, limit: int = 240) -> str:
+        text = (stderr or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "..."
+
+    def _docker_preflight(self) -> None:
+        """Validate Docker can run nested challenge workloads."""
+        if self._docker_preflight_ok:
+            return
+
+        preflight_timeout = max(
+            30,
+            int(os.environ.get("OPEN_CTF_DOCKER_PREFLIGHT_TIMEOUT", "120")),
+        )
+
+        try:
+            info = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("docker command not found; install Docker on the host first.") from exc
+
+        if info.returncode != 0:
+            raise RuntimeError(
+                f"Docker daemon is unavailable: {self._truncate_stderr(info.stderr or info.stdout)}"
+            )
+
+        # Probe layer import/unpack capability without registry/network dependency.
+        with tempfile.TemporaryDirectory(prefix="openctf-preflight-") as tmpdir:
+            image_ref = f"openctf-preflight-{abs(hash(tmpdir)) & 0xFFFFFFFF:x}:latest"
+            tar_path = Path(tmpdir) / "rootfs.tar"
+            payload = b"open-ctf preflight\n"
+            with tarfile.open(tar_path, "w") as tf:
+                info = tarfile.TarInfo(name="openctf_preflight.txt")
+                info.size = len(payload)
+                tf.addfile(info, io.BytesIO(payload))
+
+            import_result = subprocess.run(
+                ["docker", "import", str(tar_path), image_ref],
+                capture_output=True,
+                text=True,
+                timeout=preflight_timeout,
+            )
+            if import_result.returncode != 0:
+                stderr = self._truncate_stderr(import_result.stderr or import_result.stdout)
+                lowered = stderr.lower()
+                if any(x in lowered for x in ("operation not permitted", "unshare", "mount")):
+                    raise RuntimeError(
+                        "Docker cannot unpack image layers in this environment "
+                        f"({stderr}). Run the pod in privileged mode with nested container "
+                        "support enabled."
+                    )
+                raise RuntimeError(
+                    f"Docker image import preflight failed: {stderr}"
+                )
+
+            subprocess.run(
+                ["docker", "rmi", "-f", image_ref],
+                capture_output=True,
+                text=True,
+                timeout=preflight_timeout,
+            )
+
+        self._docker_preflight_ok = True
 
     def _list_candidate_dirs(self) -> List[Path]:
         """Index challenge-like directories in benchmark tree."""
@@ -305,6 +412,45 @@ class ChallengeManager:
 
         return sorted(set(matches), key=lambda p: (len(p.parts), str(p)))[0]
 
+    def _ensure_shared_network_exists(self) -> None:
+        """Ensure the configured Docker network exists for challenge compose files."""
+        if not self.network:
+            return
+        try:
+            result = subprocess.run(
+                ["docker", "network", "ls", "--format", "{{.Name}}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("docker command not found; install Docker on the host first.") from exc
+
+        if result.returncode != 0:
+            raise RuntimeError(f"docker network ls failed: {result.stderr}")
+
+        networks = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        if self.network in networks:
+            return
+
+        create = subprocess.run(
+            ["docker", "network", "create", self.network],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if create.returncode != 0:
+            err = self._truncate_stderr(create.stderr or create.stdout)
+            if "operation not permitted" in err.lower():
+                raise RuntimeError(
+                    f"Failed to create docker network '{self.network}': {err}. "
+                    "This host does not allow nested Docker networking (NET_ADMIN/bridge). "
+                    "Use a privileged runtime for CyBench docker challenges."
+                )
+            raise RuntimeError(
+                f"Failed to create docker network '{self.network}': {err}"
+            )
+
     def setup(self, challenge_id: str) -> str:
         """Launch a challenge's Docker container and return the target URL.
 
@@ -326,14 +472,19 @@ class ChallengeManager:
                 f"Challenge {challenge_id} is {info.infra_type}, not docker — no container to launch"
             )
 
+        self._docker_preflight()
         challenge_dir = self._challenge_dir(challenge_id)
 
         # Run init_script.sh if present (builds images, etc.)
         init_script = self._find_first(challenge_dir, ["init_script.sh"])
         if init_script:
             logger.info("Running init script for %s", challenge_id)
+            # Match BoxPwnr's CyBench calling convention: pass a writable temp dir
+            # as arg1 so init scripts that copy artifacts can run successfully.
+            tmp_dir = Path("/tmp/open-ctf") / "challenge-init" / re.sub(r"[^a-zA-Z0-9_.-]+", "_", info.id)
+            tmp_dir.mkdir(parents=True, exist_ok=True)
             result = subprocess.run(
-                ["bash", str(init_script)],
+                ["bash", str(init_script), str(tmp_dir)],
                 cwd=str(init_script.parent),
                 capture_output=True,
                 text=True,
@@ -341,6 +492,8 @@ class ChallengeManager:
             )
             if result.returncode != 0:
                 logger.warning("init_script.sh failed for %s: %s", challenge_id, result.stderr)
+
+        self._ensure_shared_network_exists()
 
         # Start with docker compose
         compose_file = self._find_first(challenge_dir, ["docker-compose.yaml", "docker-compose.yml"])
@@ -432,6 +585,9 @@ class ChallengeManager:
         if ids is None:
             ids = [c.id for c in self.registry.list_docker_challenges()]
 
+        if ids:
+            self._docker_preflight()
+
         results = {}
         for cid in ids:
             try:
@@ -459,9 +615,28 @@ class ChallengeManager:
         Returns:
             True if service responds, False otherwise.
         """
-        url = self.registry.get_target_url(challenge_id, host=self.host)
+        info = self.registry.get(challenge_id)
+        url = self.registry.get_target_url(info.id, host=self.host)
         if not url:
             return False
+
+        # Avoid false positives from unrelated host services: require at least
+        # one running docker container to expose this challenge port.
+        if info.infra_type == "docker" and info.port:
+            try:
+                ps = subprocess.run(
+                    ["docker", "ps", "--format", "{{.Ports}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if ps.returncode != 0:
+                    return False
+                expected = f":{info.port}->"
+                if expected not in ps.stdout:
+                    return False
+            except Exception:
+                return False
 
         try:
             result = subprocess.run(

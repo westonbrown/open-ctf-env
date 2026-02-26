@@ -67,16 +67,16 @@ src/open_ctf/
 │   ├── glm4.py                  # GLM-4.7 observation role + MoE tool format
 │   └── devstral.py              # Mistral INST tags + strict alternation
 ├── rewards/
-│   └── reward.py                # CTFReward (6 signals + hallucination penalty)
+│   └── reward.py                # CTFReward (8 signals + hallucination penalty)
 └── training/
     ├── sft.py                   # LlamaFactory SFT orchestrator
     ├── grpo.py                  # SkyRL GRPO orchestrator
-    ├── gepa.py                  # GEPA prompt optimizer (DSPy)
+    ├── gepa.py                  # GEPA prompt optimizer (DSPy + CTFAgentDSPyAdapter)
     └── step_reward.py           # CTFReward adapter for SkyRL per-step rewards
 
 configs/
 ├── challenges/
-│   └── cybench.yaml             # 40 CyBench challenges (15 docker + 25 static)
+│   └── cybench.yaml             # 40 CyBench challenges (25 docker + 15 static)
 ├── llamafactory/                # Per-model SFT configs
 │   ├── nanbeige_3b.yaml
 │   ├── glm47_flash.yaml
@@ -161,8 +161,8 @@ flowchart LR
 
 - **Generator** (Ray actor): vLLM inference engine produces 8 completions per prompt.
 - **Environment** (`OpenCTFTextEnv`): Each generation gets its own env instance with a `SubprocessExecutor` for tool execution. No HTTP server — direct subprocess calls.
-- **Trainer** (Ray actor): FSDP2 computes DAPO loss with RLOO-N advantage estimation.
-- **Placement**: `colocate_all: true` offloads weights to CPU between generation and training phases. Eliminates weight sync issues for MoE models.
+- **Trainer** (Ray actor): FSDP2 computes DAPO loss with config-driven advantage estimation (for example RLOO or RLOO-N).
+- **Placement**: Current Qwen3.5 RunPod/B200 baseline uses `run_engines_locally: true` + `colocate_all: false` (trainer and vLLM on separate GPUs).
 
 ### Tool Execution
 
@@ -202,7 +202,7 @@ LlamaFactory and SkyRL configs use each framework's native format directly — n
 | Samples per prompt | N/A | 8 |
 | Max tool turns | N/A | 50 |
 | Trainer strategy | Single GPU / DeepSpeed | FSDP2 + Ray |
-| Advantage estimator | N/A | RLOO-N |
+| Advantage estimator | N/A | RLOO / RLOO-N (config-dependent) |
 
 ## Container Strategy
 
@@ -262,7 +262,7 @@ Evaluation uses the same BoxPwnr scaffold as data collection. The only variable 
 MoE models (GLM-4.7-Flash) have unique constraints documented in their config files:
 - No 4-bit quantization (BitsAndBytes + MoE routing incompatibility)
 - `batch_size=1` (MoE routing NaN with padding tokens)
-- `colocate_all: true` (safe default for weight sync)
+- `colocate_all: true` for legacy colocated MoE profiles (Qwen3.5/B200 baseline uses non-colocated local engines)
 - Router layers excluded from LoRA targets
 
 ## Hardware Compatibility
@@ -271,7 +271,7 @@ MoE models (GLM-4.7-Flash) have unique constraints documented in their config fi
 |----------|----------------|----------------|------------------|-----------------|
 | DGX Spark GB10 (128GB) | QLoRA 4-bit | BF16 LoRA | Colocate mode | Colocate mode |
 | H200 (141GB) | QLoRA 4-bit | BF16 LoRA | Colocate mode | Zero-offload possible |
-| B200 (192GB) | QLoRA 4-bit | BF16 LoRA | Colocate mode | Zero-offload (fastest) |
+| B200 (192GB) | QLoRA 4-bit | BF16 LoRA | Non-colocated local engines | Non-colocated local engines |
 
 ## Extension Points
 

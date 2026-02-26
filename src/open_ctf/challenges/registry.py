@@ -1,10 +1,12 @@
 """Challenge registry — maps challenge IDs to infrastructure requirements."""
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 import yaml
 
@@ -23,6 +25,7 @@ class ChallengeInfo:
     ground_truth_flag: Optional[str] = None
     aliases: List[str] = field(default_factory=list)
     path_hint: Optional[str] = None
+    target_url: Optional[str] = None
 
 
 class ChallengeRegistry:
@@ -34,9 +37,12 @@ class ChallengeRegistry:
         url = registry.get_target_url("eval-me")  # -> "http://localhost:32805"
     """
 
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, target_overrides_path: Optional[str] = None):
         self._challenges: Dict[str, ChallengeInfo] = {}
+        self._target_overrides: Dict[str, str] = {}
         self._load(config_path)
+        if target_overrides_path:
+            self.load_target_overrides(target_overrides_path)
 
     @staticmethod
     def _normalize(value: str) -> str:
@@ -51,6 +57,7 @@ class ChallengeRegistry:
             "a",
             "an",
             "and",
+            "id",
             "very",
             "easy",
             "medium",
@@ -63,6 +70,58 @@ class ChallengeRegistry:
             for tok in re.split(r"[^a-z0-9]+", value.lower())
             if tok and tok not in stop_tokens and not tok.isdigit()
         }
+
+    @staticmethod
+    def _normalize_target_url(raw_value: Any) -> Optional[str]:
+        """Normalize a target URL/endpoint declaration to an absolute HTTP URL."""
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, (int, float)):
+            raw = f"http://localhost:{int(raw_value)}"
+        else:
+            raw = str(raw_value).strip()
+        if not raw:
+            return None
+        if raw.startswith(("http://", "https://")):
+            return raw
+        if re.fullmatch(r"\d+", raw):
+            return f"http://localhost:{raw}"
+        if re.fullmatch(r"[^:/\s]+:\d+", raw):
+            return f"http://{raw}"
+        return raw
+
+    @staticmethod
+    def _rewrite_url_host(url: str, host: str) -> str:
+        """Rewrite localhost-style URLs for caller-specified host overrides."""
+        if "{host}" in url:
+            return url.replace("{host}", host)
+
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return url
+        if host == "localhost":
+            return url
+        if parsed.hostname not in {"localhost", "127.0.0.1"}:
+            return url
+
+        netloc_host = host
+        if parsed.username:
+            auth = parsed.username
+            if parsed.password:
+                auth += f":{parsed.password}"
+            netloc_host = f"{auth}@{netloc_host}"
+        if parsed.port is not None:
+            netloc_host = f"{netloc_host}:{parsed.port}"
+        return urlunparse(
+            (
+                parsed.scheme,
+                netloc_host,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
 
     def _load(self, config_path: str) -> None:
         path = Path(config_path)
@@ -88,10 +147,97 @@ class ChallengeRegistry:
                 ground_truth_flag=entry.get("ground_truth_flag"),
                 aliases=[str(x) for x in aliases],
                 path_hint=entry.get("path_hint"),
+                target_url=self._normalize_target_url(
+                    entry.get("target_url", entry.get("target"))
+                ),
             )
             self._challenges[info.id] = info
 
         logger.info("Loaded %d challenges from %s", len(self._challenges), config_path)
+
+    @staticmethod
+    def _extract_target_mapping(payload: Any) -> Dict[str, Any]:
+        """Extract a challenge_id -> endpoint mapping from common JSON/YAML shapes."""
+        if isinstance(payload, list):
+            mapping: Dict[str, Any] = {}
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                cid = item.get("id") or item.get("challenge_id") or item.get("challenge")
+                if not cid:
+                    continue
+                mapping[str(cid)] = item
+            return mapping
+
+        if not isinstance(payload, dict):
+            return {}
+
+        # Common wrapper keys used by deployment scripts.
+        for key in ("challenge_targets", "target_overrides", "targets", "challenge_urls"):
+            inner = payload.get(key)
+            if isinstance(inner, (dict, list)):
+                return ChallengeRegistry._extract_target_mapping(inner)
+
+        # Export shape from scripts can use "challenges": [{id, target_url, ...}]
+        challenges = payload.get("challenges")
+        if isinstance(challenges, list):
+            return ChallengeRegistry._extract_target_mapping(challenges)
+
+        # Assume direct mapping.
+        return {str(k): v for k, v in payload.items()}
+
+    @staticmethod
+    def _coerce_mapping_value(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            direct = value.get("target_url", value.get("target", value.get("url")))
+            normalized = ChallengeRegistry._normalize_target_url(direct)
+            if normalized:
+                return normalized
+            port = value.get("port")
+            host = value.get("host", "localhost")
+            if port is not None:
+                return ChallengeRegistry._normalize_target_url(f"{host}:{int(port)}")
+            return None
+        return ChallengeRegistry._normalize_target_url(value)
+
+    def set_target_overrides(self, mapping: Dict[str, Any], strict: bool = False) -> int:
+        """Apply target URL overrides keyed by challenge id/name/alias."""
+        loaded = 0
+        for raw_key, raw_value in mapping.items():
+            resolved_id = self.resolve_id(str(raw_key))
+            if resolved_id is None:
+                if strict:
+                    raise KeyError(f"Unknown challenge in target override mapping: {raw_key}")
+                logger.warning("Ignoring unknown challenge target override key: %s", raw_key)
+                continue
+            target = self._coerce_mapping_value(raw_value)
+            if not target:
+                if strict:
+                    raise ValueError(f"Invalid target override for challenge {raw_key!r}: {raw_value!r}")
+                logger.warning("Ignoring invalid target override for %s: %r", raw_key, raw_value)
+                continue
+            self._target_overrides[resolved_id] = target
+            loaded += 1
+        return loaded
+
+    def load_target_overrides(self, path: str, strict: bool = False) -> int:
+        """Load challenge target URL overrides from JSON or YAML file."""
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Target overrides file not found: {path}")
+        text = p.read_text()
+        payload: Any
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = yaml.safe_load(text)
+        mapping = self._extract_target_mapping(payload)
+        loaded = self.set_target_overrides(mapping, strict=strict)
+        logger.info("Loaded %d challenge target overrides from %s", loaded, path)
+        return loaded
+
+    def get_target_overrides(self) -> Dict[str, str]:
+        return dict(self._target_overrides)
 
     def resolve_id(self, challenge_id: str) -> Optional[str]:
         """Resolve challenge ID/name/alias to a canonical registry ID."""
@@ -176,6 +322,11 @@ class ChallengeRegistry:
     def get_target_url(self, challenge_id: str, host: str = "localhost") -> Optional[str]:
         """Get the target URL for a challenge, or None for static challenges."""
         info = self.get(challenge_id)
+        override = self._target_overrides.get(info.id)
+        if override:
+            return self._rewrite_url_host(override, host=host)
+        if info.target_url:
+            return self._rewrite_url_host(info.target_url, host=host)
         if info.infra_type == "docker" and info.port:
             return f"http://{host}:{info.port}"
         return None

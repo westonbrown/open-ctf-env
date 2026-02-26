@@ -1,275 +1,308 @@
-# CyBench Challenge Registry
-# Maps 40 challenges to infrastructure requirements for online RL training.
-# infra_type: "docker" = needs running container, "static" = file-based (no server)
+# CyBench Challenge Registry (auto-aligned with task_list.txt)
+# Generated from BoxPwnr cybench-repo metadata and launch artifacts.
 
 challenges:
-  # ---- Crypto (15 challenges) ----
-  - id: "Dynastic"
-    name: "[Very Easy] Dynastic"
+  - id: "noisier-crc"
+    name: "noisier-crc"
     category: crypto
-    difficulty: very_easy
-    infra_type: static
+    difficulty: expert
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2023/crypto/noisier-crc"
+    port: 9999
 
-  - id: "Primary Knowledge"
+  - id: "just-another-pickle-jail"
+    name: "just-another-pickle-jail"
+    category: misc
+    difficulty: master
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2023/misc/just-another-pickle-jail"
+    port: 1337
+
+  - id: "chunky"
+    name: "chunky"
+    category: web
+    difficulty: hard
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2023/web/chunky"
+    port: 8080
+
+  - id: "network-tools"
+    name: "network-tools"
+    category: pwn
+    difficulty: medium
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2023/pwn/network-tools"
+    port: 1337
+
+  - id: "[Very Easy] Primary Knowledge"
     name: "[Very Easy] Primary Knowledge"
     category: crypto
-    difficulty: very_easy
-    infra_type: static
-
-  - id: "makeshift"
-    name: "[Very Easy] makeshift"
-    category: crypto
-    difficulty: very_easy
-    infra_type: static
-
-  - id: "Iced TEA"
-    name: "[Easy] Iced TEA"
-    category: crypto
     difficulty: easy
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Primary Knowledge"
 
-  - id: "Blunt"
-    name: "[Easy] Blunt"
-    category: crypto
-    difficulty: easy
-    infra_type: static
-
-  - id: "Partial Tenacity"
-    name: "[Easy] Partial Tenacity"
-    category: crypto
-    difficulty: easy
-    infra_type: static
-
-  - id: "ROT128"
-    name: "[Easy] ROT128"
-    category: crypto
-    difficulty: easy
-    infra_type: static
-
-  - id: "Arranged"
-    name: "[Medium] Arranged"
-    category: crypto
-    difficulty: medium
-    infra_type: static
-
-  - id: "Bloom Bloom"
-    name: "[Medium] Bloom Bloom"
-    category: crypto
-    difficulty: medium
-    infra_type: static
-
-  - id: "Down the Rabbithole"
-    name: "[Medium] Down the Rabbithole"
-    category: crypto
-    difficulty: medium
-    infra_type: static
-
-  - id: "Permuted"
-    name: "[Medium] Permuted"
-    category: crypto
-    difficulty: medium
-    infra_type: static
-
-  - id: "the-three-eyed-oracle"
-    name: "[Medium] the-three-eyed-oracle"
-    category: crypto
-    difficulty: medium
-    infra_type: docker
-    # cybench-patched uses a different nested naming scheme.
-    aliases:
-      - "[Hard] Oracle"
-    port: 32801
-
-  - id: "tsb"
-    name: "[Medium] tsb"
-    category: crypto
-    difficulty: medium
-    infra_type: static
-
-  - id: "Probing"
-    name: "[Hard] Probing"
-    category: crypto
-    difficulty: hard
-    infra_type: docker
-    aliases:
-      - "[Hard] Permuted"
-    port: 32802
-
-  - id: "RsaCtfTool"
-    name: "[Hard] RsaCtfTool"
+  - id: "[Medium] Partial Tenacity"
+    name: "[Medium] Partial Tenacity"
     category: crypto
     difficulty: hard
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/crypto/[Medium] Partial Tenacity"
 
-  # ---- Forensics (4 challenges) ----
-  - id: "LootStash"
-    name: "[Very Easy] LootStash"
+  - id: "[Very Easy] Dynastic"
+    name: "[Very Easy] Dynastic"
+    category: crypto
+    difficulty: easy
+    infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Dynastic"
+
+  - id: "[Very Easy] It Has Begun"
+    name: "[Very Easy] It Has Begun"
     category: forensics
     difficulty: very_easy
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/forensics/[Very Easy] It Has Begun"
 
-  - id: "Urgent"
+  - id: "[Very Easy] Urgent"
     name: "[Very Easy] Urgent"
     category: forensics
     difficulty: very_easy
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/forensics/[Very Easy] Urgent"
 
-  - id: "It Has Begun"
-    name: "[Easy] It Has Begun"
-    category: forensics
+  - id: "[Medium] Were Pickle Phreaks Revenge"
+    name: "[Medium] Were Pickle Phreaks Revenge"
+    category: misc
+    difficulty: hard
+    infra_type: docker
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/misc/[Medium] Were Pickle Phreaks Revenge"
+    port: 1337
+
+  - id: "[Very Easy] Delulu"
+    name: "[Very Easy] Delulu"
+    category: pwn
+    difficulty: easy
+    infra_type: docker
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/pwn/[Very Easy] Delulu"
+    port: 1337
+
+  - id: "[Very Easy] PackedAway"
+    name: "[Very Easy] PackedAway"
+    category: reverse
+    difficulty: very_easy
+    infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/reversing/[Very Easy] PackedAway"
+
+  - id: "[Easy] Crushing"
+    name: "[Easy] Crushing"
+    category: reverse
     difficulty: easy
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/reversing/[Easy] Crushing"
 
-  - id: "Phreaky"
-    name: "[Medium] Phreaky"
-    category: forensics
-    difficulty: medium
+  - id: "[Hard] FlecksOfGold"
+    name: "[Hard] FlecksOfGold"
+    category: reverse
+    difficulty: expert
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/reversing/[Hard] FlecksOfGold"
 
-  # ---- Misc (10 challenges) ----
-  - id: "Flag Command"
-    name: "[Very Easy] Flag Command"
-    category: misc
-    difficulty: very_easy
-    infra_type: docker
-    port: 32803
+  - id: "MissingBits"
+    name: "MissingBits"
+    category: crypto
+    difficulty: expert
+    infra_type: static
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/crypto/MissingBits"
 
-  - id: "Stop Drop and Roll"
-    name: "[Very Easy] Stop Drop and Roll"
-    category: misc
-    difficulty: very_easy
-    infra_type: docker
-    port: 32804
+  - id: "SLCG"
+    name: "SLCG"
+    category: crypto
+    difficulty: expert
+    infra_type: static
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/crypto/SLCG"
 
-  - id: "eval-me"
-    name: "[Very Easy] eval-me"
-    category: misc
-    difficulty: very_easy
+  - id: "WalkingToTheSeaSide"
+    name: "WalkingToTheSeaSide"
+    category: crypto
+    difficulty: expert
     infra_type: docker
-    port: 32805
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/crypto/WalkingToTheSeaSide"
+    port: 1234
+
+  - id: "shuffled-aes"
+    name: "shuffled-aes"
+    category: crypto
+    difficulty: expert
+    infra_type: docker
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/crypto/shuffled-aes"
+    port: 1337
+
+  - id: "skilift"
+    name: "skilift"
+    category: intro
+    difficulty: easy
+    infra_type: docker
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/intro/skilift"
+    port: 1337
 
   - id: "avatar"
-    name: "[Very Easy] avatar"
+    name: "avatar"
     category: misc
-    difficulty: very_easy
+    difficulty: expert
     infra_type: docker
-    port: 32806
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/misc/avatar"
+    port: 1337
 
-  - id: "Character"
-    name: "[Easy] Character"
-    category: misc
-    difficulty: easy
+  - id: "rpgo"
+    name: "rpgo"
+    category: rev
+    difficulty: hard
+    infra_type: static
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/rev/rpgo"
+
+  - id: "sop"
+    name: "sop"
+    category: rev
+    difficulty: expert
+    infra_type: static
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/rev/sop"
+
+  - id: "GlacierExchange"
+    name: "GlacierExchange"
+    category: web
+    difficulty: expert
     infra_type: docker
-    port: 32807
+    path_hint: "benchmark/LosFuzzys/GlacierCTF2023_writeups/web/GlacierExchange"
+    port: 8080
 
-  - id: "Colored Squares"
-    name: "[Easy] Colored Squares"
-    category: misc
-    difficulty: easy
-    infra_type: static
+  - id: "diffecient"
+    name: "diffecient"
+    category: crypto
+    difficulty: hard
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2022/crypto/diffecient"
+    port: 9999
 
-  - id: "meerkat"
-    name: "[Easy] meerkat"
-    category: misc
-    difficulty: easy
-    infra_type: static
+  - id: "robust-cbc"
+    name: "robust-cbc"
+    category: crypto
+    difficulty: expert
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2022/crypto/robust-cbc"
+    port: 1337
 
-  - id: "Compressor"
-    name: "[Medium] Compressor"
-    category: misc
+  - id: "ezmaze"
+    name: "ezmaze"
+    category: crypto
+    difficulty: hard
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2022/crypto/ezmaze"
+    port: 9999
+
+  - id: "randsubware"
+    name: "randsubware"
+    category: crypto
+    difficulty: master
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2023/crypto/randsubware"
+    port: 1337
+
+  - id: "frog-waf"
+    name: "frog-waf"
+    category: web
+    difficulty: hard
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2023/web/frog-waf"
+    port: 1337
+
+  - id: "[Medium] Data Siege"
+    name: "[Medium] Data Siege"
+    category: forensics
     difficulty: medium
-    infra_type: docker
-    aliases:
-      - "[Medium] Data Siege"
-    port: 32808
-
-  - id: "MultiDigilingual"
-    name: "[Medium] MultiDigilingual"
-    category: misc
-    difficulty: medium
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/forensics/[Medium] Data Siege"
 
   - id: "05-motp"
-    name: "[Hard] 05-motp"
-    category: misc
-    difficulty: hard
-    infra_type: docker
-    port: 32809
-
-  # ---- Web (6 challenges) ----
-  - id: "TimeKORP"
-    name: "[Easy] TimeKORP"
-    category: web
-    difficulty: easy
-    infra_type: docker
-    port: 32810
-
-  - id: "Labyrinth Linguist"
-    name: "[Medium] Labyrinth Linguist"
+    name: "05-motp"
     category: web
     difficulty: medium
     infra_type: docker
-    port: 32811
+    path_hint: "benchmark/hkcert-ctf/CTF-Challenges/CTF-2022/05-motp"
+    port: 80
 
-  - id: "chunky"
-    name: "[Medium] chunky"
-    category: web
-    difficulty: medium
-    infra_type: docker
-    port: 32812
-
-  - id: "KORP Terminal"
-    name: "[Easy] KORP Terminal"
+  - id: "[Easy] Labyrinth Linguist"
+    name: "[Easy] Labyrinth Linguist"
     category: web
     difficulty: easy
     infra_type: docker
-    port: 32813
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/web/[Easy] Labyrinth Linguist"
+    port: 1337
 
-  - id: "ProxyAsAService"
-    name: "[Easy] ProxyAsAService"
-    category: web
-    difficulty: easy
-    infra_type: docker
-    aliases:
-      - "[Easy] Labyrinth Linguist"
-    port: 32814
-
-  - id: "LoveTok"
-    name: "[Easy] LoveTok"
-    category: web
-    difficulty: easy
-    infra_type: docker
-    aliases:
-      - "[Medium] LockTalk"
-    port: 32815
-
-  # ---- Rev (5 challenges) ----
-  - id: "BabyRE"
-    name: "[Very Easy] BabyRE"
-    category: rev
+  - id: "[Very Easy] LootStash"
+    name: "[Very Easy] LootStash"
+    category: reverse
     difficulty: very_easy
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/reversing/[Very Easy] LootStash"
 
-  - id: "Crushing"
-    name: "[Easy] Crushing"
-    category: rev
-    difficulty: easy
-    infra_type: static
-
-  - id: "FollowThePath"
-    name: "[Easy] FollowThePath"
-    category: rev
-    difficulty: easy
-    infra_type: static
-
-  - id: "Packed Away"
-    name: "[Medium] Packed Away"
-    category: rev
-    difficulty: medium
-    infra_type: static
-
-  - id: "Metagaming"
-    name: "[Hard] Metagaming"
-    category: rev
+  - id: "[Hard] Permuted"
+    name: "[Hard] Permuted"
+    category: crypto
     difficulty: hard
     infra_type: static
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/crypto/[Hard] Permuted"
+
+  - id: "22-back-to-the-past"
+    name: "22-back-to-the-past"
+    category: misc
+    difficulty: easy
+    infra_type: docker
+    path_hint: "benchmark/hkcert-ctf/CTF-Challenges/CTF-2022/22-back-to-the-past"
+    port: 8081
+
+  - id: "[Very Easy] Flag Command"
+    name: "[Very Easy] Flag Command"
+    category: web
+    difficulty: very_easy
+    infra_type: docker
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/web/[Very Easy] Flag Command"
+    port: 1337
+
+  - id: "[Easy] Unbreakable"
+    name: "[Easy] Unbreakable"
+    category: misc
+    difficulty: easy
+    infra_type: docker
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/misc/[Easy] Unbreakable"
+    port: 1337
+
+  - id: "[Medium] LockTalk"
+    name: "[Medium] LockTalk"
+    category: web
+    difficulty: hard
+    infra_type: docker
+    path_hint: "benchmark/hackthebox/cyber-apocalypse-2024/web/[Medium] LockTalk"
+    port: 1337
+
+  - id: "noisy-crc"
+    name: "noisy-crc"
+    category: crypto
+    difficulty: hard
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2023/crypto/noisy-crc"
+    port: 9999
+
+  - id: "eval-me"
+    name: "eval-me"
+    category: forensics
+    difficulty: easy
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2023/forensics/eval-me"
+    port: 1337
+
+  - id: "failproof"
+    name: "failproof"
+    category: crypto
+    difficulty: expert
+    infra_type: docker
+    path_hint: "benchmark/project-sekai-ctf/sekaictf-2022/crypto/failproof"
+    port: 9999

@@ -11,9 +11,15 @@ import os
 import pytest
 from pathlib import Path
 
+import yaml
+
+from open_ctf.challenges.registry import ChallengeRegistry
 from open_ctf.training.grpo import (
     _convert_grpo_data,
     _build_skyrl_config,
+    _is_qwen3_5_config,
+    _validate_qwen3_5_runtime_dependencies,
+    _resolve_reward_config,
     _should_force_legacy_inference,
     _resolve_vllm_ready_model_path,
 )
@@ -68,6 +74,10 @@ def _write_grpo_jsonl(path, samples=None):
 
 
 class TestConvertGRPOData:
+    @staticmethod
+    def _write_registry(path: Path, challenges: list[dict]) -> None:
+        path.write_text(yaml.safe_dump({"challenges": challenges}))
+
     def test_output_file_created(self, tmp_path):
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src)
@@ -175,6 +185,104 @@ class TestConvertGRPOData:
         assert row["prompt"][-1]["role"] == "user"
         assert "flag" in row["prompt"][-1]["content"].lower()
 
+    def test_registry_filter_drops_unresolved_samples(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(
+            src,
+            samples=[
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Challenge A"},
+                    ],
+                    "ground_truth_flag": "FLAG{a}",
+                    "metadata": {"challenge_id": "known-id"},
+                },
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Challenge B"},
+                    ],
+                    "ground_truth_flag": "FLAG{b}",
+                    "metadata": {"challenge_id": "missing-id"},
+                },
+            ],
+        )
+        registry_path = tmp_path / "registry.yaml"
+        self._write_registry(
+            registry_path,
+            challenges=[
+                {
+                    "id": "known-id",
+                    "name": "Known Challenge",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "static",
+                }
+            ],
+        )
+        registry = ChallengeRegistry(str(registry_path))
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(
+            str(src),
+            output_dir,
+            registry=registry,
+            drop_unresolved_registry_samples=True,
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+
+        assert len(rows) == 1
+        assert rows[0]["challenge_id"] == "known-id"
+
+    def test_registry_resolves_alias_to_canonical_id(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(
+            src,
+            samples=[
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Alias challenge"},
+                    ],
+                    "ground_truth_flag": "FLAG{x}",
+                    "metadata": {"challenge_id": "[Very Easy] eval-me"},
+                }
+            ],
+        )
+        registry_path = tmp_path / "registry.yaml"
+        self._write_registry(
+            registry_path,
+            challenges=[
+                {
+                    "id": "eval-me",
+                    "name": "[Very Easy] eval-me",
+                    "aliases": ["EvalMe"],
+                    "category": "misc",
+                    "difficulty": "very_easy",
+                    "infra_type": "docker",
+                    "port": 32805,
+                }
+            ],
+        )
+        registry = ChallengeRegistry(str(registry_path))
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(
+            str(src),
+            output_dir,
+            registry=registry,
+            drop_unresolved_registry_samples=True,
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+
+        assert row["challenge_id"] == "eval-me"
+        assert row["target"] == "http://localhost:32805"
+
 
 # ---------------------------------------------------------------------------
 # _build_skyrl_config
@@ -248,6 +356,39 @@ class TestBuildSkyrlConfig:
     def test_generator_max_turns(self, config):
         result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
         assert result["generator"]["max_turns"] == 15
+
+    def test_generator_max_turns_invalid_falls_back(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["grpo"]["max_tool_calling_iterations"] = 0
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["generator"]["max_turns"] == 15
+
+    def test_vllm_model_len_respects_prompt_plus_completion(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["model"]["max_seq_length"] = 131072
+        cfg["grpo"]["max_prompt_length"] = 6000
+        cfg["grpo"]["max_completion_length"] = 3000
+        # Intentionally too small; builder should bump to prompt+completion.
+        cfg["grpo"]["vllm_max_model_len"] = 7000
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["generator"]["engine_init_kwargs"]["max_model_len"] == 9000
+
+    def test_inference_parallel_sizes_propagate(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["grpo"]["inference_engine_tensor_parallel_size"] = 2
+        cfg["grpo"]["inference_engine_pipeline_parallel_size"] = 1
+        cfg["grpo"]["inference_engine_data_parallel_size"] = 3
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        gen = result["generator"]
+        assert gen["inference_engine_tensor_parallel_size"] == 2
+        assert gen["inference_engine_pipeline_parallel_size"] == 1
+        assert gen["inference_engine_data_parallel_size"] == 3
+
+    def test_max_env_workers_is_configurable(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["grpo"]["max_env_workers"] = 40
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["environment"]["skyrl_gym"]["max_env_workers"] == 40
 
     def test_generator_server_mode_without_url_uses_local_non_colocate(self, config):
         cfg = json.loads(json.dumps(config))
@@ -612,6 +753,11 @@ class TestRegistryIntegration:
         from open_ctf.challenges.registry import ChallengeRegistry
         return ChallengeRegistry(str(path))
 
+    @staticmethod
+    def _write_registry(path: Path, challenges: list[dict]) -> ChallengeRegistry:
+        path.write_text(yaml.safe_dump({"challenges": challenges}))
+        return ChallengeRegistry(str(path))
+
     def test_registry_provides_target_when_missing(self, tmp_path):
         """Registry should provide target URL when not in user message."""
         registry = self._make_registry(tmp_path)
@@ -656,6 +802,33 @@ class TestRegistryIntegration:
             row = next(iter(reader))
         assert row["target"] == "http://localhost:9999"  # Message URL wins
 
+    def test_prefer_registry_target_overrides_message_url(self, tmp_path):
+        """When enabled, registry target should replace stale in-message URLs."""
+        registry = self._make_registry(tmp_path)
+
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Solve at http://localhost:9999"},
+                ],
+                "ground_truth_flag": "FLAG{override}",
+                "metadata": {"challenge_id": "eval-me"},
+            })
+
+        output_dir = str(tmp_path / "out")
+        result = _convert_grpo_data(
+            str(src),
+            output_dir,
+            registry=registry,
+            prefer_registry_target=True,
+        )
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] == "http://localhost:32805"
+
     def test_static_challenge_gets_none_from_registry(self, tmp_path):
         """Static challenges should get target=None even with registry."""
         registry = self._make_registry(tmp_path)
@@ -699,3 +872,127 @@ class TestRegistryIntegration:
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["target"] is None
+
+    def test_registry_target_override_used_by_converter(self, tmp_path):
+        registry = self._make_registry(tmp_path)
+        registry.set_target_overrides({"eval-me": "http://localhost:43012"})
+
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Solve eval-me."},
+                ],
+                "ground_truth_flag": "FLAG{eval}",
+                "metadata": {"challenge_id": "eval-me"},
+            })
+
+        result = _convert_grpo_data(str(src), str(tmp_path / "out"), registry=registry)
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] == "http://localhost:43012"
+
+    def test_convert_raises_when_target_collisions_enabled(self, tmp_path):
+        registry = self._write_registry(
+            tmp_path / "registry.yaml",
+            challenges=[
+                {
+                    "id": "a",
+                    "name": "Alpha",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 1337,
+                },
+                {
+                    "id": "b",
+                    "name": "Beta",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 1337,
+                },
+            ],
+        )
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            for challenge_id in ("a", "b"):
+                w.write({
+                    "messages": [
+                        {"role": "system", "content": "Agent."},
+                        {"role": "user", "content": f"Solve {challenge_id}."},
+                    ],
+                    "ground_truth_flag": "FLAG{x}",
+                    "metadata": {"challenge_id": challenge_id},
+                })
+
+        with pytest.raises(ValueError, match="Target URL collisions detected"):
+            _convert_grpo_data(
+                str(src),
+                str(tmp_path / "out"),
+                registry=registry,
+                fail_on_target_collisions=True,
+            )
+
+
+class TestRuntimeGuards:
+    def test_is_qwen3_5_config_detects_model_type(self):
+        class _Cfg:
+            model_type = "qwen3_5"
+            architectures = []
+
+        assert _is_qwen3_5_config(_Cfg()) is True
+
+    def test_is_qwen3_5_config_detects_architecture(self):
+        class _Cfg:
+            model_type = "custom"
+            architectures = ["Qwen3_5ForConditionalGeneration"]
+
+        assert _is_qwen3_5_config(_Cfg()) is True
+
+    def test_validate_qwen3_5_runtime_dependencies_raises_when_missing(self, monkeypatch):
+        from open_ctf.training import grpo as grpo_mod
+
+        class _Cfg:
+            model_type = "qwen3_5"
+            architectures = ["Qwen3_5ForConditionalGeneration"]
+
+        monkeypatch.setattr(
+            grpo_mod,
+            "_missing_qwen3_5_fast_path_deps",
+            lambda: ["flash-linear-attention (module: fla)", "causal-conv1d"],
+        )
+
+        with pytest.raises(RuntimeError, match="flash-linear-attention"):
+            _validate_qwen3_5_runtime_dependencies(
+                _Cfg(),
+                {"require_fast_linear_attention": True},
+            )
+
+    def test_validate_qwen3_5_runtime_dependencies_allows_override(self, monkeypatch):
+        from open_ctf.training import grpo as grpo_mod
+
+        class _Cfg:
+            model_type = "qwen3_5"
+            architectures = ["Qwen3_5ForConditionalGeneration"]
+
+        monkeypatch.setattr(
+            grpo_mod,
+            "_missing_qwen3_5_fast_path_deps",
+            lambda: ["flash-linear-attention (module: fla)"],
+        )
+
+        _validate_qwen3_5_runtime_dependencies(
+            _Cfg(),
+            {"require_fast_linear_attention": False},
+        )
+
+    def test_resolve_reward_config_defaults_to_empty_dict(self):
+        assert _resolve_reward_config({}) == {}
+
+    def test_resolve_reward_config_rejects_non_dict(self):
+        with pytest.raises(TypeError, match="config\\['reward'\\] must be a dict"):
+            _resolve_reward_config({"reward": "bad"})

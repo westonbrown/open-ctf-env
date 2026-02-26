@@ -176,25 +176,41 @@ open-ctf-synthetic-data \
 ### Train
 
 ```bash
-# Stage 1: SFT via LlamaFactory
+# Stage 1: SFT via TRL (Qwen3.5 baseline)
 open-ctf-train sft \
-    --model THUDM/GLM-4.7-Flash \
+    --model Qwen/Qwen3.5-27B \
     --data data/sft.jsonl \
-    --output outputs/sft \
-    --config configs/llamafactory/glm47_flash.yaml
+    --output outputs/sft-qwen35 \
+    --backend trl \
+    --config src/open_ctf/configs/training_qwen35_27b.yaml
 
 # Merge LoRA adapter into base
 open-ctf-train merge \
-    --adapter outputs/sft/final \
-    --base-model THUDM/GLM-4.7-Flash \
-    --output outputs/sft-merged
+    --adapter outputs/sft-qwen35/final \
+    --base-model Qwen/Qwen3.5-27B \
+    --output outputs/sft-qwen35-merged
 
 # Stage 2: GRPO via SkyRL
 open-ctf-train grpo \
-    --model outputs/sft-merged \
-    --data data/grpo.jsonl \
-    --output outputs/grpo \
-    --config configs/skyrl/glm47_flash.yaml
+    --model outputs/sft-qwen35-merged \
+    --data data/grpo_cybench40.jsonl \
+    --output outputs/grpo-qwen35 \
+    --config src/open_ctf/configs/training_qwen35_27b.yaml \
+    --challenge-registry configs/challenges/cybench.yaml
+```
+
+If challenges run on a different host than the trainer (for example DGX + RunPod tunnel), export live challenge targets and pass the map at launch:
+
+```bash
+# On challenge host
+PYTHONPATH=src python3 scripts/generate_live_target_map.py \
+    --registry configs/challenges/cybench.yaml \
+    --benchmark-root /workspace/cybench \
+    --port-offset 10200 \
+    --output /tmp/cybench_targets.json
+
+# On trainer host
+OPEN_CTF_TARGET_MAP_PATH=/tmp/cybench_targets.json open-ctf-train grpo ...
 ```
 
 During online GRPO, the model generates tool calls that are executed locally by the `ToolExecutor` (subprocess per env worker). SkyRL handles distributing the simulation environments alongside the vLLM engine across Ray workers.
@@ -244,16 +260,18 @@ Data is generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) -
 
 ## Reward Function
 
-The CTF reward for GRPO training uses **6 signals + 1 penalty**:
+The CTF reward for GRPO training uses **8 signals + 1 penalty**:
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
 | **Flag Capture** | 0.20 | `metadata.success` > exact match > pattern match (0.1) |
-| **Efficiency** | 0.25 | `min(optimal / actual, 1.0)` |
-| **Format** | 0.20 | Valid tool call JSON structure |
-| **Progression** | 0.15 | RECON -> ENUM -> EXPLOIT phase ordering |
-| **Exploration** | 0.10 | Novel tool usage weighted toward early trajectory |
-| **Uniqueness** | 0.10 | Command diversity (detects stuck loops) |
+| **Efficiency** | 0.20 | `min(optimal / actual, 1.0)` |
+| **Progression** | 0.12 | RECON -> ENUM -> EXPLOIT phase ordering |
+| **Exploration** | 0.08 | Novel tool usage weighted toward early trajectory |
+| **Uniqueness** | 0.08 | Command diversity (detects stuck loops) |
+| **Format** | 0.15 | Valid tool call structure and schema compliance |
+| **Recovery** | 0.07 | Recovers from failed commands and retries productively |
+| **Cognitive** | 0.10 | Reward for coherent reasoning/execution progression |
 | **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag |
 
 All process signals are ungated -- they provide gradient signal regardless of flag capture.
@@ -272,28 +290,27 @@ To add a new model: create `configs/llamafactory/<model>.yaml` and `configs/skyr
 
 ## GEPA Prompt Optimization (Stage 3)
 
-After SFT and GRPO train the model weights, [GEPA](https://arxiv.org/abs/2507.19457) (Genetic-Pareto reflective prompt evolution) optimizes the system prompt **without weight updates**. GEPA reflects on execution traces to evolve better instructions, using Pareto-based candidate selection to avoid local optima. It outperforms GRPO by ~6% avg with 4-35x fewer rollouts (ICLR 2026 Oral).
+After SFT and GRPO train the model weights, [GEPA](https://arxiv.org/abs/2507.19457) (Genetic-Pareto reflective prompt evolution) optimizes the system prompt **without weight updates**. GEPA reflects on execution traces to evolve better instructions, using Pareto-based candidate selection to avoid local optima.
 
 ```bash
 # Install GEPA dependencies
 pip install -e ".[gepa]"
 
-# Stage 3: Optimize system prompt (offline mode -- no environment needed)
+# Stage 3: Optimize system prompt
 open-ctf-train gepa \
     --model openai/ctf-agent \
-    --data data/grpo.jsonl \
+    --data data/grpo_cybench40.jsonl \
     --output outputs/gepa \
-    --reflection-model anthropic/claude-sonnet-4-20250514 \
+    --challenge-registry configs/challenges/cybench.yaml \
     --budget medium
 
-# Stage 3: Online mode (tools execute against live environment)
-OPEN_CTF_ENV_URL=http://localhost:8100 \
+# Optional: use a stronger reflection model served on another local endpoint
 open-ctf-train gepa \
     --model openai/ctf-agent \
-    --data data/grpo.jsonl \
+    --data data/grpo_cybench40.jsonl \
     --output outputs/gepa \
-    --reflection-model openai/gpt-5 \
-    --env-url http://localhost:8100
+    --reflection-model openai/ctf-reflection \
+    --challenge-registry configs/challenges/cybench.yaml
 ```
 
 GEPA produces an optimized system prompt at `outputs/gepa/optimized_prompt.txt` that can be used with BoxPwnr's `user_additional_custom_instructions` or injected into the model's system message at inference time.
@@ -301,9 +318,11 @@ GEPA produces an optimized system prompt at `outputs/gepa/optimized_prompt.txt` 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--model` | (required) | LLM for agent execution (e.g. local vLLM endpoint) |
-| `--reflection-model` | same as model | Strong LLM for GEPA reflection (frontier model recommended) |
+| `--reflection-model` | same as model | Optional reflection LM (can be a larger local model) |
 | `--budget` | `medium` | Optimization budget: `light` / `medium` / `heavy` |
-| `--env-url` | offline | ToolExecutor URL for live tool execution |
+| `--challenge-registry` | none | Challenge registry for target URL resolution |
+| `--agent` | none | Optional custom CTFAgent adapter |
+| `--val-data` | none | Optional validation set |
 | `--max-samples` | all | Limit training examples |
 
 ## Architecture
@@ -318,7 +337,7 @@ flowchart LR
         parse["Parse tool calls"]
         exec["ToolExecutor<br/>Subprocess execution"]
         obs["Observation + tool output"]
-        reward["CTFReward<br/>6 signals + hallucination penalty"]
+        reward["CTFReward<br/>8 signals + hallucination penalty"]
         trainer["FSDP2 Policy Update<br/>DAPO loss (no KL penalty)"]
 
         vllm --> parse --> exec --> obs --> reward --> trainer
@@ -349,7 +368,7 @@ open-ctf-env/
 │   │   └── skyrl/openctf_env.py     # SkyRL BaseTextEnv bridge
 │   ├── synthetic_data_generation/   # Offline World Manifests & Generators
 │   ├── formatters/                  # Model chat template formatters
-│   ├── rewards/reward.py            # CTFReward (6 signals + penalty)
+│   ├── rewards/reward.py            # CTFReward (8 signals + penalty)
 │   └── training/
 │       ├── sft.py                   # LlamaFactory SFT orchestrator
 │       ├── grpo.py                  # SkyRL GRPO orchestrator
@@ -391,7 +410,7 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 - [x] Lossless trace converter (tool-calling + chat-command formats)
 - [x] Training data: 820 SFT + 87 online GRPO traces from BoxPwnr across 8 platforms
 - [x] SFT Training with LlamaFactory
-- [x] Multi-signal CTF reward function (6 signals + hallucination penalty)
+- [x] Multi-signal CTF reward function (8 signals + hallucination penalty)
 - [x] Online GRPO Training with SkyRL (Ray + vLLM)
 - [x] OpenCTF Gym Environment with direct Subprocess ToolExecutor
 - [x] CyBench benchmark runner with per-challenge metrics

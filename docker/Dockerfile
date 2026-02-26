@@ -66,6 +66,9 @@ RUN pip install --no-cache-dir \
     "ray[default]>=2.40.0" \
     "colorama"
 
+# Apply deterministic SkyRL/vLLM/Ray compatibility patches for this image.
+RUN bash /workspace/open-ctf-env/docker/patches/apply_all_patches.sh
+
 ENV BNB_CUDA_VERSION=130 \
     TORCHINDUCTOR_MAX_AUTOTUNE_PRUNE_CHOICES_BASED_ON_SHARED_MEM=1
 

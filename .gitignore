@@ -50,6 +50,8 @@ coverage.xml
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv/
 env/
 venv/
@@ -76,13 +78,25 @@ Thumbs.db
 .ipynb_checkpoints/
 
 # Project specific
-references/        # External repos (users clone BoxPwnr here)
-benchmarks/        # Challenge benchmarks (users clone CyBench here)
-targets/           # Agent trace outputs (created by demo/agent runs)
+# External repos (users clone BoxPwnr here)
+references/
+# Challenge benchmarks (users clone CyBench here)
+benchmarks/
+# Agent trace outputs (created by demo/agent runs)
+targets/
 outputs/
 logs/
 wandb/
 ray_results/
+tmp/
+
+# Local script/runtime artifacts
+scripts/**/*.log
+scripts/**/*.out
+scripts/**/*.err
+scripts/**/*.pid
+scripts/**/tmp/
+scripts/**/*_targets.json
 
 # Keep lightweight metadata/docs in data/, ignore generated datasets.
 data/**/*.jsonl

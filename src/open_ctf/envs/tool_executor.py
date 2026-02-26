@@ -492,7 +492,9 @@ class SubprocessExecutor(BaseExecutor):
             "stdout": stdout,
             "stderr": "",
             "exit_code": 0 if correct else 1,
-            "done": True,  # Episode ends on flag submission
+            # Keep episode running after incorrect submissions so the agent
+            # can continue exploring and retry a corrected flag.
+            "done": bool(correct or state.step_count >= self.max_steps),
             "reward": reward,
         }
 
@@ -654,7 +656,7 @@ class RemoteBatchExecutor(BaseExecutor):
         if tool_name in ("submit_flag", "flag_found"):
             submitted = arguments.get("content", "").strip()
             correct = bool(self.ground_truth) and submitted == self.ground_truth
-            self._done = True
+            self._done = bool(correct or self._step_count >= self.max_steps)
             if correct:
                 return {
                     "stdout": f"Correct! Flag verified: {submitted}",
@@ -668,7 +670,7 @@ class RemoteBatchExecutor(BaseExecutor):
                     "stdout": f"Incorrect submission: {submitted}",
                     "stderr": "",
                     "exit_code": 1,
-                    "done": True,
+                    "done": self._done,
                     "reward": -0.2,
                 }
 

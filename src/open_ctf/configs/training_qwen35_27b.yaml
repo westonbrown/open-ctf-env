@@ -78,20 +78,49 @@ grpo:
   warmup_ratio: 0.10
   beta: 0.0
   loss_type: dapo
-  # 4 generations per prompt: balances sample efficiency and vLLM memory.
-  num_generations: 4
+  # 2 generations per prompt improves wall-clock throughput while preserving
+  # a group-relative signal for GRPO.
+  num_generations: 2
   advantage_estimator: rloo
-  # 8K completion captures 98.9% of observed GRPO trajectories.
+  # Per-turn generation cap (multi-turn): 8192 covers ~99% of current CyBench
+  # GRPO traces while preserving headroom for long reasoning + tool outputs.
   max_completion_length: 8192
-  # 40 tool iterations for long-horizon BoxPwnr-style runs.
-  max_tool_calling_iterations: 40
-  # Use SkyRL's new HTTP inference path to avoid legacy Ray-wrapped vLLM
-  # LoRA startup regressions on Qwen3.5.
+  # 60 tool iterations for long-horizon BoxPwnr-style runs.
+  max_tool_calling_iterations: 60
+  # Cap to one sample per challenge for broad coverage with predictable ETA.
+  max_samples_per_challenge: 1
+  # When a challenge registry is supplied, drop samples that cannot be mapped
+  # to the canonical benchmark challenge IDs.
+  drop_unresolved_registry_samples: true
+  # Optional target URL rewrite for tunneled challenge ranges.
+  # Example: set to 10200 to map 32801 -> 43001 on SSH-forwarded RunPod jobs.
+  target_port_offset: 0
+  target_host_override: null
+  # Optional per-challenge target map file (JSON/YAML) produced from live
+  # challenge infra. Preferred for remote DGX tunnels where static registry
+  # ports are not the externally reachable endpoints.
+  target_map_path: null
+  target_map_strict: false
+  # Ignore stale in-prompt localhost URLs and use canonical registry target when
+  # available (especially important when target_map_path is set).
+  prefer_registry_target: true
+  # Fail fast when multiple challenge IDs collapse onto one URL (common stale
+  # tunnel mapping failure mode).
+  fail_on_target_collisions: true
+  # Legacy vLLM engine path crashes on LoRA startup for Qwen3.5
+  # (adapter activation during cudagraph warmup). Keep new inference enabled.
   use_new_inference: true
+  allow_new_inference_for_qwen35: true
+  # Qwen3.5 (Mamba-hybrid) prefix caching is still experimental in vLLM.
+  # Disable to avoid intermittent engine-core exits in long-horizon rollouts.
+  enable_prefix_caching: false
+  enable_chunked_prefill: true
+  enforce_eager: true
   # Cap prompt length for GRPO/vLLM memory while preserving long trajectories.
-  max_prompt_length: 16384
+  max_prompt_length: 12288
   # Explicit vLLM max model len for stable KV-cache sizing.
-  vllm_max_model_len: 24576
+  # Keep this aligned with prompt + completion (+small headroom).
+  vllm_max_model_len: 22528
   # Qwen3.5 uses a conditional-generation config in merged checkpoints.
   # Force text-only vLLM path so local engines do not initialize vision processors.
   vllm_language_model_only: true
@@ -105,11 +134,23 @@ grpo:
   use_vllm: true
   vllm_mode: server
   vllm_server_url: null
-  # Dedicated GPU0 vLLM server: use higher utilization for larger KV cache.
-  gpu_memory_utilization: 0.70
-  # Flash Attention: B200 HBM3e native support.
-  flash_attn: true
+  # Dedicated GPU0 local vLLM engine: keep utilization high but leave cushion
+  # for LoRA adapter reloads and fragmented KV cache pages.
+  gpu_memory_utilization: 0.72
+  # vLLM scheduling bounds (configurable in grpo.py; avoid hardcoded 32 seqs).
+  max_num_seqs: 16
+  max_num_batched_tokens: 20480
+  # Parallel env workers (up to one per challenge in CyBench40 profile).
+  max_env_workers: 40
+  # GRPO trainer side: disable FlashAttention for Qwen3.5 stability.
+  # We observed intermittent illegal-memory-access in policy forward under FA.
+  # vLLM generation on GPU0 still uses fast attention kernels.
+  flash_attn: false
   use_sample_packing: false
+  # Qwen3.5 linear-attention blocks require flash-linear-attention + causal-conv1d.
+  # Keep this strict in production to fail fast on new instances instead of
+  # silently using unstable torch fallback kernels.
+  require_fast_linear_attention: true
   # Tool call format for vLLM: use qwen3_coder parser.
   tool_call_format: qwen3_coder
   # Thinking mode: Qwen3.5 generates <think>...</think> before tool calls.
@@ -119,6 +160,10 @@ grpo:
   chat_template: "qwen3_without_thinking"
   chat_template_kwargs:
     enable_thinking: true
+  # Early-stop runaway trajectories when the model repeatedly emits text
+  # without valid tool calls.
+  agent_kwargs:
+    max_consecutive_no_tool_calls: 3
   # Memory budget for GRPO on B200 (183 GB HBM3e), server mode:
   #   Policy model (BF16): ~54 GB
   #   Ref model (BF16, CPU offload when beta=0): ~0 GB (offloaded)
@@ -137,7 +182,26 @@ grpo:
   #   If on same GPU: Training ~94 GB + vLLM ~92 GB = 186 GB (tight!).
   #   Recommended: use 2 GPUs, or reduce gpu_memory_utilization to 0.35.
 
+reward:
+  # Explicitly pin default CTFReward weights for clarity and reproducibility.
+  flag_weight: 0.20
+  efficiency_weight: 0.20
+  progression_weight: 0.12
+  exploration_weight: 0.08
+  uniqueness_weight: 0.08
+  format_weight: 0.15
+  recovery_weight: 0.07
+  cognitive_weight: 0.10
+  hallucination_penalty: 0.10
+  noise_range: 0.05
+  exploration_gamma: 0.95
+  use_gdpo: false
+
 output:
   save_steps: 25
   logging_steps: 1
-  report_to: none
+  report_to: tensorboard
+
+grpo_logging:
+  # Trajectory logging: saves per-generation JSONL for post-run analysis.
+  enable_trajectory_logging: true

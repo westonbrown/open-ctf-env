@@ -4,6 +4,7 @@ Validates parse_tool_calls() across all supported formats:
 - Hermes/Qwen3/Nanbeige: <tool_call>{"name": ..., "arguments": ...}</tool_call>
 - GLM-4 XML: <tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
 - Bare JSON: {"name": "...", "arguments": {...}}
+- Python-style fallback: shell_command(command="...")
 - Plain text: returns empty list (no tool calls detected)
 """
 
@@ -147,6 +148,40 @@ class TestBareJSONFormat:
         calls = parse_tool_calls(text)
         assert len(calls) == 1
         assert calls[0]["name"] == "python_code"
+
+    def test_unknown_tool_filtered(self):
+        text = '{"name": "type", "arguments": {"command": "ls"}}'
+        calls = parse_tool_calls(text)
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Python-style fallback format
+# ---------------------------------------------------------------------------
+
+
+class TestPythonStyleFormat:
+    def test_keyword_arguments(self):
+        text = 'shell_command(command="ls -la /root/challenge", timeout=15)'
+        calls = parse_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0]["name"] == "shell_command"
+        assert calls[0]["arguments"]["command"] == "ls -la /root/challenge"
+        assert calls[0]["arguments"]["timeout"] == 15
+
+    def test_positional_argument(self):
+        text = 'read_file("/root/challenge/index.php")'
+        calls = parse_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0]["name"] == "read_file"
+        assert calls[0]["arguments"]["file_path"] == "/root/challenge/index.php"
+
+    def test_unquoted_path_argument(self):
+        text = "read_file(/root/challenge/index.php)"
+        calls = parse_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0]["name"] == "read_file"
+        assert calls[0]["arguments"]["file_path"] == "/root/challenge/index.php"
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,83 @@
+# Qwen3.5-27B GRPO smoke config (2x B200: trainer on GPU1, vLLM on GPU0)
+# Purpose: fast online-RL sanity pass (tool execution + reward + policy update)
+
+model:
+  name: "Qwen/Qwen3.5-27B"
+  max_seq_length: 49152
+  load_in_4bit: false
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+grpo:
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  beta: 0.0
+  loss_type: dapo
+  num_generations: 2
+  advantage_estimator: rloo
+  max_completion_length: 1024
+  max_tool_calling_iterations: 8
+  drop_unresolved_registry_samples: true
+  use_new_inference: true
+  allow_new_inference_for_qwen35: true
+  enable_prefix_caching: false
+  enable_chunked_prefill: true
+  enforce_eager: true
+  max_prompt_length: 4096
+  vllm_max_model_len: 6144
+  vllm_language_model_only: true
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+  use_vllm: true
+  vllm_mode: server
+  vllm_server_url: null
+  gpu_memory_utilization: 0.68
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  flash_attn: false
+  use_sample_packing: false
+  require_fast_linear_attention: true
+  tool_call_format: qwen3_coder
+  chat_template: "qwen3_without_thinking"
+  chat_template_kwargs:
+    enable_thinking: true
+
+reward:
+  flag_weight: 0.20
+  efficiency_weight: 0.20
+  progression_weight: 0.12
+  exploration_weight: 0.08
+  uniqueness_weight: 0.08
+  format_weight: 0.15
+  recovery_weight: 0.07
+  cognitive_weight: 0.10
+  hallucination_penalty: 0.10
+  noise_range: 0.05
+  exploration_gamma: 0.95
+  use_gdpo: false
+
+output:
+  save_steps: 1
+  logging_steps: 1
+  report_to: tensorboard
+
+grpo_logging:
+  enable_trajectory_logging: true

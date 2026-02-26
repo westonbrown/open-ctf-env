@@ -107,12 +107,14 @@ def patch_worker():
             WORKER_PATH.write_text(content)
             print("   Patch 1 (NCCL weight sync skip): APPLIED (flexible match)")
         else:
-            print("   Patch 1 (NCCL weight sync skip): FAILED - pattern not found")
+            # Upstream layout drifted; keep patching pipeline running so the
+            # remote client route/response patches can still be applied.
+            print("   Patch 1 (NCCL weight sync skip): pattern not found (non-fatal)")
             idx = content.find("init_weight_sync_state")
             if idx >= 0:
                 print("   Context around init_weight_sync_state:")
                 print(repr(content[idx:idx+500]))
-            sys.exit(1)
+            return
 
 
 def patch_fsdp_worker():
@@ -192,8 +194,16 @@ def patch_remote_inference_client():
         found = True
         content = client_path.read_text()
 
-        if 'if hasattr(request, "lora_path")' in content and '"load_inplace": False' in content:
+        if 'if hasattr(request, "lora_path")' in content and '"load_inplace": True' in content:
             print(f"   Patch 3 (remote client LoRA route): already applied ({client_path})")
+            continue
+
+        # Upgrade previously patched variants that still used load_inplace=False.
+        if 'if hasattr(request, "lora_path")' in content and '"load_inplace": False' in content:
+            content = content.replace('"load_inplace": False', '"load_inplace": True', 1)
+            client_path.write_text(content)
+            applied = True
+            print(f"   Patch 3 (remote client LoRA route): UPDATED load_inplace=True ({client_path})")
             continue
 
         old_direct = '        return await self._call_all_servers("/update_weights", request.to_json_dict())'
@@ -233,7 +243,7 @@ def patch_remote_inference_client():
                 {
                     "lora_name": getattr(request, "lora_name", "skyrl-default"),
                     "lora_path": request.lora_path,
-                    "load_inplace": False,
+                    "load_inplace": True,
                 },
             )
         data = request.to_json_dict()

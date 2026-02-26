@@ -209,7 +209,6 @@ class CTFReward:
 
         rewards: List[float] = []
         for idx, completion in enumerate(completions):
-            text, tool_calls = self._extract(completion)
             gt_flag = (
                 ground_truth_flags[idx]
                 if idx < len(ground_truth_flags)
@@ -225,99 +224,191 @@ class CTFReward:
                 if idx < len(metadata_list)
                 else None
             )
-            metadata_success = (
-                meta.get("success") if isinstance(meta, dict) else None
-            )
-            task_category = (
-                meta.get("task_category", "web") if isinstance(meta, dict) else "web"
-            )
 
-            flag_sc = self._flag_score(text, gt_flag, metadata_success=metadata_success)
-
-            # Compute process signals (all ungated for dual-mode support).
-            eff_sc = self._efficiency_score(
-                len(tool_calls), opt_steps, flag_found=(flag_sc >= 1.0),
-            )
-            prog_sc = self._progression_score(tool_calls)
-            expl_sc = self._exploration_score(tool_calls)
-            uniq_sc = self._uniqueness_score(tool_calls)
-            fmt_sc = self._format_score(tool_calls)
-            hall_sc = self._hallucination_score(tool_calls, flag_sc, gt_flag)
-            recov_sc = self._recovery_score(tool_calls)
-            cog_sc = self._cognitive_score(text, tool_calls)
-
-            # Entropy-scaled format: modulate format by information density.
-            # Low uniqueness = low entropy = less format credit.
-            info_density = max(uniq_sc, 0.5) if tool_calls else 0.0
-            fmt_effective = fmt_sc * info_density
-
-            # Hallucination as energy loss: wrong flag submission zeroes
-            # ALL process signals. Total kinetic energy lost.
-            if hall_sc < 0:
-                fmt_effective = 0.0
-                expl_sc = 0.0
-                prog_sc = 0.0
-                recov_sc = 0.0
-                cog_sc = 0.0
-
-            raw_signals = {
-                "flag": flag_sc,
-                "efficiency": eff_sc,
-                "progression": prog_sc,
-                "exploration": expl_sc,
-                "uniqueness": uniq_sc,
-                "format": fmt_effective,
-                "recovery": recov_sc,
-                "cognitive": cog_sc,
-                "hallucination": hall_sc,
-            }
-
-            if self.use_gdpo:
-                with self._gdpo_lock:
-                    normalized_signals = {}
-                    for k, v in raw_signals.items():
-                        self._gdpo_stats[k].append(v)
-                        history = list(self._gdpo_stats[k])
-                        if len(history) > 1:
-                            mean_val = sum(history) / len(history)
-                            variance = sum((x - mean_val) ** 2 for x in history) / len(history)
-                            std_val = (variance ** 0.5) + 1e-4
-                            normalized_signals[k] = (v - mean_val) / std_val
-                        else:
-                            normalized_signals[k] = v - 0.5  # Rough center if no history
-            else:
-                normalized_signals = raw_signals
-
-            # Dynamic weight redistribution: 
-            # Non-web challenges don't follow RECON->ENUM->EXPLOIT.
-            current_prog_weight = self.progression_weight
-            current_cog_weight = self.cognitive_weight
-            current_eff_weight = self.efficiency_weight
-
-            if str(task_category).lower() in ("crypto", "rev", "forensics"):
-                # Disable strict progression and redistribute its weight
-                redistribute = current_prog_weight
-                current_prog_weight = 0.0
-                current_cog_weight += redistribute * 0.5
-                current_eff_weight += redistribute * 0.5
-
-            score = (
-                self.flag_weight * normalized_signals["flag"]
-                + current_eff_weight * normalized_signals["efficiency"]
-                + current_prog_weight * normalized_signals["progression"]
-                + self.exploration_weight * normalized_signals["exploration"]
-                + self.uniqueness_weight * normalized_signals["uniqueness"]
-                + self.format_weight * normalized_signals["format"]
-                + self.recovery_weight * normalized_signals["recovery"]
-                + current_cog_weight * normalized_signals["cognitive"]
-                + normalized_signals["hallucination"]
-            )
-
-            # Guarantee variance for GRPO
-            score += self._rng.uniform(-self.noise_range, self.noise_range)
+            score, _ = self._score_one(completion, gt_flag, opt_steps, meta)
             rewards.append(score)
 
         return rewards
+
+    def compute_with_breakdown(
+        self,
+        completions: List[Any],
+        prompts: Optional[List[Any]] = None,
+        **kwargs: Any,
+    ) -> List[Tuple[float, Dict[str, float]]]:
+        """Score a batch of completions, returning per-signal breakdowns.
+
+        Same interface as ``__call__`` but returns a list of
+        ``(total_reward, breakdown_dict)`` tuples. The breakdown dict
+        contains the raw (pre-noise) weighted contribution of each signal.
+
+        This method does NOT modify the existing ``__call__`` contract.
+        """
+        n = len(completions)
+        ground_truth_flags: List[Optional[str]] = kwargs.get(
+            "ground_truth_flag", [None] * n
+        )
+        optimal_steps_list: List[Optional[int]] = kwargs.get(
+            "optimal_steps", [None] * n
+        )
+        metadata_list: List[Optional[Dict[str, Any]]] = kwargs.get(
+            "metadata", [None] * n
+        )
+
+        results: List[Tuple[float, Dict[str, float]]] = []
+        for idx, completion in enumerate(completions):
+            gt_flag = (
+                ground_truth_flags[idx]
+                if idx < len(ground_truth_flags)
+                else None
+            )
+            opt_steps = (
+                optimal_steps_list[idx]
+                if idx < len(optimal_steps_list)
+                else None
+            )
+            meta = (
+                metadata_list[idx]
+                if idx < len(metadata_list)
+                else None
+            )
+
+            score, breakdown = self._score_one(completion, gt_flag, opt_steps, meta)
+            results.append((score, breakdown))
+
+        return results
+
+    def _score_one(
+        self,
+        completion: Any,
+        gt_flag: Optional[str],
+        opt_steps: Optional[int],
+        meta: Optional[Dict[str, Any]],
+    ) -> Tuple[float, Dict[str, float]]:
+        """Score a single completion. Returns (total_score, breakdown_dict).
+
+        The breakdown dict contains raw signal values (before weighting)
+        keyed by signal name, plus the weighted contributions.
+        """
+        text, tool_calls = self._extract(completion)
+
+        metadata_success = (
+            meta.get("success") if isinstance(meta, dict) else None
+        )
+        task_category = (
+            meta.get("task_category", "web") if isinstance(meta, dict) else "web"
+        )
+
+        flag_sc = self._flag_score(text, gt_flag, metadata_success=metadata_success)
+
+        # Compute process signals (all ungated for dual-mode support).
+        eff_sc = self._efficiency_score(
+            len(tool_calls), opt_steps, flag_found=(flag_sc >= 1.0),
+        )
+        prog_sc = self._progression_score(tool_calls)
+        expl_sc = self._exploration_score(tool_calls)
+        uniq_sc = self._uniqueness_score(tool_calls)
+        fmt_sc = self._format_score(tool_calls)
+        hall_sc = self._hallucination_score(tool_calls, flag_sc, gt_flag)
+        recov_sc = self._recovery_score(tool_calls)
+        cog_sc = self._cognitive_score(text, tool_calls)
+
+        # Entropy-scaled format: modulate format by information density.
+        # Low uniqueness = low entropy = less format credit.
+        info_density = max(uniq_sc, 0.5) if tool_calls else 0.0
+        fmt_effective = fmt_sc * info_density
+
+        # Hallucination as energy loss: wrong flag submission zeroes
+        # ALL process signals. Total kinetic energy lost.
+        if hall_sc < 0:
+            fmt_effective = 0.0
+            expl_sc = 0.0
+            prog_sc = 0.0
+            recov_sc = 0.0
+            cog_sc = 0.0
+
+        raw_signals = {
+            "flag": flag_sc,
+            "efficiency": eff_sc,
+            "progression": prog_sc,
+            "exploration": expl_sc,
+            "uniqueness": uniq_sc,
+            "format": fmt_effective,
+            "recovery": recov_sc,
+            "cognitive": cog_sc,
+            "hallucination": hall_sc,
+        }
+
+        if self.use_gdpo:
+            with self._gdpo_lock:
+                normalized_signals = {}
+                for k, v in raw_signals.items():
+                    self._gdpo_stats[k].append(v)
+                    history = list(self._gdpo_stats[k])
+                    if len(history) > 1:
+                        mean_val = sum(history) / len(history)
+                        variance = sum((x - mean_val) ** 2 for x in history) / len(history)
+                        std_val = (variance ** 0.5) + 1e-4
+                        normalized_signals[k] = (v - mean_val) / std_val
+                    else:
+                        normalized_signals[k] = v - 0.5  # Rough center if no history
+        else:
+            normalized_signals = raw_signals
+
+        # Dynamic weight redistribution:
+        # Non-web challenges don't follow RECON->ENUM->EXPLOIT.
+        current_prog_weight = self.progression_weight
+        current_cog_weight = self.cognitive_weight
+        current_eff_weight = self.efficiency_weight
+
+        if str(task_category).lower() in ("crypto", "rev", "forensics"):
+            # Disable strict progression and redistribute its weight
+            redistribute = current_prog_weight
+            current_prog_weight = 0.0
+            current_cog_weight += redistribute * 0.5
+            current_eff_weight += redistribute * 0.5
+
+        score = (
+            self.flag_weight * normalized_signals["flag"]
+            + current_eff_weight * normalized_signals["efficiency"]
+            + current_prog_weight * normalized_signals["progression"]
+            + self.exploration_weight * normalized_signals["exploration"]
+            + self.uniqueness_weight * normalized_signals["uniqueness"]
+            + self.format_weight * normalized_signals["format"]
+            + self.recovery_weight * normalized_signals["recovery"]
+            + current_cog_weight * normalized_signals["cognitive"]
+            + normalized_signals["hallucination"]
+        )
+
+        # Guarantee variance for GRPO
+        noise = self._rng.uniform(-self.noise_range, self.noise_range)
+        score += noise
+
+        # Build breakdown: raw signal values + their weighted contributions
+        breakdown = {
+            "flag": raw_signals["flag"],
+            "efficiency": raw_signals["efficiency"],
+            "progression": raw_signals["progression"],
+            "exploration": raw_signals["exploration"],
+            "uniqueness": raw_signals["uniqueness"],
+            "format": raw_signals["format"],
+            "recovery": raw_signals["recovery"],
+            "cognitive": raw_signals["cognitive"],
+            "hallucination": raw_signals["hallucination"],
+            # Weighted contributions (what each signal added to the total)
+            "flag_weighted": self.flag_weight * normalized_signals["flag"],
+            "efficiency_weighted": current_eff_weight * normalized_signals["efficiency"],
+            "progression_weighted": current_prog_weight * normalized_signals["progression"],
+            "exploration_weighted": self.exploration_weight * normalized_signals["exploration"],
+            "uniqueness_weighted": self.uniqueness_weight * normalized_signals["uniqueness"],
+            "format_weighted": self.format_weight * normalized_signals["format"],
+            "recovery_weighted": self.recovery_weight * normalized_signals["recovery"],
+            "cognitive_weighted": current_cog_weight * normalized_signals["cognitive"],
+            "hallucination_weighted": normalized_signals["hallucination"],
+            "noise": noise,
+        }
+
+        return score, breakdown
 
     # ------------------------------------------------------------------
     # Component scorers

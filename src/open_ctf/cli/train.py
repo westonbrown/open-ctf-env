@@ -20,11 +20,11 @@ Usage:
         --output outputs/grpo
 
     # Stage 3: GEPA prompt optimization (no weight updates)
+    # Both agent and reflection LMs default to the same model (local vLLM).
     open-ctf-train gepa \\
         --model openai/ctf-agent \\
         --data data/grpo.jsonl \\
-        --output outputs/gepa \\
-        --reflection-model anthropic/claude-sonnet-4-20250514
+        --output outputs/gepa
 
     # Merge LoRA adapter into base weights
     open-ctf-train merge \\
@@ -91,6 +91,47 @@ def _patch_merged_config_for_vllm(base_model_id: str, output_dir: str) -> bool:
         f.write("\n")
     logger.info(
         "Replaced merged config.json with base config for vLLM compatibility "
+        "(backup saved to %s)",
+        backup_path,
+    )
+    return True
+
+
+def _patch_merged_tokenizer_config(base_model_id: str, output_dir: str) -> bool:
+    """Patch merged tokenizer_config.json when tokenizer_class is incompatible.
+
+    Some merge environments can emit ``tokenizer_class=TokenizersBackend`` in the
+    merged artifact, which older Transformers runtimes cannot import during GRPO.
+
+    Returns:
+        True if tokenizer_config.json was replaced, False otherwise.
+    """
+    base_tok_cfg_path = Path(base_model_id) / "tokenizer_config.json"
+    merged_tok_cfg_path = Path(output_dir) / "tokenizer_config.json"
+    if not base_tok_cfg_path.exists() or not merged_tok_cfg_path.exists():
+        return False
+
+    with open(base_tok_cfg_path) as f:
+        base_tok_cfg = json.load(f)
+    with open(merged_tok_cfg_path) as f:
+        merged_tok_cfg = json.load(f)
+
+    merged_cls = merged_tok_cfg.get("tokenizer_class")
+    base_cls = base_tok_cfg.get("tokenizer_class")
+
+    # Keep this narrowly targeted to avoid overriding valid tokenizer classes.
+    if merged_cls != "TokenizersBackend":
+        return False
+    if not base_cls:
+        return False
+
+    backup_path = Path(output_dir) / "tokenizer_config.text_backup.json"
+    shutil.copy2(merged_tok_cfg_path, backup_path)
+    with open(merged_tok_cfg_path, "w") as f:
+        json.dump(base_tok_cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    logger.info(
+        "Replaced merged tokenizer_config.json with base tokenizer config "
         "(backup saved to %s)",
         backup_path,
     )
@@ -176,6 +217,8 @@ def cmd_gepa(args: argparse.Namespace) -> None:
         budget=args.budget,
         val_data_path=args.val_data,
         max_samples=args.max_samples,
+        challenge_registry=getattr(args, 'challenge_registry', None),
+        agent_class=getattr(args, 'agent', None),
     )
 
 
@@ -214,6 +257,10 @@ def cmd_merge(args: argparse.Namespace) -> None:
         _patch_merged_config_for_vllm(base_model_id, args.output)
     except Exception as exc:
         logger.warning("Could not apply merged-config compatibility fix: %s", exc)
+    try:
+        _patch_merged_tokenizer_config(base_model_id, args.output)
+    except Exception as exc:
+        logger.warning("Could not apply merged-tokenizer compatibility fix: %s", exc)
 
     logger.info("Merged via PEFT -> %s", args.output)
 
@@ -282,13 +329,23 @@ def main() -> None:
     gepa_parser.add_argument("--val-data", default=None, help="Validation JSONL (separate from train)")
     gepa_parser.add_argument(
         "--reflection-model", default=None,
-        help="Strong LLM for GEPA reflection (default: same as --model)",
+        help="LLM for GEPA reflection (default: same as --model). "
+             "For stronger mutations, point at a larger local model.",
     )
     gepa_parser.add_argument(
         "--budget", choices=["light", "medium", "heavy"], default="medium",
         help="GEPA budget preset (default: medium)",
     )
     gepa_parser.add_argument("--max-samples", type=int, default=None, help="Max training examples")
+    gepa_parser.add_argument(
+        "--challenge-registry", default=None,
+        help="Path to challenge registry YAML for target URL resolution",
+    )
+    gepa_parser.add_argument(
+        "--agent", default=None,
+        help="Dotted path to a CTFAgent class (e.g. my_module.MyAgent). "
+             "When set, wraps the agent in a DSPy Module for GEPA optimization.",
+    )
     gepa_parser.set_defaults(func=cmd_gepa)
 
     # -- merge (unchanged) ------------------------------------------------

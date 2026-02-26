@@ -64,6 +64,19 @@ grpo:
   # Online training: max tool-calling iterations per generation.
   max_tool_calling_iterations: 15
 
+gepa:
+  # GEPA prompt evolution (Stage 3, no weight updates).
+  # Uses DSPy to evolve the system prompt by reflecting on execution traces.
+  # Both agent and reflection LMs default to the same model — no cloud APIs needed.
+  # Point model_id at a local vLLM server (e.g. openai/my-model with OPENAI_API_BASE).
+  seed_prompt: null           # Override default CTF agent prompt (null = use built-in SEED_PROMPT)
+  reflection_model: null      # Reflection LM (null = same as agent model). Can be a stronger local model.
+  max_iters: 20               # Max tool-calling iterations per challenge evaluation
+  reflection_minibatch_size: 3  # Samples per GEPA reflection batch
+  seed: 42
+  budget: light               # GEPA budget preset: light / medium / heavy
+  num_threads: 1              # Parallel challenge evaluations (1 = sequential)
+
 reward:
   # CTFReward weights (must sum to 1.0).
   # Uncomment and adjust to override defaults from reward.py.
@@ -78,3 +91,7 @@ output:
   save_steps: 25
   logging_steps: 1
   report_to: tensorboard
+
+grpo_logging:
+  # Trajectory logging: saves per-generation JSONL for post-run analysis.
+  enable_trajectory_logging: true

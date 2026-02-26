@@ -72,35 +72,79 @@ grpo:
   gradient_accumulation_steps: 8
   learning_rate: 5.0e-6
   warmup_ratio: 0.10
-  beta: 0.0
+  # v6: small KL penalty (was 0.0) to prevent catastrophic policy update
+  # from outlier rewards (step 7 flag capture scored 3.78, caused grad spike).
+  beta: 0.001
   loss_type: dapo
-  num_generations: 8
-  advantage_estimator: grpo
-  # 32K completion matches the model's max_seq_length.
-  # 3B dense model at NF4 + vLLM colocate @ 0.4 util still fits DGX Spark.
-  # KV cache: 32 layers × 2 × 32 heads × 128 dim × 32K × 8 gens × 2B ≈ 32 GB
-  # Total GRPO ≈ 3-4 (model) + 48 (vLLM 0.4) + 2 (train) + 32 (KV) + 5 (OS) ≈ 90-94 GB
-  # Headroom: ~25-29 GB on 119 GB unified — FITS.
-  max_completion_length: 32768
+  num_generations: 4
+  advantage_estimator: rloo
+  # GB10 166K-vocab memory math (v4→v5 OOM fixes):
+  #   fwd_logprobs: 4 seqs × seq_len × 166K × 4B. At 11K avg → 29 GB (OOMs).
+  #   Fix: cap prompt to 4K, completion to 2K → max total 6K.
+  #   4 × 6K × 166K × 4B ≈ 16 GB → fits with headroom.
+  #   policy_train processes 1 seq at a time (batch=1), so peak is ~4 GB logits.
+  max_completion_length: 2048
+  max_prompt_length: 4096
+  vllm_max_model_len: 6144
+  # 15 tool iterations × ~200 tok/iter ≈ 3000 tok (fits in 2K+4K budget).
   max_tool_calling_iterations: 15
   max_grad_norm: 0.1
   epsilon_high: 0.28
   weight_decay: 0.1
   scale_rewards: false
-  # vLLM colocate mode: LlamaForCausalLM is the most tested arch.
-  # Model + vLLM + training all fit on DGX Spark.
+  # v5: 1.3 penalty caused degenerate garbage at temperature 1.0.
+  # Root cause: aggressive penalty + high temp forces diverse nonsense tokens.
+  # SFT model generates valid Hermes tool calls at temp 0.7 / no penalty.
+  # v6: 1.05 provides mild anti-repetition without destroying coherence.
+  # max_completion_length=2048 already caps output length (OOM prevention).
+  repetition_penalty: 1.05
+  # Nanbeige4.1-3B natively supports <think>/<think> (token IDs 166103/166104).
+  # The tokenizer template auto-strips thinking from history (keeps only on
+  # last turn after the final user query), which is optimal for multi-turn
+  # context management. No "enable_thinking" toggle needed — the model
+  # generates thinking blocks by default when the SFT model learned them.
+  # keep_all_think: false is the default (strip from history, keep on last).
+  chat_template_kwargs:
+    keep_all_think: false
+  # External vLLM server mode: colocate OOMs GB10 unified memory.
+  # vLLM runs as separate process on same GPU, trainer uses remaining memory.
   use_vllm: true
-  vllm_mode: colocate
-  gpu_memory_utilization: 0.4
-  # Memory budget for GRPO on DGX Spark (119 GB unified):
-  #   Model (NF4): ~3-4 GB
-  #   vLLM engine (colocate, 40% util): ~48 GB (includes KV cache)
-  #   Training state (LoRA + AdamW 8-bit): ~2 GB
-  #   Gradient activations (checkpointed, 32K): ~15-20 GB
-  #   Framework/OS: ~5 GB
-  #   Total: ~73-79 GB -> ~40-46 GB headroom
+  vllm_mode: server
+  vllm_server_url: "http://localhost:8001"
+  allow_remote_lora: true
+  gpu_memory_utilization: 0.15
+  # Flash attention disabled for GB10 stability (sm_121a kernel issues).
+  flash_attn: false
+  use_sample_packing: false
+  # Memory budget for GRPO on DGX Spark (119 GB unified), server mode:
+  #   vLLM server (BF16, 0.15 util): ~18 GB
+  #   FSDP policy model (BF16): ~12 GB
+  #   FSDP ref model (frozen): ~6 GB
+  #   fwd_logprobs (4 × 6K × 166K × 4B): ~16 GB peak
+  #   policy_train (1 × 6K × 166K × 4B): ~4 GB per micro-batch
+  #   Training activations (batch=1, grad ckpt): ~8 GB
+  #   Ray overhead: ~5 GB
+  #   Total peak: ~69 GB → ~50 GB headroom
+
+reward:
+  # Explicit CTFReward weights for reproducibility (prevents binary fallback).
+  flag_weight: 0.20
+  efficiency_weight: 0.20
+  progression_weight: 0.12
+  exploration_weight: 0.08
+  uniqueness_weight: 0.08
+  format_weight: 0.15
+  recovery_weight: 0.07
+  cognitive_weight: 0.10
+  hallucination_penalty: 0.10
+  noise_range: 0.05
+  exploration_gamma: 0.95
 
 output:
   save_steps: 25
   logging_steps: 1
-  report_to: none
+  report_to: tensorboard
+
+grpo_logging:
+  # Trajectory logging: saves per-generation JSONL for post-run analysis.
+  enable_trajectory_logging: true
