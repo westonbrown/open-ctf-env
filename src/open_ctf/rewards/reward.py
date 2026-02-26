@@ -1,15 +1,15 @@
 """CTF reward function for online GRPO training.
 
 Physics-inspired scoring (8 signals, sum to 1.0 + penalty):
-  - Flag capture (0.20): Boundary condition -- did the trajectory reach the goal?
-  - Efficiency (0.20): Principle of least action -- shortest path to the goal.
-  - Progression (0.12): Phase space ordering -- RECON->ENUM->EXPLOIT trajectory.
-  - Exploration (0.08): Exponentially-decayed novelty -- early diversity > late.
-  - Uniqueness (0.08): Information entropy -- repeated observations carry zero bits.
-  - Format compliance (0.15): Signal fidelity -- valid instrument readings only.
-  - Recovery (0.07): Resilience -- trajectory pivots after stuck runs.
-  - Cognitive (0.10): Words-per-action -- optimal reasoning density (~42 WPA).
-  - Hallucination penalty: Energy loss -- false claims reverse trajectory progress.
+  - Flag capture (0.40): Boundary condition -- did the trajectory reach the goal?
+  - Efficiency (0.15): Principle of least action -- shortest path to the goal.
+  - Format compliance (0.10): Signal fidelity -- valid instrument readings only.
+  - Recovery (0.09): Resilience -- trajectory pivots after stuck runs.
+  - Progression (0.08): Phase space ordering -- RECON->ENUM->EXPLOIT trajectory.
+  - Cognitive (0.08): Words-per-action -- optimal reasoning density (~42 WPA).
+  - Exploration (0.05): Exponentially-decayed novelty -- early diversity > late.
+  - Uniqueness (0.05): Information entropy -- repeated observations carry zero bits.
+  - Hallucination penalty (0.20): Energy loss -- false claims decay trajectory progress.
 
 Design principles:
   - **Principle of least action**: Flag (boundary condition) + efficiency (path
@@ -25,8 +25,9 @@ Design principles:
     fingerprints (tool name + binary name for shell wrappers), no regex.
   - **Cognitive efficiency**: Words-per-action peaks at ~42. Underthinking
     (WPA < 10) and severe overthinking (WPA > 80) are penalized.
-  - **Anti-hallucination (energy loss)**: Wrong flag submission zeroes ALL
-    process signals. Total kinetic energy lost.
+  - **Anti-hallucination (energy loss)**: Wrong flag submission decays ALL
+    process signals to 30%. Prevents full zeroing which made flag_found
+    EV-negative for small models (v7 lesson: 0% flag accuracy).
   - **Online**: environment verification ("Correct! Flag verified") is authoritative.
 
 Noise (+-0.05) is added to every reward to guarantee variance for GRPO gradients.
@@ -47,6 +48,9 @@ _FLAG_PLACEHOLDERS = frozenset({
     "FLAG{...}",
     "",
     "CHECK",
+    # Dummy/fake flags found in GRPO data (poisoned ground truth)
+    "gctf{DUMMY_FLAG}",
+    "flag{this_is_fake_flag}",
 })
 
 # ---------------------------------------------------------------------------
@@ -138,16 +142,16 @@ class CTFReward:
 
     def __init__(
         self,
-        flag_weight: float = 0.20,
-        efficiency_weight: float = 0.20,
-        progression_weight: float = 0.12,
-        exploration_weight: float = 0.08,
-        uniqueness_weight: float = 0.08,
-        format_weight: float = 0.15,
-        recovery_weight: float = 0.07,
-        cognitive_weight: float = 0.10,
-        hallucination_penalty: float = 0.10,
-        noise_range: float = 0.05,
+        flag_weight: float = 0.40,
+        efficiency_weight: float = 0.15,
+        progression_weight: float = 0.08,
+        exploration_weight: float = 0.05,
+        uniqueness_weight: float = 0.05,
+        format_weight: float = 0.10,
+        recovery_weight: float = 0.09,
+        cognitive_weight: float = 0.08,
+        hallucination_penalty: float = 0.20,
+        noise_range: float = 0.01,
         exploration_gamma: float = 0.95,
         seed: Optional[int] = None,
         use_gdpo: bool = False,
@@ -318,14 +322,18 @@ class CTFReward:
         info_density = max(uniq_sc, 0.5) if tool_calls else 0.0
         fmt_effective = fmt_sc * info_density
 
-        # Hallucination as energy loss: wrong flag submission zeroes
-        # ALL process signals. Total kinetic energy lost.
+        # Hallucination as energy loss: wrong flag submission decays
+        # process signals to 30% (v8 fix: full zeroing made flag_found
+        # EV-negative for small models, discouraging all flag attempts).
         if hall_sc < 0:
-            fmt_effective = 0.0
-            expl_sc = 0.0
-            prog_sc = 0.0
-            recov_sc = 0.0
-            cog_sc = 0.0
+            _HALL_DECAY = 0.3
+            fmt_effective *= _HALL_DECAY
+            expl_sc *= _HALL_DECAY
+            prog_sc *= _HALL_DECAY
+            recov_sc *= _HALL_DECAY
+            cog_sc *= _HALL_DECAY
+            eff_sc *= _HALL_DECAY
+            uniq_sc *= _HALL_DECAY
 
         raw_signals = {
             "flag": flag_sc,
@@ -472,9 +480,12 @@ class CTFReward:
             return False
         if flag in _FLAG_PLACEHOLDERS:
             return False
-        # Detect template text that was accidentally captured as ground_truth_flag
-        if "content_of_flag_here" in flag:
-            return False
+        flag_lower = flag.lower()
+        # Detect template text or dummy flags
+        for poison in ("content_of_flag_here", "dummy_flag", "fake_flag",
+                       "this_is_fake", "placeholder"):
+            if poison in flag_lower:
+                return False
         return True
 
     def _uniqueness_score(self, tool_calls: List[Dict[str, str]]) -> float:

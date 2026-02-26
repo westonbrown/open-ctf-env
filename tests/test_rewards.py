@@ -544,9 +544,9 @@ class TestCallIntegration:
         # metadata.success=True → flag_sc=1.0
         # efficiency = 0.0 (0 steps), progression = 0, exploration = 0
         # uniqueness = 0, format = 0, recovery = 0.5 (neutral), cognitive = 0
-        # Total = 0.20*1.0 + 0.07*0.5 = 0.235
-        assert scores[0] > 0.2
-        assert scores[0] < 0.3
+        # Total = flag_weight*1.0 + recovery_weight*0.5
+        assert scores[0] > 0.35
+        assert scores[0] < 0.55
 
 
 # ---------------------------------------------------------------------------

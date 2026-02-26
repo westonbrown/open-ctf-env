@@ -9,7 +9,11 @@ scoreboard so that after a training run you can:
 All data is written to ``{output_dir}/trajectories/`` as JSONL files.
 The scoreboard is saved as ``{output_dir}/challenge_scoreboard.json``.
 
-No external dependencies beyond stdlib + json.
+When ``tensorboard_dir`` is provided, CTF-specific scalars are written
+alongside SkyRL's native training metrics (loss, KL, gradients).
+
+No external dependencies beyond stdlib + json.  TensorBoard writing is
+optional and gracefully degrades if ``tensorboard`` is not installed.
 """
 
 import json
@@ -48,17 +52,32 @@ class TrajectoryLogger:
         tl.save_scoreboard()
     """
 
-    def __init__(self, output_dir: str, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        output_dir: str,
+        enabled: bool = True,
+        tensorboard_dir: Optional[str] = None,
+    ) -> None:
         self._output_dir = output_dir
         self._enabled = enabled
         self._trajectories_dir = os.path.join(output_dir, "trajectories")
         self._lock = threading.Lock()
         # Challenge scoreboard: {challenge_id: {attempts, solves, rewards, ...}}
         self._scoreboard: Dict[str, Dict[str, Any]] = {}
+        self._tb_writer = None
 
         if self._enabled:
             os.makedirs(self._trajectories_dir, exist_ok=True)
             logger.info("TrajectoryLogger initialized: %s", self._trajectories_dir)
+
+        # Optional TensorBoard writer for CTF-specific scalars.
+        if tensorboard_dir:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                self._tb_writer = SummaryWriter(log_dir=tensorboard_dir)
+                logger.info("TensorBoard CTF metrics: %s", tensorboard_dir)
+            except ImportError:
+                logger.info("tensorboard not installed; CTF scalars disabled")
 
     @property
     def enabled(self) -> bool:
@@ -193,6 +212,21 @@ class TrajectoryLogger:
             with open(filepath, "a") as f:
                 f.write(line)
 
+        # Write CTF-specific scalars to TensorBoard.
+        if self._tb_writer is not None:
+            step = global_step
+            self._tb_writer.add_scalar("ctf/avg_reward", avg_reward, step)
+            self._tb_writer.add_scalar("ctf/min_reward", min_reward, step)
+            self._tb_writer.add_scalar("ctf/max_reward", max_reward, step)
+            self._tb_writer.add_scalar("ctf/reward_std", reward_std, step)
+            self._tb_writer.add_scalar(
+                "ctf/flag_found_rate",
+                flag_found_count / total_generations if total_generations > 0 else 0.0,
+                step,
+            )
+            self._tb_writer.add_scalar("ctf/avg_tool_calls", avg_tool_calls, step)
+            self._tb_writer.add_scalar("ctf/avg_response_length", avg_response_length, step)
+
     def log_challenge_result(
         self,
         challenge_id: str,
@@ -294,6 +328,29 @@ class TrajectoryLogger:
                     "difficulty": data.get("difficulty"),
                 }
             return result
+
+
+    def flush_scoreboard_to_tensorboard(self, global_step: int = 0) -> None:
+        """Write per-challenge solve rates to TensorBoard as a bar chart."""
+        if self._tb_writer is None:
+            return
+        with self._lock:
+            for cid, data in self._scoreboard.items():
+                attempts = data["attempts"]
+                if attempts == 0:
+                    continue
+                solve_rate = data["solves"] / attempts
+                avg_r = sum(data["rewards"]) / len(data["rewards"]) if data["rewards"] else 0.0
+                safe_cid = cid.replace("/", "_").replace(" ", "_")
+                self._tb_writer.add_scalar(f"ctf_challenge/{safe_cid}/solve_rate", solve_rate, global_step)
+                self._tb_writer.add_scalar(f"ctf_challenge/{safe_cid}/avg_reward", avg_r, global_step)
+
+    def close(self) -> None:
+        """Flush and close TensorBoard writer if active."""
+        if self._tb_writer is not None:
+            self._tb_writer.flush()
+            self._tb_writer.close()
+            self._tb_writer = None
 
 
 def _truncate(text: Optional[str], max_len: int = 50000) -> Optional[str]:

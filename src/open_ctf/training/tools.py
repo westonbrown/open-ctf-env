@@ -358,13 +358,17 @@ def apply_patch(patch: str) -> str:
 
 
 def flag_found(content: str) -> str:
-    """Submit a discovered flag for verification.
-
-    Call this when you have found the flag. The environment will verify
-    correctness and end the episode if the flag is correct.
+    """Submit a discovered flag for verification. ONLY call this when you
+    have found the EXACT flag string in tool output or a file. Flags
+    typically match ``FLAG{...}`` or ``flag{...}`` format. Do NOT guess,
+    fabricate, or submit partial flags -- incorrect submissions are
+    penalized. The environment verifies the flag and ends the episode
+    if correct.
 
     Args:
-        content: The flag string you discovered (e.g. ``FLAG{example}``).
+        content: The exact flag string copied from tool output
+            (e.g. ``FLAG{s3cr3t_v4lu3}``). Must be the complete flag
+            including the wrapper (FLAG{...}).
 
     Returns:
         Verification result indicating whether the flag is correct.

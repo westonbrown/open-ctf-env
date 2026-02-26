@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -336,6 +337,17 @@ class OpenCTFTextEnv(_Base):
         self._episode_id: Optional[str] = None
         self._done = False
 
+        # Step-wise trajectory rewards: when enabled, per-step rewards
+        # include small format-compliance and phase-progression signals
+        # instead of returning 0.0 for all non-terminal steps.
+        self._step_wise: bool = bool(
+            extras.get("step_wise_trajectories")
+            or kwargs.get("step_wise_trajectories", False)
+        )
+
+        # Track tool call count before each step for per-step reward.
+        self._prev_tool_call_count: int = 0
+
         # Tool call format for prompt injection.
         # "hermes" (default): <tool_call>{"name": ..., "arguments": ...}</tool_call>
         # "qwen3_coder": <tool_call><function=name><parameter=k>v</parameter></function></tool_call>
@@ -384,8 +396,13 @@ class OpenCTFTextEnv(_Base):
         if self._trajectory_output_dir:
             try:
                 from open_ctf.training.trajectory_logger import TrajectoryLogger
+                # Reuse the same TensorBoard logdir set by _resolve_skyrl_logger()
+                # so CTF scalars appear alongside SkyRL training metrics.
+                tb_dir = os.environ.get("TENSORBOARD_LOGDIR")
                 self._trajectory_logger = TrajectoryLogger(
-                    self._trajectory_output_dir, enabled=True
+                    self._trajectory_output_dir,
+                    enabled=True,
+                    tensorboard_dir=tb_dir,
                 )
             except Exception as exc:
                 logger.warning("Failed to create TrajectoryLogger: %s", exc)
@@ -454,6 +471,7 @@ class OpenCTFTextEnv(_Base):
         self._episode_id = None  # no longer tracked via server
         self.turns = 0
         self._done = False
+        self._prev_tool_call_count = 0
 
         # Inject tool schemas into the system message so the model knows
         # what tools are available during GRPO rollouts. SkyRL's generator
@@ -583,6 +601,14 @@ class OpenCTFTextEnv(_Base):
             BaseTextEnvStepOutput dict with observations, reward, done, metadata.
         """
         self.turns += 1
+
+        # Snapshot tool call count before agent processes this step,
+        # so we can compute how many new tool calls this step produced
+        # (needed for step-wise trajectory rewards).
+        self._prev_tool_call_count = len(
+            getattr(self._agent, "tool_calls_history", [])
+        )
+
         result = self._agent.step(action)
 
         # Sync done state from agent
@@ -639,8 +665,12 @@ class OpenCTFTextEnv(_Base):
 
         if not done:
             from open_ctf.training.step_reward import per_step_reward
+            # Compute how many new tool calls were added by this step.
+            step_tool_call_count = len(tool_calls_history) - self._prev_tool_call_count
             return per_step_reward(
                 tool_calls_history, self.turns, self.max_turns,
+                step_tool_call_count=max(0, step_tool_call_count),
+                step_wise=self._step_wise,
             )
 
         # Terminal: compute full reward
@@ -671,12 +701,17 @@ class OpenCTFTextEnv(_Base):
                 "content": all_text,
             })
 
+            # Pass challenge metadata so reward function can adjust weights
+            # (e.g. crypto/rev/forensics skip RECON->ENUM->EXPLOIT progression).
+            reward_metadata = [{"task_category": self._category or "web", "success": episode_done}]
+
             # Use compute_with_breakdown if available for trajectory logging.
             if self._trajectory_logger and hasattr(self._reward_fn, "compute_with_breakdown"):
                 results = self._reward_fn.compute_with_breakdown(
                     completions=[completion_msgs],
                     ground_truth_flag=[self._ground_truth_flag],
                     optimal_steps=[self._optimal_steps],
+                    metadata=reward_metadata,
                 )
                 if results:
                     reward, breakdown = results[0]
@@ -685,6 +720,7 @@ class OpenCTFTextEnv(_Base):
                     completions=[completion_msgs],
                     ground_truth_flag=[self._ground_truth_flag],
                     optimal_steps=[self._optimal_steps],
+                    metadata=reward_metadata,
                 )
                 reward = rewards[0] if rewards else 0.0
         else:

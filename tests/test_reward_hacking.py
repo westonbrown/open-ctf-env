@@ -393,9 +393,9 @@ class TestComponentBreakdown:
         """Only flag score should fire for text-only with exact match."""
         comp = [{"role": "assistant", "content": "The flag is FLAG{exact}"}]
         scores = reward([comp], ground_truth_flag=["FLAG{exact}"])
-        # flag = 1.0 * 0.20 = 0.20, efficiency = 0.0 (no tool calls),
+        # flag = 1.0 * flag_weight, efficiency = 0.0 (no tool calls),
         # everything else = 0
-        assert 0.15 < scores[0] < 0.25
+        assert 0.35 < scores[0] < 0.50
 
     def test_only_format(self, reward):
         """Valid tool calls with no progression/exploration value."""

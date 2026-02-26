@@ -71,6 +71,9 @@ sft:
 
 grpo:
   epochs: 1
+  # Difficulty curriculum: 27B model can handle up to hard challenges.
+  # Expert and master are excluded to keep gradient signal useful.
+  difficulty_max: "hard"
   batch_size: 1
   # batch_size(1) * grad_accum(4) must be divisible by num_gen(4): 4 % 4 = 0 (valid)
   gradient_accumulation_steps: 4
@@ -82,9 +85,9 @@ grpo:
   # a group-relative signal for GRPO.
   num_generations: 2
   advantage_estimator: rloo
-  # Per-turn generation cap (multi-turn): 8192 covers ~99% of current CyBench
-  # GRPO traces while preserving headroom for long reasoning + tool outputs.
-  max_completion_length: 8192
+  # Per-turn generation cap (multi-turn): 6144 keeps long-horizon behavior
+  # while reducing policy-backward memory spikes during FA canary runs.
+  max_completion_length: 6144
   # 60 tool iterations for long-horizon BoxPwnr-style runs.
   max_tool_calling_iterations: 60
   # Cap to one sample per challenge for broad coverage with predictable ETA.
@@ -117,10 +120,10 @@ grpo:
   enable_chunked_prefill: true
   enforce_eager: true
   # Cap prompt length for GRPO/vLLM memory while preserving long trajectories.
-  max_prompt_length: 12288
+  max_prompt_length: 8192
   # Explicit vLLM max model len for stable KV-cache sizing.
   # Keep this aligned with prompt + completion (+small headroom).
-  vllm_max_model_len: 22528
+  vllm_max_model_len: 16384
   # Qwen3.5 uses a conditional-generation config in merged checkpoints.
   # Force text-only vLLM path so local engines do not initialize vision processors.
   vllm_language_model_only: true
@@ -136,21 +139,22 @@ grpo:
   vllm_server_url: null
   # Dedicated GPU0 local vLLM engine: keep utilization high but leave cushion
   # for LoRA adapter reloads and fragmented KV cache pages.
-  gpu_memory_utilization: 0.72
+  gpu_memory_utilization: 0.68
   # vLLM scheduling bounds (configurable in grpo.py; avoid hardcoded 32 seqs).
   max_num_seqs: 16
-  max_num_batched_tokens: 20480
+  max_num_batched_tokens: 16384
   # Parallel env workers (up to one per challenge in CyBench40 profile).
   max_env_workers: 40
-  # GRPO trainer side: disable FlashAttention for Qwen3.5 stability.
-  # We observed intermittent illegal-memory-access in policy forward under FA.
-  # vLLM generation on GPU0 still uses fast attention kernels.
-  flash_attn: false
+  # Enable FlashAttention for this canary after installing fast-path deps.
+  # If instability reappears, revert to false and keep the reduced token bounds.
+  flash_attn: true
   use_sample_packing: false
   # Qwen3.5 linear-attention blocks require flash-linear-attention + causal-conv1d.
   # Keep this strict in production to fail fast on new instances instead of
   # silently using unstable torch fallback kernels.
   require_fast_linear_attention: true
+  # Reduce allocator fragmentation during long GRPO policy updates.
+  pytorch_cuda_alloc_conf: "expandable_segments:True"
   # Tool call format for vLLM: use qwen3_coder parser.
   tool_call_format: qwen3_coder
   # Thinking mode: Qwen3.5 generates <think>...</think> before tool calls.
@@ -160,10 +164,27 @@ grpo:
   chat_template: "qwen3_without_thinking"
   chat_template_kwargs:
     enable_thinking: true
+  # SkyRL zero-variance filter: skip prompt groups where all generations
+  # in the group receive the same reward (zero advantage signal).
+  # Avoids wasting gradient updates on uninformative batches.
+  zero_variance_filter: true
+  # SkyRL dynamic sampling (DAPO filter): when a prompt group has zero
+  # variance, resample up to max_sample_batches times before giving up.
+  # "filter" type discards zero-variance groups; "resample" type retries.
+  dynamic_sampling:
+    type: "filter"
+    max_sample_batches: 10
+  # SkyRL step-wise trajectories: assign per-step rewards instead of
+  # only terminal reward. Enables credit assignment at each tool-call
+  # step (format compliance + phase progression signals).
+  step_wise_trajectories: true
+  # Explicit opt-in: requires patched SkyRL support for step-wise trajectories
+  # when using custom chat templates (qwen3_without_thinking).
+  allow_step_wise_with_custom_chat_template: true
   # Early-stop runaway trajectories when the model repeatedly emits text
   # without valid tool calls.
   agent_kwargs:
-    max_consecutive_no_tool_calls: 3
+    max_consecutive_no_tool_calls: 2
   # Memory budget for GRPO on B200 (183 GB HBM3e), server mode:
   #   Policy model (BF16): ~54 GB
   #   Ref model (BF16, CPU offload when beta=0): ~0 GB (offloaded)
@@ -183,17 +204,20 @@ grpo:
   #   Recommended: use 2 GPUs, or reduce gpu_memory_utilization to 0.35.
 
 reward:
-  # Explicitly pin default CTFReward weights for clarity and reproducibility.
-  flag_weight: 0.20
-  efficiency_weight: 0.20
-  progression_weight: 0.12
-  exploration_weight: 0.08
-  uniqueness_weight: 0.08
-  format_weight: 0.15
-  recovery_weight: 0.07
-  cognitive_weight: 0.10
-  hallucination_penalty: 0.10
-  noise_range: 0.05
+  # v8 reward weights: flag-dominant design.
+  # flag_weight doubled to dominate process signals in RLOO advantage.
+  # hallucination_penalty doubled to deter wrong flag submissions.
+  # noise_range reduced to avoid drowning the flag gap signal.
+  flag_weight: 0.40
+  efficiency_weight: 0.15
+  progression_weight: 0.08
+  exploration_weight: 0.05
+  uniqueness_weight: 0.05
+  format_weight: 0.10
+  recovery_weight: 0.09
+  cognitive_weight: 0.08
+  hallucination_penalty: 0.20
+  noise_range: 0.01
   exploration_gamma: 0.95
   use_gdpo: false
 

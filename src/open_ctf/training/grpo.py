@@ -25,12 +25,16 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# Canonical difficulty ordering for curriculum filtering.
+_DIFFICULTY_ORDER: List[str] = ["very_easy", "easy", "medium", "hard", "expert", "master"]
+_DIFFICULTY_RANK: Dict[str, int] = {d: i for i, d in enumerate(_DIFFICULTY_ORDER)}
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _CONFIGS_DIR = _PROJECT_ROOT / "configs" / "skyrl"
@@ -411,12 +415,15 @@ def _convert_grpo_data(
     output_dir: str,
     registry=None,
     drop_unresolved_registry_samples: bool = False,
+    drop_static_challenges: bool = False,
     max_samples: Optional[int] = None,
     max_samples_per_challenge: Optional[int] = None,
     target_port_offset: int = 0,
     target_host_override: Optional[str] = None,
     fail_on_target_collisions: bool = False,
     prefer_registry_target: bool = False,
+    difficulty_min: Optional[str] = None,
+    difficulty_max: Optional[str] = None,
 ) -> str:
     """Convert our GRPO JSONL to SkyRL dataset format.
 
@@ -438,6 +445,10 @@ def _convert_grpo_data(
         registry: Optional ChallengeRegistry for challenge ID normalization.
         drop_unresolved_registry_samples: If True and registry is provided,
             samples whose challenge ID cannot be resolved are dropped.
+        drop_static_challenges: If True and registry is provided, samples
+            whose resolved challenge has infra_type="static" are dropped.
+            Static challenges have no running Docker service, so they waste
+            compute during online GRPO training.
         max_samples: Optional cap on converted samples (after filtering).
         max_samples_per_challenge: Optional per-challenge cap for balancing.
         target_port_offset: Optional port offset applied to parsed target URLs.
@@ -447,6 +458,11 @@ def _convert_grpo_data(
             resolve to the same target URL.
         prefer_registry_target: If True, use registry-resolved target URL when
             available, even when a user message already contains a URL.
+        difficulty_min: Optional minimum difficulty (inclusive). Requires registry.
+            Samples below this difficulty are skipped. One of:
+            very_easy, easy, medium, hard, expert, master.
+        difficulty_max: Optional maximum difficulty (inclusive). Requires registry.
+            Samples above this difficulty are skipped.
 
     Returns:
         Path to the converted JSONL file.
@@ -456,8 +472,33 @@ def _convert_grpo_data(
     output_path = os.path.join(output_dir, "skyrl_grpo_data.jsonl")
     os.makedirs(output_dir, exist_ok=True)
 
+    # Validate difficulty bounds.
+    min_rank: Optional[int] = None
+    max_rank: Optional[int] = None
+    if difficulty_min is not None:
+        if difficulty_min not in _DIFFICULTY_RANK:
+            raise ValueError(
+                f"Invalid difficulty_min={difficulty_min!r}. "
+                f"Must be one of: {_DIFFICULTY_ORDER}"
+            )
+        min_rank = _DIFFICULTY_RANK[difficulty_min]
+    if difficulty_max is not None:
+        if difficulty_max not in _DIFFICULTY_RANK:
+            raise ValueError(
+                f"Invalid difficulty_max={difficulty_max!r}. "
+                f"Must be one of: {_DIFFICULTY_ORDER}"
+            )
+        max_rank = _DIFFICULTY_RANK[difficulty_max]
+    if min_rank is not None and max_rank is not None and min_rank > max_rank:
+        raise ValueError(
+            f"difficulty_min={difficulty_min!r} is harder than "
+            f"difficulty_max={difficulty_max!r}."
+        )
+
     converted = 0
     skipped = 0
+    skipped_static = 0
+    skipped_difficulty = 0
     unresolved_counts: Dict[str, int] = {}
     missing_challenge_id = 0
     per_challenge_counts: Dict[str, int] = {}
@@ -556,10 +597,41 @@ def _convert_grpo_data(
                     missing_challenge_id += 1
                     continue
 
+            # Drop static challenges (no Docker service to attack during online GRPO).
+            if drop_static_challenges and registry and resolved_challenge_id:
+                try:
+                    _static_info = registry.get(str(resolved_challenge_id))
+                    if _static_info.infra_type == "static":
+                        skipped += 1
+                        skipped_static += 1
+                        continue
+                except KeyError:
+                    pass
+
+            # Difficulty curriculum filter: skip challenges outside the allowed range.
+            if (min_rank is not None or max_rank is not None) and registry and resolved_challenge_id:
+                try:
+                    _diff_info = registry.get(str(resolved_challenge_id))
+                    diff_rank = _DIFFICULTY_RANK.get(_diff_info.difficulty)
+                    if diff_rank is not None:
+                        if min_rank is not None and diff_rank < min_rank:
+                            skipped += 1
+                            skipped_difficulty += 1
+                            continue
+                        if max_rank is not None and diff_rank > max_rank:
+                            skipped += 1
+                            skipped_difficulty += 1
+                            continue
+                except KeyError:
+                    pass
+
             registry_target = None
+            registry_category = None
             if registry and resolved_challenge_id:
                 try:
+                    info = registry.get(resolved_challenge_id)
                     registry_target = registry.get_target_url(resolved_challenge_id)
+                    registry_category = info.category or None
                 except KeyError:
                     registry_target = None
 
@@ -580,14 +652,19 @@ def _convert_grpo_data(
                     skipped += 1
                     continue
 
+            # Category from registry (e.g. "crypto", "rev", "forensics", "web")
+            # falls back to metadata.category if no registry match.
+            category = registry_category or metadata.get("category")
+
             row = {
                 "prompt": prompt,
                 "env_class": "openctf",
                 "ground_truth_flag": sample.get("ground_truth_flag"),
-                "optimal_steps": metadata.get("optimal_steps"),
+                "optimal_steps": sample.get("optimal_steps") or metadata.get("optimal_steps"),
                 "challenge_id": resolved_challenge_id,
                 "task_type": metadata.get("task_type", "ctf"),
                 "target": target,
+                "category": category,
             }
 
             writer.write(row)
@@ -612,6 +689,18 @@ def _convert_grpo_data(
         logger.warning(
             "Skipped %d samples with missing challenge_id/challenge metadata.",
             missing_challenge_id,
+        )
+    if skipped_static:
+        logger.info(
+            "Dropped %d static challenge samples (infra_type='static', no Docker service).",
+            skipped_static,
+        )
+    if skipped_difficulty:
+        logger.info(
+            "Dropped %d samples by difficulty filter (min=%s, max=%s).",
+            skipped_difficulty,
+            difficulty_min,
+            difficulty_max,
         )
     if converted == 0:
         raise ValueError(
@@ -971,6 +1060,11 @@ def _build_skyrl_config(
                     visible_gpu_count,
                 )
     chat_template_name = grpo_cfg.get("chat_template", None)
+    chat_template_kwargs = grpo_cfg.get("chat_template_kwargs", {})
+    step_wise_trajectories = bool(grpo_cfg.get("step_wise_trajectories", False))
+    allow_step_wise_with_custom_template = bool(
+        grpo_cfg.get("allow_step_wise_with_custom_chat_template", False)
+    )
     default_logprobs = None if remote_vllm else 0
     train_logprobs = grpo_cfg.get("logprobs", default_logprobs)
     eval_logprobs = grpo_cfg.get("eval_logprobs", train_logprobs)
@@ -994,6 +1088,39 @@ def _build_skyrl_config(
             eval_logprobs,
         )
         eval_logprobs = None
+
+    # SkyRL currently rejects step-wise trajectories with custom chat templates.
+    # Apply one centralized compatibility policy for all model/config combinations.
+    if (
+        chat_template_name
+        and step_wise_trajectories
+        and not allow_step_wise_with_custom_template
+    ):
+        if bool(grpo_cfg.get("step_wise_strict_compat", False)):
+            raise ValueError(
+                "grpo.step_wise_trajectories=true is incompatible with "
+                f"grpo.chat_template={chat_template_name!r} in current SkyRL. "
+                "Set grpo.step_wise_trajectories=false, remove grpo.chat_template, "
+                "or set grpo.step_wise_strict_compat=false to auto-disable."
+            )
+        logger.warning(
+            "grpo.step_wise_trajectories=true is incompatible with custom "
+            "chat_template=%r in current SkyRL; auto-disabling step-wise "
+            "trajectories for this run.",
+            chat_template_name,
+        )
+        step_wise_trajectories = False
+    elif (
+        chat_template_name
+        and step_wise_trajectories
+        and allow_step_wise_with_custom_template
+    ):
+        logger.warning(
+            "Using grpo.allow_step_wise_with_custom_chat_template=true with "
+            "chat_template=%r. Ensure SkyRL includes the step-wise + custom "
+            "chat-template compatibility fix.",
+            chat_template_name,
+        )
 
     # Detect transformer layer class for FSDP wrapping.
     # model._no_split_modules returns a set on some architectures (e.g. Llama),
@@ -1201,7 +1328,7 @@ def _build_skyrl_config(
                 "value_head_prefix": "value_head",
                 "loss_reduction": "token_mean",
                 "grpo_norm_by_std": True,
-                "zero_variance_filter": False,
+                "zero_variance_filter": bool(grpo_cfg.get("zero_variance_filter", False)),
                 "lambd": 1.0,
                 "gamma": 1.0,
                 "eps_clip_low": eps_clip_low,
@@ -1212,8 +1339,12 @@ def _build_skyrl_config(
                 "sapo": {"tau_pos": 1.0, "tau_neg": 1.05},
                 "value_clip": 0.2,
                 "dynamic_sampling": {
-                    "type": None,
-                    "max_sample_batches": 30,
+                    "type": grpo_cfg.get("dynamic_sampling", {}).get("type", None),
+                    "max_sample_batches": _as_positive_int(
+                        "grpo.dynamic_sampling.max_sample_batches",
+                        grpo_cfg.get("dynamic_sampling", {}).get("max_sample_batches"),
+                        30,
+                    ),
                     "min_replace_ratio": 0.3,
                 },
                 "clip_cov": {
@@ -1272,7 +1403,7 @@ def _build_skyrl_config(
             # SkyRL unpacks these in every apply_chat_template() call.
             # For Qwen3/Qwen3.5: {"enable_thinking": true} activates
             # <think>...</think> generation and correct loss masking.
-            "chat_template_kwargs": grpo_cfg.get("chat_template_kwargs", {}),
+            "chat_template_kwargs": chat_template_kwargs,
             # max_model_len limits vLLM's KV cache allocation.  Without this,
             # vLLM uses the model's max_position_embeddings (e.g. 262144) which
             # can exceed available GPU memory.  Set to max_input_length + headroom.
@@ -1310,7 +1441,7 @@ def _build_skyrl_config(
             "apply_overlong_filtering": False,
             "rope_scaling": None,
             "rope_theta": None,
-            "step_wise_trajectories": False,
+            "step_wise_trajectories": step_wise_trajectories,
         },
 
         # Environment
@@ -1452,12 +1583,15 @@ def train_grpo(
         output_dir,
         registry=registry,
         drop_unresolved_registry_samples=drop_unresolved,
+        drop_static_challenges=bool(grpo_cfg.get("drop_static_challenges", True)),
         max_samples=grpo_cfg.get("max_samples"),
         max_samples_per_challenge=grpo_cfg.get("max_samples_per_challenge"),
         target_port_offset=port_offset,
         target_host_override=host_override,
         fail_on_target_collisions=bool(grpo_cfg.get("fail_on_target_collisions", False)),
         prefer_registry_target=prefer_registry_target,
+        difficulty_min=grpo_cfg.get("difficulty_min"),
+        difficulty_max=grpo_cfg.get("difficulty_max"),
     )
 
     # 2. Build SkyRL config
@@ -1496,6 +1630,7 @@ def train_grpo(
     # Agent class from CLI flag > config file > None (DefaultStepAgent)
     resolved_agent_class = agent_class or grpo_cfg.get("agent_class")
     resolved_agent_kwargs = grpo_cfg.get("agent_kwargs", {})
+    pytorch_cuda_alloc_conf = grpo_cfg.get("pytorch_cuda_alloc_conf")
     try:
         _run_skyrl_training(
             skyrl_config, reward_config,
@@ -1503,6 +1638,7 @@ def train_grpo(
             agent_kwargs=resolved_agent_kwargs,
             use_new_inference=use_new_inference,
             trajectory_output_dir=trajectory_output_dir,
+            pytorch_cuda_alloc_conf=pytorch_cuda_alloc_conf,
         )
     except ImportError as e:
         logger.error(
@@ -1534,6 +1670,7 @@ def _run_skyrl_training(
     agent_kwargs: Optional[Dict[str, Any]] = None,
     use_new_inference: bool = False,
     trajectory_output_dir: Optional[str] = None,
+    pytorch_cuda_alloc_conf: Optional[str] = None,
 ) -> None:
     """Launch SkyRL training with the given config.
 
@@ -1569,6 +1706,9 @@ def _run_skyrl_training(
     # Keep multiprocess disabled to avoid Ray actor engine bootstrap issues.
     os.environ.setdefault("VLLM_USE_V1", "1")
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    if pytorch_cuda_alloc_conf:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = str(pytorch_cuda_alloc_conf)
+        logger.info("Set PYTORCH_CUDA_ALLOC_CONF=%s", pytorch_cuda_alloc_conf)
     # Use SkyRL's new HTTP inference layer when requested.
     # This avoids legacy Ray-wrapped vLLM LoRA startup issues on Qwen3.5.
     os.environ["_SKYRL_USE_NEW_INFERENCE"] = "1" if use_new_inference else "0"
@@ -1581,10 +1721,20 @@ def _run_skyrl_training(
     # Register env and run training inside a Ray remote task.
     # This ensures the env registration is visible to Ray workers.
     @ray.remote(num_cpus=1)
-    def _skyrl_entrypoint(cfg_dict, reward_config, agent_class, agent_kwargs, use_new_inference, trajectory_output_dir):
+    def _skyrl_entrypoint(
+        cfg_dict,
+        reward_config,
+        agent_class,
+        agent_kwargs,
+        use_new_inference,
+        trajectory_output_dir,
+        pytorch_cuda_alloc_conf,
+    ):
         import os as _os
         _os.environ["VLLM_USE_V1"] = "1"
         _os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        if pytorch_cuda_alloc_conf:
+            _os.environ["PYTORCH_CUDA_ALLOC_CONF"] = str(pytorch_cuda_alloc_conf)
         _os.environ["_SKYRL_USE_NEW_INFERENCE"] = "1" if use_new_inference else "0"
 
         from omegaconf import OmegaConf
@@ -1605,6 +1755,11 @@ def _run_skyrl_training(
             # Keep env-side guard aligned with generator max_turns, even though
             # SkyRL also injects max_turns per-sample via env_extras.
             "max_turns": int(getattr(cfg.generator, "max_turns", 15)),
+            # Step-wise trajectory rewards: when enabled, per-step rewards
+            # include small format-compliance and phase-progression signals.
+            "step_wise_trajectories": bool(
+                getattr(cfg.generator, "step_wise_trajectories", False)
+            ),
         }
         if agent_class:
             env_kwargs["agent_class"] = agent_class
@@ -1632,5 +1787,6 @@ def _run_skyrl_training(
             agent_kwargs or {},
             use_new_inference,
             trajectory_output_dir,
+            pytorch_cuda_alloc_conf,
         )
     )

@@ -22,6 +22,8 @@ from open_ctf.training.grpo import (
     _resolve_reward_config,
     _should_force_legacy_inference,
     _resolve_vllm_ready_model_path,
+    _DIFFICULTY_ORDER,
+    _DIFFICULTY_RANK,
 )
 
 
@@ -236,6 +238,131 @@ class TestConvertGRPOData:
 
         assert len(rows) == 1
         assert rows[0]["challenge_id"] == "known-id"
+
+    def test_drop_static_challenges_filters_static_infra(self, tmp_path):
+        """Samples with infra_type='static' should be dropped when flag is set."""
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(
+            src,
+            samples=[
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Docker challenge"},
+                    ],
+                    "ground_truth_flag": "FLAG{docker}",
+                    "metadata": {"challenge_id": "docker-chall"},
+                },
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Static challenge"},
+                    ],
+                    "ground_truth_flag": "FLAG{static}",
+                    "metadata": {"challenge_id": "static-chall"},
+                },
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Another docker challenge"},
+                    ],
+                    "ground_truth_flag": "FLAG{docker2}",
+                    "metadata": {"challenge_id": "docker-chall-2"},
+                },
+            ],
+        )
+        registry_path = tmp_path / "registry.yaml"
+        self._write_registry(
+            registry_path,
+            challenges=[
+                {
+                    "id": "docker-chall",
+                    "name": "Docker Challenge",
+                    "category": "web",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 8080,
+                },
+                {
+                    "id": "static-chall",
+                    "name": "Static Challenge",
+                    "category": "crypto",
+                    "difficulty": "easy",
+                    "infra_type": "static",
+                },
+                {
+                    "id": "docker-chall-2",
+                    "name": "Docker Challenge 2",
+                    "category": "pwn",
+                    "difficulty": "medium",
+                    "infra_type": "docker",
+                    "port": 1337,
+                },
+            ],
+        )
+        registry = ChallengeRegistry(str(registry_path))
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(
+            str(src),
+            output_dir,
+            registry=registry,
+            drop_static_challenges=True,
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+
+        assert len(rows) == 2
+        ids = {row["challenge_id"] for row in rows}
+        assert "docker-chall" in ids
+        assert "docker-chall-2" in ids
+        assert "static-chall" not in ids
+
+    def test_drop_static_challenges_disabled_keeps_all(self, tmp_path):
+        """When drop_static_challenges=False, static samples should be kept."""
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(
+            src,
+            samples=[
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Static challenge"},
+                    ],
+                    "ground_truth_flag": "FLAG{static}",
+                    "metadata": {"challenge_id": "static-chall"},
+                },
+            ],
+        )
+        registry_path = tmp_path / "registry.yaml"
+        self._write_registry(
+            registry_path,
+            challenges=[
+                {
+                    "id": "static-chall",
+                    "name": "Static Challenge",
+                    "category": "crypto",
+                    "difficulty": "easy",
+                    "infra_type": "static",
+                },
+            ],
+        )
+        registry = ChallengeRegistry(str(registry_path))
+        output_dir = str(tmp_path / "out")
+
+        result = _convert_grpo_data(
+            str(src),
+            output_dir,
+            registry=registry,
+            drop_static_challenges=False,
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+
+        assert len(rows) == 1
+        assert rows[0]["challenge_id"] == "static-chall"
 
     def test_registry_resolves_alias_to_canonical_id(self, tmp_path):
         src = tmp_path / "grpo.jsonl"
@@ -996,3 +1123,169 @@ class TestRuntimeGuards:
     def test_resolve_reward_config_rejects_non_dict(self):
         with pytest.raises(TypeError, match="config\\['reward'\\] must be a dict"):
             _resolve_reward_config({"reward": "bad"})
+
+
+# ---------------------------------------------------------------------------
+# Difficulty Curriculum Filtering
+# ---------------------------------------------------------------------------
+
+
+class TestDifficultyCurriculum:
+    """Tests for difficulty-based sample filtering in _convert_grpo_data."""
+
+    @staticmethod
+    def _write_registry(path: Path, challenges: list[dict]) -> ChallengeRegistry:
+        path.write_text(yaml.safe_dump({"challenges": challenges}))
+        return ChallengeRegistry(str(path))
+
+    @staticmethod
+    def _make_challenges():
+        """Create challenges at each difficulty level."""
+        return [
+            {"id": "ch-very-easy", "name": "VE", "category": "misc", "difficulty": "very_easy", "infra_type": "static"},
+            {"id": "ch-easy", "name": "Easy", "category": "misc", "difficulty": "easy", "infra_type": "static"},
+            {"id": "ch-medium", "name": "Med", "category": "misc", "difficulty": "medium", "infra_type": "static"},
+            {"id": "ch-hard", "name": "Hard", "category": "misc", "difficulty": "hard", "infra_type": "static"},
+            {"id": "ch-expert", "name": "Exp", "category": "misc", "difficulty": "expert", "infra_type": "static"},
+            {"id": "ch-master", "name": "Mst", "category": "misc", "difficulty": "master", "infra_type": "static"},
+        ]
+
+    @staticmethod
+    def _make_samples(challenge_ids):
+        """Create minimal GRPO samples for given challenge IDs."""
+        return [
+            {
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": f"Solve {cid}."},
+                ],
+                "ground_truth_flag": f"FLAG{{{cid}}}",
+                "metadata": {"challenge_id": cid},
+            }
+            for cid in challenge_ids
+        ]
+
+    def test_no_filter_keeps_all(self, tmp_path):
+        """When no difficulty filter is set, all samples pass through."""
+        registry = self._write_registry(tmp_path / "reg.yaml", self._make_challenges())
+        all_ids = [c["id"] for c in self._make_challenges()]
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src, self._make_samples(all_ids))
+
+        result = _convert_grpo_data(str(src), str(tmp_path / "out"), registry=registry)
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+        assert len(rows) == 6
+
+    def test_difficulty_max_filters_hard_challenges(self, tmp_path):
+        """difficulty_max='medium' should drop hard, expert, master."""
+        registry = self._write_registry(tmp_path / "reg.yaml", self._make_challenges())
+        all_ids = [c["id"] for c in self._make_challenges()]
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src, self._make_samples(all_ids))
+
+        result = _convert_grpo_data(
+            str(src), str(tmp_path / "out"),
+            registry=registry,
+            difficulty_max="medium",
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+        kept_ids = {r["challenge_id"] for r in rows}
+        assert kept_ids == {"ch-very-easy", "ch-easy", "ch-medium"}
+        assert len(rows) == 3
+
+    def test_difficulty_min_filters_easy_challenges(self, tmp_path):
+        """difficulty_min='hard' should drop very_easy, easy, medium."""
+        registry = self._write_registry(tmp_path / "reg.yaml", self._make_challenges())
+        all_ids = [c["id"] for c in self._make_challenges()]
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src, self._make_samples(all_ids))
+
+        result = _convert_grpo_data(
+            str(src), str(tmp_path / "out"),
+            registry=registry,
+            difficulty_min="hard",
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+        kept_ids = {r["challenge_id"] for r in rows}
+        assert kept_ids == {"ch-hard", "ch-expert", "ch-master"}
+        assert len(rows) == 3
+
+    def test_difficulty_range_filters_both_ends(self, tmp_path):
+        """difficulty_min='easy', difficulty_max='hard' keeps easy/medium/hard."""
+        registry = self._write_registry(tmp_path / "reg.yaml", self._make_challenges())
+        all_ids = [c["id"] for c in self._make_challenges()]
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src, self._make_samples(all_ids))
+
+        result = _convert_grpo_data(
+            str(src), str(tmp_path / "out"),
+            registry=registry,
+            difficulty_min="easy",
+            difficulty_max="hard",
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+        kept_ids = {r["challenge_id"] for r in rows}
+        assert kept_ids == {"ch-easy", "ch-medium", "ch-hard"}
+        assert len(rows) == 3
+
+    def test_invalid_difficulty_min_raises(self, tmp_path):
+        """Invalid difficulty_min should raise ValueError."""
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        with pytest.raises(ValueError, match="Invalid difficulty_min"):
+            _convert_grpo_data(
+                str(src), str(tmp_path / "out"),
+                difficulty_min="impossible",
+            )
+
+    def test_invalid_difficulty_max_raises(self, tmp_path):
+        """Invalid difficulty_max should raise ValueError."""
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        with pytest.raises(ValueError, match="Invalid difficulty_max"):
+            _convert_grpo_data(
+                str(src), str(tmp_path / "out"),
+                difficulty_max="impossible",
+            )
+
+    def test_inverted_range_raises(self, tmp_path):
+        """difficulty_min harder than difficulty_max should raise."""
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)
+        with pytest.raises(ValueError, match="is harder than"):
+            _convert_grpo_data(
+                str(src), str(tmp_path / "out"),
+                difficulty_min="hard",
+                difficulty_max="easy",
+            )
+
+    def test_without_registry_no_filtering(self, tmp_path):
+        """Difficulty filter with no registry should keep all samples."""
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(src)  # 2 default samples, no registry
+
+        result = _convert_grpo_data(
+            str(src), str(tmp_path / "out"),
+            difficulty_max="easy",
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            rows = list(reader)
+        assert len(rows) == 2  # All kept because no registry to look up difficulty
+
+    def test_difficulty_order_constants(self):
+        """Verify difficulty ordering is correct."""
+        assert _DIFFICULTY_ORDER == ["very_easy", "easy", "medium", "hard", "expert", "master"]
+        assert _DIFFICULTY_RANK["very_easy"] < _DIFFICULTY_RANK["easy"]
+        assert _DIFFICULTY_RANK["easy"] < _DIFFICULTY_RANK["medium"]
+        assert _DIFFICULTY_RANK["medium"] < _DIFFICULTY_RANK["hard"]
+        assert _DIFFICULTY_RANK["hard"] < _DIFFICULTY_RANK["expert"]
+        assert _DIFFICULTY_RANK["expert"] < _DIFFICULTY_RANK["master"]

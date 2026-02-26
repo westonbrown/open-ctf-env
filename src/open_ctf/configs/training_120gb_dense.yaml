@@ -66,6 +66,9 @@ sft:
 
 grpo:
   epochs: 1
+  # Difficulty curriculum: 3B model should not face expert/master challenges
+  # (zero-signal gradient updates). Start with very_easy..medium.
+  difficulty_max: "medium"
   # Dense model: batch_size > 1 possible but keep 1 for GRPO stability.
   batch_size: 1
   # batch_size(1) * grad_accum(8) must be divisible by num_gen(8): 8 % 8 = 0 (valid)
@@ -88,7 +91,10 @@ grpo:
   vllm_max_model_len: 6144
   # 15 tool iterations × ~200 tok/iter ≈ 3000 tok (fits in 2K+4K budget).
   max_tool_calling_iterations: 15
-  max_grad_norm: 0.1
+  # v8: increased from 0.1 to allow stronger gradient signal for flag capture.
+  # v7 lesson: 0.1 clipping was too aggressive, flag reward signal couldn't
+  # propagate through LoRA weights (grad norm consistently at clip ceiling).
+  max_grad_norm: 0.5
   epsilon_high: 0.28
   weight_decay: 0.1
   scale_rewards: false
@@ -106,6 +112,26 @@ grpo:
   # keep_all_think: false is the default (strip from history, keep on last).
   chat_template_kwargs:
     keep_all_think: false
+  # SkyRL zero-variance filter: skip prompt groups where all generations
+  # in the group receive the same reward (zero advantage signal).
+  # Avoids wasting gradient updates on uninformative batches.
+  zero_variance_filter: true
+  # SkyRL dynamic sampling (DAPO filter): when a prompt group has zero
+  # variance, resample up to max_sample_batches times before giving up.
+  # "filter" type discards zero-variance groups; "resample" type retries.
+  dynamic_sampling:
+    type: "filter"
+    max_sample_batches: 10
+  # SkyRL step-wise trajectories: assign per-step rewards instead of
+  # only terminal reward. Enables credit assignment at each tool-call
+  # step (format compliance +0.02/-0.02 + phase progression +0.03).
+  # Terminal CTFReward (8-signal, typical range 0.0-2.0) remains dominant.
+  step_wise_trajectories: true
+  # Early-stop runaway trajectories when the model repeatedly emits text
+  # without valid tool calls. Critical for 3B model which can get stuck
+  # in reasoning loops without producing actions.
+  agent_kwargs:
+    max_consecutive_no_tool_calls: 3
   # External vLLM server mode: colocate OOMs GB10 unified memory.
   # vLLM runs as separate process on same GPU, trainer uses remaining memory.
   use_vllm: true
@@ -127,21 +153,28 @@ grpo:
   #   Total peak: ~69 GB → ~50 GB headroom
 
 reward:
-  # Explicit CTFReward weights for reproducibility (prevents binary fallback).
-  flag_weight: 0.20
-  efficiency_weight: 0.20
-  progression_weight: 0.12
-  exploration_weight: 0.08
-  uniqueness_weight: 0.08
-  format_weight: 0.15
-  recovery_weight: 0.07
-  cognitive_weight: 0.10
-  hallucination_penalty: 0.10
-  noise_range: 0.05
+  # v8 reward weights: flag-dominant design (v7 lesson: 0% flag accuracy).
+  # Key changes from v7:
+  #   - flag_weight: 0.20 → 0.40 (model got +0.44 without any flag capture)
+  #   - hallucination_penalty: 0.10 → 0.20 (stronger deterrent)
+  #   - noise_range: 0.05 → 0.01 (was drowning 0.25 flag gap in RLOO)
+  #   - Process weights reduced proportionally to make room for flag signal
+  flag_weight: 0.40
+  efficiency_weight: 0.15
+  progression_weight: 0.08
+  exploration_weight: 0.05
+  uniqueness_weight: 0.05
+  format_weight: 0.10
+  recovery_weight: 0.09
+  cognitive_weight: 0.08
+  hallucination_penalty: 0.20
+  noise_range: 0.01
   exploration_gamma: 0.95
+  use_gdpo: false
 
 output:
-  save_steps: 25
+  # v8: more frequent checkpoints for shorter 44-sample run.
+  save_steps: 10
   logging_steps: 1
   report_to: tensorboard
 

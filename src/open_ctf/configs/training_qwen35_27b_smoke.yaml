@@ -52,13 +52,22 @@ grpo:
   gpu_memory_utilization: 0.68
   max_num_seqs: 4
   max_num_batched_tokens: 8192
-  flash_attn: false
+  flash_attn: true
   use_sample_packing: false
   require_fast_linear_attention: true
+  pytorch_cuda_alloc_conf: "expandable_segments:True"
   tool_call_format: qwen3_coder
   chat_template: "qwen3_without_thinking"
   chat_template_kwargs:
     enable_thinking: true
+  zero_variance_filter: true
+  dynamic_sampling:
+    type: "filter"
+    max_sample_batches: 5
+  step_wise_trajectories: true
+  allow_step_wise_with_custom_chat_template: true
+  agent_kwargs:
+    max_consecutive_no_tool_calls: 2
 
 reward:
   flag_weight: 0.20
