@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 
 from open_ctf.challenges.registry import ChallengeRegistry
-from open_ctf.training.grpo import (
+from open_ctf.training.online_rl.runtime import (
     _convert_grpo_data,
     _build_skyrl_config,
     _is_qwen3_5_config,
@@ -87,7 +87,7 @@ class TestConvertGRPOData:
 
         result = _convert_grpo_data(str(src), output_dir)
         assert os.path.exists(result)
-        assert result.endswith("skyrl_grpo_data.jsonl")
+        assert result.endswith("skyrl_online_rl_data.jsonl")
 
     def test_correct_number_of_samples(self, tmp_path):
         src = tmp_path / "grpo.jsonl"
@@ -410,6 +410,177 @@ class TestConvertGRPOData:
         assert row["challenge_id"] == "eval-me"
         assert row["target"] == "http://localhost:32805"
 
+    def test_registry_flag_mismatch_raises_when_enabled(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(
+            src,
+            samples=[
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Challenge A"},
+                    ],
+                    "ground_truth_flag": "FLAG{dataset}",
+                    "metadata": {"challenge_id": "known-id"},
+                }
+            ],
+        )
+        registry_path = tmp_path / "registry.yaml"
+        self._write_registry(
+            registry_path,
+            challenges=[
+                {
+                    "id": "known-id",
+                    "name": "Known Challenge",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 32801,
+                    "ground_truth_flag": "FLAG{registry}",
+                }
+            ],
+        )
+        registry = ChallengeRegistry(str(registry_path))
+
+        with pytest.raises(ValueError, match="mismatches registry"):
+            _convert_grpo_data(
+                str(src),
+                str(tmp_path / "out"),
+                registry=registry,
+                fail_on_flag_mismatch=True,
+            )
+
+    def test_registry_flag_mismatch_uses_registry_when_not_failing(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(
+            src,
+            samples=[
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Challenge A"},
+                    ],
+                    "ground_truth_flag": "FLAG{dataset}",
+                    "metadata": {"challenge_id": "known-id"},
+                }
+            ],
+        )
+        registry_path = tmp_path / "registry.yaml"
+        self._write_registry(
+            registry_path,
+            challenges=[
+                {
+                    "id": "known-id",
+                    "name": "Known Challenge",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 32801,
+                    "ground_truth_flag": "FLAG{registry}",
+                }
+            ],
+        )
+        registry = ChallengeRegistry(str(registry_path))
+
+        result = _convert_grpo_data(
+            str(src),
+            str(tmp_path / "out"),
+            registry=registry,
+            fail_on_flag_mismatch=False,
+        )
+        import jsonlines
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["ground_truth_flag"] == "FLAG{registry}"
+
+    def test_missing_registry_flag_raises_when_enabled(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(
+            src,
+            samples=[
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Challenge A"},
+                    ],
+                    "ground_truth_flag": "FLAG{dataset}",
+                    "metadata": {"challenge_id": "known-id"},
+                }
+            ],
+        )
+        registry_path = tmp_path / "registry.yaml"
+        self._write_registry(
+            registry_path,
+            challenges=[
+                {
+                    "id": "known-id",
+                    "name": "Known Challenge",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 32801,
+                }
+            ],
+        )
+        registry = ChallengeRegistry(str(registry_path))
+
+        with pytest.raises(ValueError, match="missing ground_truth_flag"):
+            _convert_grpo_data(
+                str(src),
+                str(tmp_path / "out"),
+                registry=registry,
+                fail_on_missing_registry_flag=True,
+            )
+
+    def test_require_all_registry_challenges_raises_when_missing(self, tmp_path):
+        src = tmp_path / "grpo.jsonl"
+        _write_grpo_jsonl(
+            src,
+            samples=[
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a CTF agent."},
+                        {"role": "user", "content": "Challenge A"},
+                    ],
+                    "ground_truth_flag": "FLAG{a}",
+                    "metadata": {"challenge_id": "chall-a"},
+                }
+            ],
+        )
+        registry_path = tmp_path / "registry.yaml"
+        self._write_registry(
+            registry_path,
+            challenges=[
+                {
+                    "id": "chall-a",
+                    "name": "Challenge A",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 32801,
+                    "ground_truth_flag": "FLAG{a}",
+                },
+                {
+                    "id": "chall-b",
+                    "name": "Challenge B",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 32802,
+                    "ground_truth_flag": "FLAG{b}",
+                },
+            ],
+        )
+        registry = ChallengeRegistry(str(registry_path))
+
+        with pytest.raises(ValueError, match="missing registry challenges"):
+            _convert_grpo_data(
+                str(src),
+                str(tmp_path / "out"),
+                registry=registry,
+                require_all_registry_challenges=True,
+            )
+
 
 # ---------------------------------------------------------------------------
 # _build_skyrl_config
@@ -460,7 +631,7 @@ class TestBuildSkyrlConfig:
     def test_trainer_algorithm_default(self, config):
         result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
-        assert algo["advantage_estimator"] == "rloo_n"
+        assert algo["advantage_estimator"] == "rloo"
 
     def test_generator_sampling_params(self, config):
         result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
@@ -1081,7 +1252,7 @@ class TestRuntimeGuards:
         assert _is_qwen3_5_config(_Cfg()) is True
 
     def test_validate_qwen3_5_runtime_dependencies_raises_when_missing(self, monkeypatch):
-        from open_ctf.training import grpo as grpo_mod
+        import open_ctf.training.online_rl.runtime as grpo_mod
 
         class _Cfg:
             model_type = "qwen3_5"
@@ -1100,7 +1271,7 @@ class TestRuntimeGuards:
             )
 
     def test_validate_qwen3_5_runtime_dependencies_allows_override(self, monkeypatch):
-        from open_ctf.training import grpo as grpo_mod
+        import open_ctf.training.online_rl.runtime as grpo_mod
 
         class _Cfg:
             model_type = "qwen3_5"

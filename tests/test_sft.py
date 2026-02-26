@@ -11,7 +11,7 @@ import json
 import pytest
 from pathlib import Path
 
-from open_ctf.training.sft import (
+from open_ctf.training.sft.llamafactory import (
     _ensure_dataset_info,
     _build_lf_config,
     _resolve_lf_config,

@@ -164,7 +164,7 @@ cat data/all_traces.jsonl data/failed_traces.jsonl > data/combined.jsonl
 open-ctf-split \
     --input data/combined.jsonl \
     --sft-output data/sft.jsonl \
-    --grpo-output data/grpo.jsonl
+    --online-rl-output data/online_rl.jsonl
 
 # Synthesize Massively Parallel Agent Traces
 open-ctf-synthetic-data \
@@ -191,13 +191,15 @@ open-ctf-train merge \
     --output outputs/sft-qwen35-merged
 
 # Stage 2: GRPO via SkyRL
-open-ctf-train grpo \
+open-ctf-train rl \
     --model outputs/sft-qwen35-merged \
-    --data data/grpo_cybench40.jsonl \
-    --output outputs/grpo-qwen35 \
+    --data data/online_rl_cybench40.jsonl \
+    --output outputs/online_rl-qwen35 \
     --config src/open_ctf/configs/training_qwen35_27b.yaml \
     --challenge-registry configs/challenges/cybench.yaml
 ```
+
+Stage-2 launch runs a strict preflight gate automatically (`open-ctf-validate --mode grpo-preflight`) and expects a dataset manifest at `<data>.manifest.json`.
 
 If challenges run on a different host than the trainer (for example DGX + RunPod tunnel), export live challenge targets and pass the map at launch:
 
@@ -210,7 +212,7 @@ PYTHONPATH=src python3 scripts/generate_live_target_map.py \
     --output /tmp/cybench_targets.json
 
 # On trainer host
-OPEN_CTF_TARGET_MAP_PATH=/tmp/cybench_targets.json open-ctf-train grpo ...
+OPEN_CTF_TARGET_MAP_PATH=/tmp/cybench_targets.json open-ctf-train rl ...
 ```
 
 During online GRPO, the model generates tool calls that are executed locally by the `ToolExecutor` (subprocess per env worker). SkyRL handles distributing the simulation environments alongside the vLLM engine across Ray workers.
@@ -219,7 +221,7 @@ During online GRPO, the model generates tool calls that are executed locally by 
 
 ```bash
 open-ctf-eval \
-    --model outputs/grpo/final \
+    --model outputs/online_rl/final \
     --baseline unsloth/GLM-4.7-Flash \
     --challenges cybench
 ```
@@ -229,7 +231,7 @@ open-ctf-eval \
 ```bash
 # Export to GGUF
 open-ctf-export \
-    --adapter outputs/grpo/final \
+    --adapter outputs/online_rl/final \
     --base-model unsloth/GLM-4.7-Flash \
     --output models/ctf-agent.gguf \
     --quant Q4_K_M
@@ -253,7 +255,7 @@ Data is generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) -
 | Dataset | Traces | Size | Description |
 |---------|--------|------|-------------|
 | `data/sft.jsonl` | 820 | 62.5MB | Successful solves for SFT |
-| `data/grpo_cybench40.jsonl` | 87 | 7.3MB | CyBench traces with flags for online GRPO |
+| `data/online_rl_cybench40.jsonl` | 87 | 7.3MB | CyBench traces with flags for online GRPO |
 | `data/grpo_offline_683.jsonl` | 676 | 38.8MB | Cross-platform traces for offline GRPO |
 
 **Sources:** BoxPwnr-Traces across 8 CTF platforms. After conversion, splitting, and quality filtering (token outliers, empty traces, placeholder flags removed), 820 SFT + 87 online GRPO remain. See [`data/README.md`](data/README.md) for filter criteria.
@@ -299,7 +301,7 @@ pip install -e ".[gepa]"
 # Stage 3: Optimize system prompt
 open-ctf-train gepa \
     --model openai/ctf-agent \
-    --data data/grpo_cybench40.jsonl \
+    --data data/online_rl_cybench40.jsonl \
     --output outputs/gepa \
     --challenge-registry configs/challenges/cybench.yaml \
     --budget medium
@@ -307,7 +309,7 @@ open-ctf-train gepa \
 # Optional: use a stronger reflection model served on another local endpoint
 open-ctf-train gepa \
     --model openai/ctf-agent \
-    --data data/grpo_cybench40.jsonl \
+    --data data/online_rl_cybench40.jsonl \
     --output outputs/gepa \
     --reflection-model openai/ctf-reflection \
     --challenge-registry configs/challenges/cybench.yaml
@@ -355,7 +357,7 @@ open-ctf-env/
 │   └── skyrl/                       # Per-model GRPO configs
 ├── data/                            # Training data (generated)
 │   ├── sft.jsonl                    # 820 successful traces
-│   ├── grpo_cybench40.jsonl         # 87 CyBench traces with flags
+│   ├── online_rl_cybench40.jsonl    # 87 CyBench traces with flags
 │   └── dataset_info.json            # LlamaFactory dataset metadata
 ├── docker/Dockerfile                # Multi-stage (targets: base, sft, grpo)
 ├── src/open_ctf/
@@ -370,10 +372,15 @@ open-ctf-env/
 │   ├── formatters/                  # Model chat template formatters
 │   ├── rewards/reward.py            # CTFReward (8 signals + penalty)
 │   └── training/
-│       ├── sft.py                   # LlamaFactory SFT orchestrator
-│       ├── grpo.py                  # SkyRL GRPO orchestrator
-│       ├── gepa.py                  # GEPA prompt optimizer (DSPy)
-│       └── step_reward.py           # CTFReward adapter for SkyRL
+│       ├── sft/
+│       │   ├── llamafactory.py      # LlamaFactory SFT backend
+│       │   └── trl.py               # TRL SFT backend
+│       ├── online_rl/
+│       │   ├── entrypoint.py        # Stage-2 online RL entrypoint
+│       │   ├── runtime.py           # SkyRL runtime + config conversion
+│       │   ├── step_reward.py       # Per-step shaping reward adapter
+│       │   └── trajectory_logger.py # Rollout + reward telemetry
+│       └── gepa.py                  # GEPA prompt optimizer (DSPy)
 ├── tests/                           # Reward, executor, registry, drift tests
 └── references/                      # SkyRL, LlamaFactory, BoxPwnr sources
 ```
@@ -394,7 +401,7 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 |---------|---------|
 | `open-ctf-train sft` | Stage 1: SFT via LlamaFactory |
 | `open-ctf-train merge` | Merge LoRA adapter into base model |
-| `open-ctf-train grpo` | Stage 2: Online GRPO via SkyRL |
+| `open-ctf-train rl` | Stage 2: Online GRPO via SkyRL |
 | `open-ctf-train gepa` | Stage 3: GEPA prompt optimization (no weight updates) |
 | `open-ctf-convert` | Convert BoxPwnr traces to training format |
 | `open-ctf-split` | Split datasets into SFT and GRPO sets |

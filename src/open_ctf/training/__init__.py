@@ -1,16 +1,23 @@
-"""Training modules for SFT, GRPO, and GEPA stages.
+"""Training modules for SFT, online RL, and GEPA stages.
 
 Imports are lazy to avoid requiring all dependencies (e.g. llamafactory,
 skyrl, dspy) when only one training stage is used.
 
 SFT:  LlamaFactory-based supervised fine-tuning
-GRPO: SkyRL-based online reinforcement learning
+online RL: SkyRL-based online reinforcement learning (GRPO/RLOO variants)
 GEPA: DSPy-based prompt evolution (no weight updates)
 """
 
 import logging
 
-__all__ = ["train_sft", "train_sft_trl", "train_grpo", "run_gepa", "check_wandb_available"]
+__all__ = [
+    "train_sft",
+    "train_sft_trl",
+    "train_online_rl",
+    "train_grpo",
+    "run_gepa",
+    "check_wandb_available",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +42,23 @@ def check_wandb_available(report_to: str) -> str:
     return report_to
 
 
+def _import_online_rl():
+    from .online_rl import train_online_rl, train_grpo
+    return train_online_rl, train_grpo
+
+
 def __getattr__(name):
     if name == "train_sft":
         from .sft import train_sft
         return train_sft
     if name == "train_sft_trl":
-        from .sft_trl import train_sft as train_sft_trl
+        from .sft import train_sft_trl
         return train_sft_trl
+    if name == "train_online_rl":
+        train_online_rl, _ = _import_online_rl()
+        return train_online_rl
     if name == "train_grpo":
-        from .grpo import train_grpo
+        _, train_grpo = _import_online_rl()
         return train_grpo
     if name == "run_gepa":
         from .gepa import run_gepa

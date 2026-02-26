@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Split converted BoxPwnr traces into SFT and GRPO datasets.
+"""Split converted BoxPwnr traces into SFT and online RL datasets.
 
 Usage:
     open-ctf split --input data/converted.jsonl
     open-ctf split --input data/converted.jsonl \\
         --sft-output data/sft.jsonl \\
-        --grpo-output data/grpo.jsonl \\
-        --max-grpo-tokens 32768
+        --online-rl-output data/online_rl.jsonl \\
+        --max-online-rl-tokens 32768
 """
 
 import argparse
@@ -19,7 +19,7 @@ from open_ctf.data.splitter import DatasetSplitter
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Split converted BoxPwnr traces into SFT and GRPO datasets"
+        description="Split converted BoxPwnr traces into SFT and online RL datasets"
     )
     parser.add_argument(
         "--input",
@@ -32,15 +32,17 @@ def main() -> None:
         help="Output path for SFT dataset (default: data/sft.jsonl)",
     )
     parser.add_argument(
-        "--grpo-output",
-        default="data/grpo.jsonl",
-        help="Output path for GRPO dataset (default: data/grpo.jsonl)",
+        "--online-rl-output", "--grpo-output",
+        dest="online_rl_output",
+        default="data/online_rl.jsonl",
+        help="Output path for online RL dataset (default: data/online_rl.jsonl)",
     )
     parser.add_argument(
-        "--max-grpo-tokens",
+        "--max-online-rl-tokens", "--max-grpo-tokens",
+        dest="max_online_rl_tokens",
         type=int,
         default=32768,
-        help="Max estimated tokens per GRPO trace (default: 32768)",
+        help="Max estimated tokens per online RL trace (default: 32768)",
     )
     parser.add_argument(
         "--verbose",
@@ -58,8 +60,8 @@ def main() -> None:
         print(f"Error: input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    splitter = DatasetSplitter(max_grpo_tokens=args.max_grpo_tokens)
-    stats = splitter.split(args.input, args.sft_output, args.grpo_output)
+    splitter = DatasetSplitter(max_grpo_tokens=args.max_online_rl_tokens)
+    stats = splitter.split(args.input, args.sft_output, args.online_rl_output)
 
     # Print summary
     print("\n=== Dataset Split Summary ===\n")
@@ -80,7 +82,7 @@ def main() -> None:
         print(f"    {platform:<25s} {count:>6d}")
 
     print(f"\n  Written: {args.sft_output}")
-    print(f"  Written: {args.grpo_output}")
+    print(f"  Written: {args.online_rl_output}")
     print()
 
 

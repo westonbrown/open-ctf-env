@@ -15,8 +15,8 @@ from unittest.mock import MagicMock, patch
 
 from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv, parse_tool_calls
 from open_ctf.rewards.reward import CTFReward
-from open_ctf.training.step_reward import per_step_reward
-from open_ctf.training.grpo import _build_skyrl_config
+from open_ctf.training.online_rl.step_reward import per_step_reward
+from open_ctf.training.online_rl.runtime import _build_skyrl_config
 
 
 # ---------------------------------------------------------------------------
@@ -461,11 +461,11 @@ class TestRLOONConfig:
             "output": {"save_steps": 50, "report_to": "none"},
         }
 
-    def test_default_advantage_estimator_is_rloo_n(self, base_config):
-        """Default should be rloo_n (OpenThoughts-aligned)."""
+    def test_default_advantage_estimator_is_rloo(self, base_config):
+        """Default should be rloo (SkyRL 0.3.1 compatible)."""
         result = _build_skyrl_config("/model", "/out", base_config, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
-        assert algo["advantage_estimator"] == "rloo_n"
+        assert algo["advantage_estimator"] == "rloo"
 
     def test_explicit_rloo_n_from_config(self, base_config):
         """Explicit rloo_n in config should pass through."""

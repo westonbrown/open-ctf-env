@@ -63,6 +63,10 @@ grpo:
   gpu_memory_utilization: 0.4
   # Online training: max tool-calling iterations per generation.
   max_tool_calling_iterations: 15
+  # Data/registry integrity guards (recommended for production):
+  fail_on_flag_mismatch: true
+  fail_on_missing_registry_flag: true
+  require_all_registry_challenges: false
 
 gepa:
   # GEPA prompt evolution (Stage 3, no weight updates).

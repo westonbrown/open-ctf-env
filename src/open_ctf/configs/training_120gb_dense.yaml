@@ -18,9 +18,9 @@
 
 model:
   name: "Nanbeige/Nanbeige4.1-3B"
-  # 32K context: Nanbeige4.1-3B supports 262K but 32K is practical for training.
-  # batch=1 + 32K + grad_ckpt fits on DGX Spark (119 GB unified).
-  max_seq_length: 32768
+  # 8K context: 55% of sft_quality.jsonl fits fully, rest truncated.
+  # Critical for multi-turn tool traces (system prompt + recent tool calls).
+  max_seq_length: 8192
   # QLoRA 4-bit works perfectly for dense Llama models.
   # ~3-4 GB model weights in 4-bit (vs ~8 GB BF16).
   load_in_4bit: true
@@ -42,33 +42,45 @@ lora:
   use_rslora: false
 
 sft:
-  # 3 epochs: balances convergence vs training time.
-  # Loss already drops to ~0.9 by step 7 (~epoch 0.14), 3 epochs sufficient.
-  epochs: 3
-  # batch_size=1 required: 166K vocab → logits tensor is ~81 GiB at batch=4.
-  # Compensate with gradient_accumulation_steps=16 for same effective batch.
-  batch_size: 1
-  gradient_accumulation_steps: 16
-  # Effective batch: 1 * 16 = 16
+  # 2 epochs at 8K context, batch=2, GC enabled, tf32 matmul.
+  # 339 samples × 2 passes = 678 / (batch=2 × accum=4) = 85 optimizer steps.
+  # ~250s/step × 85 = ~5.9 hours (tf32 saves ~5% vs pure bf16).
+  epochs: 2
+  # GC required: disabling OOMs (attention softmax needs 10 GB per alloc).
+  gradient_checkpointing: true
+  # batch_size=2 at 8K: logits+grad = 2 × 8K × 166K × 4B × 2 = ~22 GB.
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  # Effective batch: 2 * 4 = 8
   learning_rate: 2.0e-4
   warmup_ratio: 0.03
   weight_decay: 0.01
   lr_scheduler_type: cosine
-  packing: true
-  # Memory budget for SFT on DGX Spark (119 GB unified):
-  #   Model (NF4): ~3-4 GB
+  # Packing disabled: without flash_attn (GB10 sm_121a), packing causes
+  # cross-contamination between samples. Slower but correct.
+  packing: false
+  # GB10: flash_attn not compiled for sm_121a, use sdpa/eager
+  flash_attn: false
+  # tf32 matmul: ~5-10% speedup for float32 operations (optimizer, loss).
+  # Negligible precision impact. GB10 sm_121a supports TF32.
+  tf32: true
+  # Memory budget for SFT on DGX Spark (119 GB unified, GC enabled):
+  #   Model (NF4): ~3-4 GB (BF16 fallback: ~6 GB)
   #   LoRA adapters: ~0.5 GB
-  #   Optimizer (8-bit AdamW): ~1 GB
-  #   Logits (1 × 32K × 166K × 4B): ~21 GB (166K vocab is large!)
-  #   Gradient activations (checkpointed, 32K, batch=1): ~15-20 GB
+  #   Optimizer (8-bit or torch AdamW): ~1 GB
+  #   Logits (2 × 8K × 166K × 4B): ~11 GB
+  #   Logits gradient (same size): ~11 GB
+  #   Activations (GC, ~sqrt(32) checkpoint layers): ~8-10 GB
   #   Framework/OS: ~5 GB
-  #   Total: ~45-50 GB -> ~70 GB headroom
+  #   Total: ~40-42 GB -> ~78 GB headroom
+  #   CRITICAL: dataloader_num_workers=0 (fork overhead OOMs unified memory)
 
 grpo:
   epochs: 1
-  # Difficulty curriculum: 3B model should not face expert/master challenges
-  # (zero-signal gradient updates). Start with very_easy..medium.
-  difficulty_max: "medium"
+  # All 40 CyBench challenges: very_easy through master.
+  # 25 docker + 15 static = 40 samples total.
+  difficulty_max: "master"
+  drop_static_challenges: false
   # Dense model: batch_size > 1 possible but keep 1 for GRPO stability.
   batch_size: 1
   # batch_size(1) * grad_accum(8) must be divisible by num_gen(8): 8 % 8 = 0 (valid)
@@ -173,8 +185,8 @@ reward:
   use_gdpo: false
 
 output:
-  # v8: more frequent checkpoints for shorter 44-sample run.
-  save_steps: 10
+  # v8: ~213 optimizer steps (339 samples × 5 epochs ÷ batch2 ÷ accum4, no packing).
+  save_steps: 50
   logging_steps: 1
   report_to: tensorboard
 

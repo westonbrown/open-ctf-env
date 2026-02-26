@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -327,7 +328,16 @@ class OpenCTFTextEnv(_Base):
         extras = extras or {}
 
         self.max_turns = extras.get("max_turns") or kwargs.get("max_turns", 15)
+        self._base_max_turns = int(self.max_turns)
         self.turns = 0
+
+        # Optional progressive horizon schedule:
+        #   {"rounds": [12, 24, 40, 60], "step_interval": 80}
+        # If set, max_turns is reduced/expanded by global_step stage.
+        self._horizon_schedule: Optional[Dict[str, Any]] = (
+            extras.get("horizon_schedule")
+            or kwargs.get("horizon_schedule")
+        )
 
         # Tool schemas — SkyRL uses these for prompt injection.
         from open_ctf.envs.skyrl.tool_groups import OPENCTF_TOOLS
@@ -370,7 +380,7 @@ class OpenCTFTextEnv(_Base):
             )
             reward_config = {}
         try:
-            from open_ctf.training.step_reward import create_reward_fn
+            from open_ctf.training.online_rl.step_reward import create_reward_fn
             self._reward_fn = create_reward_fn({"reward": reward_config})
         except Exception as exc:
             logger.warning("Failed to create reward function: %s — using binary fallback", exc)
@@ -380,9 +390,19 @@ class OpenCTFTextEnv(_Base):
         self._ground_truth_flag: Optional[str] = extras.get("ground_truth_flag")
         self._optimal_steps: Optional[int] = extras.get("optimal_steps")
         self._challenge_id: Optional[str] = extras.get("challenge_id")
+        self._infra_type: str = str(
+            extras.get("infra_type")
+            or kwargs.get("infra_type")
+            or "docker"
+        )
+        self._path_hint: Optional[str] = (
+            extras.get("path_hint")
+            or kwargs.get("path_hint")
+        )
 
         # Target URL for the challenge
-        self._target: str = extras.get("target", kwargs.get("target", ""))
+        raw_target = extras.get("target", kwargs.get("target", ""))
+        self._target: str = str(raw_target).strip() if raw_target else ""
 
         # Trajectory logging (optional, for post-run analysis).
         # The output_dir is a plain string path, not a logger object, because
@@ -395,9 +415,9 @@ class OpenCTFTextEnv(_Base):
         self._trajectory_logger = None
         if self._trajectory_output_dir:
             try:
-                from open_ctf.training.trajectory_logger import TrajectoryLogger
+                from open_ctf.training.online_rl.trajectory_logger import TrajectoryLogger
                 # Reuse the same TensorBoard logdir set by _resolve_skyrl_logger()
-                # so CTF scalars appear alongside SkyRL training metrics.
+                # so environment scalars appear alongside SkyRL training metrics.
                 tb_dir = os.environ.get("TENSORBOARD_LOGDIR")
                 self._trajectory_logger = TrajectoryLogger(
                     self._trajectory_output_dir,
@@ -415,6 +435,50 @@ class OpenCTFTextEnv(_Base):
         self._difficulty: Optional[str] = extras.get("difficulty")
         # Prompt messages for logging (set in init())
         self._prompt_messages: Optional[list] = None
+        self._last_rollout_status: str = "ok"
+        self._status_counts: Dict[str, int] = {}
+        self._timing_totals: Dict[str, float] = {
+            "parse_s": 0.0,
+            "execute_s": 0.0,
+            "total_s": 0.0,
+        }
+        # Rollout quality filter: statuses that should not contribute reward.
+        hard_mask_statuses = (
+            extras.get("hard_mask_statuses")
+            or kwargs.get("hard_mask_statuses")
+            or ["infra_unreachable", "target_mismatch", "parser_error", "tool_timeout"]
+        )
+        self._hard_mask_statuses = {str(s).strip() for s in hard_mask_statuses if str(s).strip()}
+        # Optional warmup mode: clamp non-positive rollout rewards to 0 during
+        # early steps, which avoids strong negative gradients before the policy
+        # learns to issue stable tool calls.
+        raw_positive_only_until_step = (
+            extras.get("positive_only_until_step")
+            if extras.get("positive_only_until_step") is not None
+            else kwargs.get("positive_only_until_step", 0)
+        )
+        try:
+            self._positive_only_until_step = int(raw_positive_only_until_step or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid positive_only_until_step=%r; defaulting to 0.",
+                raw_positive_only_until_step,
+            )
+            self._positive_only_until_step = 0
+
+        raw_positive_only_reward_floor = (
+            extras.get("positive_only_reward_floor")
+            if extras.get("positive_only_reward_floor") is not None
+            else kwargs.get("positive_only_reward_floor", 0.0)
+        )
+        try:
+            self._positive_only_reward_floor = float(raw_positive_only_reward_floor or 0.0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid positive_only_reward_floor=%r; defaulting to 0.0.",
+                raw_positive_only_reward_floor,
+            )
+            self._positive_only_reward_floor = 0.0
 
         # Resolve and create the pluggable StepAgent.
         # agent_class is a dotted path string (Ray-safe serialization).
@@ -462,6 +526,17 @@ class OpenCTFTextEnv(_Base):
         Returns:
             (prompt, metadata) — prompt with tool schemas injected, metadata has episode_id.
         """
+        # Progressive horizon: clamp max turns by stage if schedule is enabled.
+        self.max_turns = self._resolve_max_turns_for_step(self._global_step)
+        # For static challenges, stage challenge assets into /root/challenge.
+        if self._infra_type == "static":
+            self._prepare_static_workspace()
+        # Avoid empty target fallback to localhost for static rows.
+        if not self._target:
+            if self._infra_type == "static":
+                self._target = "file:///root/challenge/"
+            else:
+                self._target = os.getenv("CHALLENGE_TARGET", "http://localhost:8080")
         self._agent.reset(
             target=self._target,
             ground_truth_flag=self._ground_truth_flag or "",
@@ -472,6 +547,9 @@ class OpenCTFTextEnv(_Base):
         self.turns = 0
         self._done = False
         self._prev_tool_call_count = 0
+        self._last_rollout_status = "ok"
+        self._status_counts = {}
+        self._timing_totals = {"parse_s": 0.0, "execute_s": 0.0, "total_s": 0.0}
 
         # Inject tool schemas into the system message so the model knows
         # what tools are available during GRPO rollouts. SkyRL's generator
@@ -487,6 +565,114 @@ class OpenCTFTextEnv(_Base):
             self._challenge_id,
         )
         return prompt, {"episode_id": self._episode_id}
+
+    def _resolve_max_turns_for_step(self, global_step: int) -> int:
+        """Return effective max turns for current training step."""
+        schedule = self._horizon_schedule
+        if not isinstance(schedule, dict):
+            return self._base_max_turns
+        rounds_raw = schedule.get("rounds")
+        if not isinstance(rounds_raw, list):
+            return self._base_max_turns
+        rounds = []
+        for item in rounds_raw:
+            try:
+                v = int(item)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                rounds.append(v)
+        if not rounds:
+            return self._base_max_turns
+        try:
+            step_interval = int(schedule.get("step_interval", 1))
+        except (TypeError, ValueError):
+            step_interval = 1
+        step_interval = max(1, step_interval)
+        stage = max(0, int(global_step) // step_interval)
+        if stage >= len(rounds):
+            stage = len(rounds) - 1
+        return max(1, min(self._base_max_turns, int(rounds[stage])))
+
+    def _resolve_static_source_path(self) -> Optional[str]:
+        """Resolve static challenge source path from path_hint + known roots."""
+        hint = (self._path_hint or "").strip()
+        if not hint:
+            return None
+        if os.path.isabs(hint) and os.path.exists(hint):
+            return hint
+
+        roots: List[str] = []
+        env_roots = os.getenv("OPENCTF_BENCHMARK_ROOTS", "")
+        if env_roots:
+            roots.extend([p.strip() for p in env_roots.split(":") if p.strip()])
+        roots.extend(
+            [
+                "/workspace/benchmarks/cybench",
+                "/workspace/cybench",
+                "/workspace/cybench-patched",
+                "/workspace/open-ctf-env",
+            ]
+        )
+
+        candidates: List[str] = []
+        for root in roots:
+            candidates.append(os.path.join(root, hint))
+            if hint.startswith("benchmark/"):
+                candidates.append(os.path.join(root, hint[len("benchmark/") :]))
+
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _prepare_static_workspace(self) -> None:
+        """Stage static challenge files into /root/challenge for tool access."""
+        src = self._resolve_static_source_path()
+        target_dir = "/root/challenge"
+        self._target = "file:///root/challenge/"
+        if not src:
+            logger.warning(
+                "Static challenge path not found for challenge=%s path_hint=%r",
+                self._challenge_id,
+                self._path_hint,
+            )
+            return
+
+        # Prefer release/challenge payload directories when present.
+        payload = src
+        for subdir in ("release", "challenge", "dist"):
+            candidate = os.path.join(src, subdir)
+            if os.path.isdir(candidate):
+                payload = candidate
+                break
+
+        os.makedirs(target_dir, exist_ok=True)
+        for name in os.listdir(target_dir):
+            path = os.path.join(target_dir, name)
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            except FileNotFoundError:
+                continue
+
+        for name in os.listdir(payload):
+            src_path = os.path.join(payload, name)
+            dst_path = os.path.join(target_dir, name)
+            if os.path.isdir(src_path):
+                shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src_path, dst_path)
+
+        logger.info(
+            "Prepared static workspace: challenge=%s source=%s payload=%s target=%s",
+            self._challenge_id,
+            src,
+            payload,
+            target_dir,
+        )
 
     def _inject_tool_schemas(self, prompt: ConversationType) -> ConversationType:
         """Prepend tool schemas to the system message in the prompt.
@@ -610,6 +796,17 @@ class OpenCTFTextEnv(_Base):
         )
 
         result = self._agent.step(action)
+        info = dict(result.info or {})
+        rollout_status = str(info.get("rollout_status", "ok") or "ok")
+        self._last_rollout_status = rollout_status
+        self._status_counts[rollout_status] = int(self._status_counts.get(rollout_status, 0)) + 1
+        timing = info.get("timing", {})
+        if isinstance(timing, dict):
+            for key in ("parse_s", "execute_s", "total_s"):
+                try:
+                    self._timing_totals[key] += float(timing.get(key, 0.0))
+                except (TypeError, ValueError):
+                    continue
 
         # Sync done state from agent
         if result.done:
@@ -622,7 +819,10 @@ class OpenCTFTextEnv(_Base):
             # Minimal episode-level logging for diagnostics (avoid huge payloads).
             tool_calls = getattr(self._agent, "tool_calls_history", [])
             tool_outputs = getattr(self._agent, "tool_outputs", [])
-            last_calls = [tc.get("name", "") for tc in tool_calls[-5:]]
+            last_calls = [
+                tc.get("name", "") if isinstance(tc, dict) else str(tc)
+                for tc in tool_calls[-5:]
+            ]
             last_outputs = [out[:200] for out in tool_outputs[-3:]]
             logger.info(
                 "Episode done: challenge=%s target=%s steps=%s tool_calls=%s unique_tools=%s flag_found=%s "
@@ -631,7 +831,12 @@ class OpenCTFTextEnv(_Base):
                 self._target,
                 self.turns,
                 len(tool_calls),
-                len(set(tc.get("name", "") for tc in tool_calls)),
+                len(
+                    set(
+                        tc.get("name", "") if isinstance(tc, dict) else str(tc)
+                        for tc in tool_calls
+                    )
+                ),
                 getattr(self._agent, "episode_done", False),
                 last_calls,
                 last_outputs,
@@ -640,14 +845,14 @@ class OpenCTFTextEnv(_Base):
                 "observations": [],
                 "reward": reward,
                 "done": True,
-                "metadata": result.info,
+                "metadata": info,
             }
 
         return {
             "observations": result.observations,
             "reward": reward,
             "done": False,
-            "metadata": result.info,
+            "metadata": info,
         }
 
     def _compute_reward(self, done: bool) -> float:
@@ -664,7 +869,7 @@ class OpenCTFTextEnv(_Base):
         episode_done = getattr(self._agent, "episode_done", False)
 
         if not done:
-            from open_ctf.training.step_reward import per_step_reward
+            from open_ctf.training.online_rl.step_reward import per_step_reward
             # Compute how many new tool calls were added by this step.
             step_tool_call_count = len(tool_calls_history) - self._prev_tool_call_count
             return per_step_reward(
@@ -727,6 +932,29 @@ class OpenCTFTextEnv(_Base):
             # Fallback: binary flag reward
             reward = 1.0 if episode_done else 0.0
 
+        # Quality filter: hard-mask known infra/runtime-invalid rollouts so they
+        # do not inject misleading gradients into policy updates.
+        if self._last_rollout_status in self._hard_mask_statuses:
+            logger.info(
+                "Hard-masking reward due to rollout_status=%s (challenge=%s step=%s)",
+                self._last_rollout_status,
+                self._challenge_id,
+                self._global_step,
+            )
+            reward = 0.0
+        elif (
+            self._positive_only_until_step > 0
+            and int(self._global_step) < self._positive_only_until_step
+            and float(reward) <= self._positive_only_reward_floor
+        ):
+            logger.info(
+                "Positive-only warmup masking reward=%s at step=%s (challenge=%s)",
+                reward,
+                self._global_step,
+                self._challenge_id,
+            )
+            reward = 0.0
+
         # Log trajectory data when episode ends.
         self._log_episode_trajectory(
             reward_total=reward,
@@ -735,6 +963,7 @@ class OpenCTFTextEnv(_Base):
             tool_outputs=tool_outputs,
             all_text=all_text,
             episode_done=episode_done,
+            rollout_status=self._last_rollout_status,
         )
 
         return reward
@@ -747,6 +976,7 @@ class OpenCTFTextEnv(_Base):
         tool_outputs: list,
         all_text: str,
         episode_done: bool,
+        rollout_status: str,
     ) -> None:
         """Log episode trajectory and update challenge scoreboard."""
         if not self._trajectory_logger:
@@ -756,6 +986,8 @@ class OpenCTFTextEnv(_Base):
             # Build structured tool call list for logging
             logged_tool_calls = []
             for i, tc in enumerate(tool_calls_history):
+                if not isinstance(tc, dict):
+                    continue
                 entry = {
                     "name": tc.get("name", ""),
                     "args": tc.get("arguments", ""),
@@ -771,6 +1003,8 @@ class OpenCTFTextEnv(_Base):
             # Detect flag_submitted from tool calls
             flag_submitted = None
             for tc in tool_calls_history:
+                if not isinstance(tc, dict):
+                    continue
                 if tc.get("name") in ("flag_found", "submit_flag"):
                     try:
                         args = tc.get("arguments", "")
@@ -798,6 +1032,10 @@ class OpenCTFTextEnv(_Base):
                 ground_truth_flag=self._ground_truth_flag,
                 response_length=len(all_text),
                 num_tool_calls=len(tool_calls_history),
+                rollout_status=rollout_status,
+                timing=dict(self._timing_totals),
+                status_counts=dict(self._status_counts),
+                max_turns=self.max_turns,
             )
 
             # Update challenge scoreboard
@@ -826,7 +1064,12 @@ class OpenCTFTextEnv(_Base):
             "total_steps": self.turns,
             "total_tool_calls": len(tool_calls_history),
             "flag_found": episode_done,
-            "unique_tools": len(set(tc["name"] for tc in tool_calls_history)),
+            "unique_tools": len(
+                set(
+                    tc.get("name", "") if isinstance(tc, dict) else str(tc)
+                    for tc in tool_calls_history
+                )
+            ),
         }
 
     @staticmethod

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from open_ctf.agent.protocol import StepResult
@@ -49,6 +50,40 @@ class DefaultStepAgent:
         self.turns: int = 0
         self.max_steps: int = 30
         self._consecutive_no_tool_calls: int = 0
+
+    @staticmethod
+    def _looks_like_tool_call(text: str) -> bool:
+        snippet = (text or "").strip()
+        if not snippet:
+            return False
+        signals = (
+            "<tool_call>",
+            "<function=",
+            '"name"',
+            "flag_found(",
+            "submit_flag(",
+            "shell_command(",
+            "exec_command(",
+            "python_code(",
+        )
+        return any(sig in snippet for sig in signals)
+
+    @staticmethod
+    def _status_from_tool_output(output: str) -> Optional[str]:
+        lowered = output.lower()
+        if "timed out" in lowered or "timeout" in lowered:
+            return "tool_timeout"
+        if (
+            "connection refused" in lowered
+            or "no route to host" in lowered
+            or "name or service not known" in lowered
+            or "temporary failure in name resolution" in lowered
+            or "network is unreachable" in lowered
+        ):
+            return "infra_unreachable"
+        if "target mismatch" in lowered:
+            return "target_mismatch"
+        return None
 
     def reset(
         self,
@@ -101,11 +136,15 @@ class DefaultStepAgent:
         """
         from open_ctf.envs.skyrl.openctf_env import parse_tool_calls
 
+        started = time.perf_counter()
         self.turns += 1
         self.all_text += "\n" + action
 
         # Parse tool calls from LLM output
+        parse_started = time.perf_counter()
         tool_calls = parse_tool_calls(action)
+        parse_seconds = time.perf_counter() - parse_started
+        execute_seconds = 0.0
 
         if not tool_calls:
             self._consecutive_no_tool_calls += 1
@@ -114,6 +153,17 @@ class DefaultStepAgent:
                 self.turns >= self.max_steps
                 or self._consecutive_no_tool_calls >= self.max_consecutive_no_tool_calls
             )
+            if done and self._consecutive_no_tool_calls >= self.max_consecutive_no_tool_calls:
+                status = "empty_action_loop"
+            elif self._looks_like_tool_call(action):
+                status = "parser_error"
+            else:
+                status = "no_tool_call"
+            timing = {
+                "parse_s": parse_seconds,
+                "execute_s": execute_seconds,
+                "total_s": time.perf_counter() - started,
+            }
             if done:
                 return StepResult(
                     observations=[],
@@ -122,6 +172,8 @@ class DefaultStepAgent:
                         "tool_calls": 0,
                         "step": self.turns,
                         "consecutive_no_tool_calls": self._consecutive_no_tool_calls,
+                        "rollout_status": status,
+                        "timing": timing,
                     },
                 )
             return StepResult(
@@ -133,12 +185,15 @@ class DefaultStepAgent:
                     "tool_calls": 0,
                     "step": self.turns,
                     "consecutive_no_tool_calls": self._consecutive_no_tool_calls,
+                    "rollout_status": status,
+                    "timing": timing,
                 },
             )
         self._consecutive_no_tool_calls = 0
 
         # Execute each tool call via executor
         obs_messages: List[Dict[str, str]] = []
+        status = "ok"
         for tc in tool_calls:
             if self.episode_done:
                 output = "[EPISODE COMPLETE] Flag already submitted."
@@ -150,7 +205,9 @@ class DefaultStepAgent:
                 })
 
                 try:
+                    execute_started = time.perf_counter()
                     resp = self._executor.step(tc["name"], tc["arguments"])
+                    execute_seconds += (time.perf_counter() - execute_started)
                     stdout = resp.get("stdout", "")
                     stderr = resp.get("stderr", "")
                     env_done = resp.get("done", False)
@@ -159,10 +216,14 @@ class DefaultStepAgent:
                     stdout = f"[ERROR] Tool execution failed: {exc}"
                     stderr = ""
                     env_done = False
+                    status = "tool_error"
 
                 output = stdout
                 if stderr:
                     output += f"\n[stderr] {stderr}"
+                derived_status = self._status_from_tool_output(output)
+                if derived_status:
+                    status = derived_status
 
                 self.tool_outputs.append(output)
                 self.all_text += "\n" + output
@@ -189,6 +250,16 @@ class DefaultStepAgent:
             })
 
         done = self.episode_done or self.turns >= self.max_steps
+        if done:
+            if self.episode_done:
+                status = "ok"
+            elif status == "ok":
+                status = "max_turn_abort"
+        timing = {
+            "parse_s": parse_seconds,
+            "execute_s": execute_seconds,
+            "total_s": time.perf_counter() - started,
+        }
 
         if done:
             return StepResult(
@@ -198,6 +269,8 @@ class DefaultStepAgent:
                     "tool_calls": len(tool_calls),
                     "step": self.turns,
                     "episode_done": self.episode_done,
+                    "rollout_status": status,
+                    "timing": timing,
                 },
             )
 
@@ -208,6 +281,8 @@ class DefaultStepAgent:
                 "tool_calls": len(tool_calls),
                 "step": self.turns,
                 "episode_done": self.episode_done,
+                "rollout_status": status,
+                "timing": timing,
             },
         )
 

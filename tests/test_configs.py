@@ -161,8 +161,8 @@ class TestSkyRLGRPOConfigs:
     def test_algorithm_advantage_estimator(self, grpo_config):
         cfg, name = grpo_config
         algo = cfg.get("trainer", {}).get("algorithm", {})
-        assert algo.get("advantage_estimator") in ("grpo", "rloo_n"), (
-            f"{name} should use GRPO or RLOO-N advantage estimator"
+        assert algo.get("advantage_estimator") in ("grpo", "rloo", "rloo_n"), (
+            f"{name} should use GRPO, RLOO, or RLOO-N advantage estimator"
         )
 
 

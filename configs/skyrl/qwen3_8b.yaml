@@ -1,10 +1,10 @@
 # SkyRL GRPO config for Qwen/Qwen3-8B (8B dense, local non-colocated vLLM)
 # Matches SkyRLConfig dataclass schema.
-# Used as reference — actual config is built by grpo.py from training_qwen3_8b.yaml.
+# Used as reference — actual config is built by training/online_rl/runtime.py from training_qwen3_8b.yaml.
 
 data:
   train_data:
-    - outputs/skyrl_grpo_data.jsonl
+    - outputs/skyrl_online_rl_data.jsonl
 
 trainer:
   strategy: fsdp2
@@ -17,12 +17,12 @@ trainer:
   train_batch_size: 1
   micro_train_batch_size_per_gpu: 1
   max_prompt_length: 8192
-  ckpt_path: outputs/grpo
+  ckpt_path: outputs/online_rl
   ckpt_interval: 50
-  export_path: outputs/grpo/final
-  log_path: outputs/grpo/logs
+  export_path: outputs/online_rl/final
+  log_path: outputs/online_rl/logs
   project_name: open-ctf
-  run_name: grpo-qwen3-8b
+  run_name: online-rl-qwen3-8b
   logger: none
 
   placement:

@@ -58,8 +58,8 @@ open-ctf-convert \
 open-ctf-split \
     --input data/sft_train.jsonl \
     --sft-output data/sft.jsonl \
-    --grpo-output data/grpo.jsonl \
-    --max-grpo-tokens 32768
+    --online-rl-output data/online_rl.jsonl \
+    --max-online-rl-tokens 32768
 ```
 
 ### Data Format
@@ -186,13 +186,15 @@ GRPO uses **SkyRL** to optimize for flag capture efficiency with live tool execu
 ### Quick Start
 
 ```bash
-open-ctf-train grpo \
+open-ctf-train rl \
     --model outputs/sft-qwen35-merged \
-    --data data/grpo_cybench40.jsonl \
-    --output outputs/grpo-qwen35 \
+    --data data/online_rl_cybench40.jsonl \
+    --output outputs/online_rl-qwen35 \
     --config src/open_ctf/configs/training_qwen35_27b.yaml \
     --challenge-registry configs/challenges/cybench.yaml
 ```
+
+`open-ctf-train rl` now runs `open-ctf-validate --mode grpo-preflight` automatically and requires `<data>.manifest.json` by default. Use `--allow-missing-manifest` only for ad-hoc debugging.
 
 For remote challenge infrastructure (for example DGX containers tunneled to RunPod), generate a live challenge target map on the challenge host and pass it to GRPO:
 
@@ -206,10 +208,10 @@ PYTHONPATH=src python3 scripts/generate_live_target_map.py \
 
 # On the trainer host (RunPod)
 OPEN_CTF_TARGET_MAP_PATH=/tmp/cybench_targets.json \
-open-ctf-train grpo \
+open-ctf-train rl \
     --model outputs/sft-qwen35-merged \
-    --data data/grpo_cybench40.jsonl \
-    --output outputs/grpo-qwen35 \
+    --data data/online_rl_cybench40.jsonl \
+    --output outputs/online_rl-qwen35 \
     --config src/open_ctf/configs/training_qwen35_27b.yaml \
     --challenge-registry configs/challenges/cybench.yaml
 ```
@@ -317,20 +319,20 @@ Pareto selection keeps prompts that excel at **different challenges** (non-domin
 # Set OPENAI_API_BASE=http://localhost:8001/v1 to point at local vLLM
 open-ctf-train gepa \
     --model openai/ctf-agent \
-    --data data/grpo.jsonl \
+    --data data/online_rl.jsonl \
     --output outputs/gepa
 
 # Stronger reflection: serve a larger model on a separate port
 open-ctf-train gepa \
     --model openai/ctf-agent \
-    --data data/grpo.jsonl \
+    --data data/online_rl.jsonl \
     --output outputs/gepa \
     --reflection-model openai/larger-model
 
 # Custom agent mode: wrap any CTFAgent in a DSPy Module
 open-ctf-train gepa \
     --model openai/ctf-agent \
-    --data data/grpo.jsonl \
+    --data data/online_rl.jsonl \
     --output outputs/gepa \
     --agent my_module.MyAgent \
     --challenge-registry configs/challenges/cybench.yaml \
@@ -407,14 +409,14 @@ open-ctf-train sft --model Nanbeige/Nanbeige4.1-3B --data data/sft.jsonl --outpu
 open-ctf-train merge --adapter outputs/sft --base-model Nanbeige/Nanbeige4.1-3B --output outputs/sft-merged
 
 # 4. GRPO
-open-ctf-train grpo --model outputs/sft-merged --data data/grpo.jsonl --output outputs/grpo \
+open-ctf-train rl --model outputs/sft-merged --data data/online_rl.jsonl --output outputs/online_rl \
     --config src/open_ctf/configs/training.yaml
 
 # 5. GEPA (optional — same model for agent + reflection, no cloud APIs)
-open-ctf-train gepa --model openai/ctf-agent --data data/grpo.jsonl --output outputs/gepa
+open-ctf-train gepa --model openai/ctf-agent --data data/online_rl.jsonl --output outputs/gepa
 
 # 6. Export
-open-ctf-export --adapter outputs/grpo/final --base-model Nanbeige/Nanbeige4.1-3B --output models/ctf-agent.gguf --quant Q4_K_M
+open-ctf-export --adapter outputs/online_rl/final --base-model Nanbeige/Nanbeige4.1-3B --output models/ctf-agent.gguf --quant Q4_K_M
 ```
 
 ## Docker Training

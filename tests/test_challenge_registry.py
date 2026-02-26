@@ -188,11 +188,15 @@ class TestChallengeRegistry:
         with pytest.raises(FileNotFoundError):
             ChallengeRegistry("/nonexistent/path.yaml")
 
-    def test_cybench_registry_covers_grpo_dataset(self):
-        """Guardrail: keep cybench registry IDs aligned with GRPO dataset challenge names."""
+    def test_cybench_registry_covers_online_rl_dataset(self):
+        """Guardrail: keep cybench registry IDs aligned with online RL dataset challenge names."""
         repo_root = Path(__file__).resolve().parents[1]
         registry = ChallengeRegistry(str(repo_root / "configs/challenges/cybench.yaml"))
-        dataset_path = repo_root / "data/grpo_cybench40.jsonl"
+        dataset_path = repo_root / "data/online_rl_quality.jsonl"
+        if not dataset_path.exists():
+            dataset_path = repo_root / "data/online_rl_cybench40.jsonl"
+        if not dataset_path.exists():
+            dataset_path = repo_root / "data/grpo_cybench40.jsonl"
 
         missing = set()
         with dataset_path.open() as f:

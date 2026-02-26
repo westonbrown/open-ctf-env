@@ -1,6 +1,6 @@
 {
   "open_ctf_sft": {
-    "file_name": "sft.jsonl",
+    "file_name": "sft_quality.jsonl",
     "formatting": "openai",
     "columns": {
       "messages": "messages"
@@ -15,8 +15,8 @@
       "system_tag": "system"
     }
   },
-  "open_ctf_grpo": {
-    "file_name": "grpo_cybench40.jsonl",
+  "open_ctf_online_rl": {
+    "file_name": "online_rl_quality.jsonl",
     "formatting": "openai",
     "columns": {
       "messages": "messages"

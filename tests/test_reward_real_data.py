@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Validate reward function against real GRPO data as a peer reviewer.
+"""Validate reward function against real online RL data as a peer reviewer.
 
-Loads actual trajectories from grpo.jsonl and scores them, printing
+Loads actual trajectories from online RL JSONL and scores them, printing
 component breakdowns to verify alignment with expected behavior.
 
 Run: pytest tests/test_reward_real_data.py -v -s
@@ -20,7 +20,9 @@ from open_ctf.rewards.reward import CTFReward
 # ---------------------------------------------------------------------------
 
 GRPO_PATHS = [
-    Path(__file__).parent.parent / "data" / "grpo.jsonl",  # 659 samples (open-ctf-env)
+    Path(__file__).parent.parent / "data" / "online_rl.jsonl",
+    Path(__file__).parent.parent / "data" / "grpo.jsonl",  # legacy name
+    Path(__file__).parent.parent / "data" / "online_rl_pre_clean.jsonl",
     Path(__file__).parent.parent / "data" / "grpo_pre_clean.jsonl",  # 1369 samples
 ]
 

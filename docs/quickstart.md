@@ -103,26 +103,28 @@ open-ctf-train merge \
     --output outputs/sft-merged
 
 # Stage 2: Online GRPO via SkyRL
-open-ctf-train grpo \
+open-ctf-train rl \
     --model outputs/sft-merged \
-    --data data/grpo.jsonl \
-    --output outputs/grpo \
+    --data data/online_rl.jsonl \
+    --output outputs/online_rl \
     --config src/open_ctf/configs/training.yaml
 
 # Stage 3: GEPA prompt optimization (no weight updates)
 open-ctf-train gepa \
     --model openai/ctf-agent \
-    --data data/grpo.jsonl \
+    --data data/online_rl.jsonl \
     --output outputs/gepa \
     --reflection-model openai/ctf-reflection \
     --challenge-registry configs/challenges/cybench.yaml
 ```
 
+Note: `open-ctf-train rl` runs a preflight validation gate and, by default, requires `<data>.manifest.json` produced by `scripts/generate_online_rl_from_registry.py`.
+
 ### Export for Deployment
 
 ```bash
 open-ctf-export \
-    --adapter outputs/grpo/final \
+    --adapter outputs/online_rl/final \
     --base-model Nanbeige/Nanbeige4.1-3B \
     --output models/ctf-agent.gguf \
     --quant Q4_K_M

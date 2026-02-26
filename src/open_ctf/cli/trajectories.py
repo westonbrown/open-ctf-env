@@ -30,13 +30,16 @@ def _load_step_summaries(trajectories_dir: str) -> List[Dict[str, Any]]:
     path = os.path.join(trajectories_dir, "step_summaries.jsonl")
     if not os.path.exists(path):
         return []
-    entries = []
+    entries_by_step: Dict[int, Dict[str, Any]] = {}
     with open(path) as f:
         for line in f:
             line = line.strip()
             if line:
-                entries.append(json.loads(line))
-    return sorted(entries, key=lambda e: e.get("global_step", 0))
+                entry = json.loads(line)
+                step = int(entry.get("global_step", 0))
+                # Keep the latest snapshot for each step.
+                entries_by_step[step] = entry
+    return [entries_by_step[k] for k in sorted(entries_by_step)]
 
 
 def _load_step_generations(trajectories_dir: str, step: int) -> List[Dict[str, Any]]:

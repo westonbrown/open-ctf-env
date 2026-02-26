@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build high-quality SFT and GRPO datasets from curated BoxPwnr traces.
+"""Build high-quality SFT and online RL datasets from curated BoxPwnr traces.
 
 Focused on CyBench performance lift for a 3B SLM conference demo.
 Quality over quantity — every sample is validated and preprocessed.
@@ -24,8 +24,8 @@ Usage:
   python scripts/build_quality_datasets.py \
       --input data/sft_curated_clean.jsonl \
       --sft-output data/sft_quality.jsonl \
-      --grpo-output data/grpo_quality.jsonl \
-      --grpo-source data/grpo_cybench40.jsonl
+      --online-rl-output data/online_rl_quality.jsonl \
+      --online-rl-source data/online_rl_cybench40.jsonl
 
   # Dry run:
   python scripts/build_quality_datasets.py --input data/sft_curated_clean.jsonl --dry-run
@@ -611,10 +611,10 @@ def should_include_for_sft(
     return True, "included"
 
 
-def should_include_for_grpo(sample: dict) -> tuple[bool, str]:
-    """Decide if a sample qualifies for GRPO dataset.
+def should_include_for_online_rl(sample: dict) -> tuple[bool, str]:
+    """Decide if a sample qualifies for online RL dataset.
 
-    GRPO needs:
+    Online RL needs:
     - ground_truth_flag (required for reward computation)
     - CyBench platform (for challenge registry routing)
     """
@@ -629,22 +629,22 @@ def should_include_for_grpo(sample: dict) -> tuple[bool, str]:
     if challenge in _EXCLUDED_CHALLENGES:
         return False, "excluded_challenge"
 
-    # GRPO: prefer CyBench for challenge registry routing
+    # Online RL: prefer CyBench for challenge registry routing
     if platform != "cybench":
         return False, "not_cybench"
 
     return True, "included"
 
 
-def build_grpo_from_existing(
-    grpo_source_path: Path,
+def build_online_rl_from_existing(
+    online_rl_source_path: Path,
     output_path: Path | None,
     *,
     difficulty_cap: str = "medium",
 ) -> dict:
-    """Build filtered GRPO dataset from existing grpo_cybench40.jsonl.
+    """Build filtered online RL dataset from existing cybench source file.
 
-    The GRPO file has prompts (system + user) + ground_truth_flag for online RL.
+    The source file has prompts (system + user) + ground_truth_flag for online RL.
     We filter to appropriate difficulty and exclude bad challenges.
     """
     stats = {"total": 0, "included": 0, "excluded": 0, "reasons": {}}
@@ -652,7 +652,7 @@ def build_grpo_from_existing(
     fout = open(output_path, "w") if output_path else None
 
     try:
-        for line in open(grpo_source_path):
+        for line in open(online_rl_source_path):
             line = line.strip()
             if not line:
                 continue
@@ -694,20 +694,35 @@ def build_grpo_from_existing(
     return stats
 
 
+# Backward-compatible aliases for external scripts.
+should_include_for_grpo = should_include_for_online_rl
+build_grpo_from_existing = build_online_rl_from_existing
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build high-quality SFT and GRPO datasets for CyBench 3B SLM demo."
+        description="Build high-quality SFT and online RL datasets for CyBench demo."
     )
     parser.add_argument("--input", required=True, help="Input SFT JSONL (sft_curated_clean.jsonl)")
     parser.add_argument("--sft-output", help="Output SFT JSONL (quality-filtered + preprocessed)")
-    parser.add_argument("--grpo-output", help="Output GRPO JSONL (quality-filtered for online RL)")
-    parser.add_argument("--grpo-source", help="Source GRPO JSONL (grpo_cybench40.jsonl)")
+    parser.add_argument(
+        "--online-rl-output", "--grpo-output",
+        dest="online_rl_output",
+        help="Output online RL JSONL (quality-filtered)",
+    )
+    parser.add_argument(
+        "--online-rl-source", "--grpo-source",
+        dest="online_rl_source",
+        help="Source online RL JSONL (default: online_rl_cybench40.jsonl fallback grpo_cybench40.jsonl)",
+    )
     parser.add_argument("--sft-difficulty-cap", default="hard",
                         choices=["medium", "hard"],
                         help="Max difficulty for SFT (hard=include hard challenges for knowledge)")
-    parser.add_argument("--grpo-difficulty-cap", default="medium",
+    parser.add_argument("--online-rl-difficulty-cap", "--grpo-difficulty-cap",
+                        dest="online_rl_difficulty_cap",
+                        default="medium",
                         choices=["medium", "hard"],
-                        help="Max difficulty for GRPO (medium for 3B, hard for 27B)")
+                        help="Max difficulty for online RL (medium for 3B, hard for 27B)")
     parser.add_argument("--min-quality", type=float, default=2.5,
                         help="Minimum quality score for SFT inclusion (0-5)")
     parser.add_argument("--dry-run", action="store_true",
@@ -720,7 +735,9 @@ def main() -> None:
         sys.exit(1)
 
     sft_output = None if args.dry_run else (Path(args.sft_output) if args.sft_output else None)
-    grpo_sft_output = None if args.dry_run else (Path(args.grpo_output) if args.grpo_output else None)
+    online_rl_output = (
+        None if args.dry_run else (Path(args.online_rl_output) if args.online_rl_output else None)
+    )
 
     # ─── Build SFT dataset ───
     print("=" * 60)
@@ -838,30 +855,39 @@ def main() -> None:
         avg = sum(scores) / len(scores)
         print(f"\nQuality scores: min={min(scores):.1f}, avg={avg:.1f}, max={max(scores):.1f}")
 
-    # ─── Build GRPO dataset ───
-    if args.grpo_source:
+    # ─── Build online RL dataset ───
+    online_rl_source = args.online_rl_source
+    if online_rl_source is None:
+        default_candidate = Path("data/online_rl_cybench40.jsonl")
+        fallback_candidate = Path("data/grpo_cybench40.jsonl")
+        if default_candidate.exists():
+            online_rl_source = str(default_candidate)
+        elif fallback_candidate.exists():
+            online_rl_source = str(fallback_candidate)
+
+    if online_rl_source:
         print(f"\n{'=' * 60}")
-        print("Building GRPO Quality Dataset")
+        print("Building Online RL Quality Dataset")
         print("=" * 60)
 
-        grpo_source = Path(args.grpo_source)
-        if not grpo_source.exists():
-            print(f"Error: GRPO source not found: {grpo_source}", file=sys.stderr)
+        online_rl_source_path = Path(online_rl_source)
+        if not online_rl_source_path.exists():
+            print(f"Error: online RL source not found: {online_rl_source_path}", file=sys.stderr)
         else:
-            grpo_stats = build_grpo_from_existing(
-                grpo_source,
-                grpo_sft_output,
-                difficulty_cap=args.grpo_difficulty_cap,
+            online_rl_stats = build_online_rl_from_existing(
+                online_rl_source_path,
+                online_rl_output,
+                difficulty_cap=args.online_rl_difficulty_cap,
             )
-            print(f"\nInput:  {grpo_stats['total']} samples from {grpo_source}")
-            if grpo_sft_output:
-                print(f"Output: {grpo_stats['included']} samples to {grpo_sft_output}")
+            print(f"\nInput:  {online_rl_stats['total']} samples from {online_rl_source_path}")
+            if online_rl_output:
+                print(f"Output: {online_rl_stats['included']} samples to {online_rl_output}")
             else:
-                print(f"Output: {grpo_stats['included']} samples (dry run)")
-            print(f"Excluded: {grpo_stats['excluded']}")
-            if grpo_stats["reasons"]:
+                print(f"Output: {online_rl_stats['included']} samples (dry run)")
+            print(f"Excluded: {online_rl_stats['excluded']}")
+            if online_rl_stats["reasons"]:
                 print(f"\nExclusion reasons:")
-                for reason, count in sorted(grpo_stats["reasons"].items(), key=lambda x: -x[1]):
+                for reason, count in sorted(online_rl_stats["reasons"].items(), key=lambda x: -x[1]):
                     print(f"  {reason}: {count}")
 
     print(f"\n{'=' * 60}")

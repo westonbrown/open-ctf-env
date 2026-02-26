@@ -56,16 +56,16 @@ class TestIsEpisodeDone:
         assert "Correct" in result
         assert is_episode_done() is True
 
-    def test_done_after_any_flag_submission(self):
-        """Any flag submission (correct or incorrect) ends the episode.
+    def test_not_done_after_incorrect_flag_submission(self):
+        """Incorrect flag submissions allow the agent to retry.
 
-        ToolExecutor returns done=True on any flag_found call, so the
-        episode is marked done regardless of correctness.
+        ToolExecutor returns done=False for incorrect submissions when
+        step_count < max_steps, so the episode continues.
         """
         mark_step_begin(ground_truth="FLAG{real_flag}")
         result = flag_found("FLAG{wrong}")
         assert "Incorrect" in result
-        assert is_episode_done() is True
+        assert is_episode_done() is False
 
 
 class TestStepEarlyExit:

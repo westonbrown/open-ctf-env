@@ -4,7 +4,7 @@ Instructions for deploying a trained Open CTF model for inference.
 
 ## Prerequisites
 
-- A trained LoRA adapter (from `open-ctf-train sft` or `open-ctf-train grpo`)
+- A trained LoRA adapter (from `open-ctf-train sft` or `open-ctf-train rl`)
 - One of: Ollama, llama.cpp, or vLLM installed
 
 ## Export Pipeline
@@ -14,14 +14,14 @@ Instructions for deploying a trained Open CTF model for inference.
 ```bash
 # Merge adapter, convert to GGUF, quantize to Q4_K_M (one command)
 open-ctf-export \
-    --adapter outputs/grpo/final \
+    --adapter outputs/online_rl/final \
     --base-model Nanbeige/Nanbeige4.1-3B \
     --output models/ctf-agent-Q4_K_M.gguf \
     --quant Q4_K_M
 
 # Export without quantization (F16)
 open-ctf-export \
-    --adapter outputs/grpo/final \
+    --adapter outputs/online_rl/final \
     --base-model Nanbeige/Nanbeige4.1-3B \
     --output models/ctf-agent-f16.gguf \
     --quant none
@@ -31,7 +31,7 @@ open-ctf-export \
 
 ```bash
 open-ctf-train merge \
-    --adapter outputs/grpo/final \
+    --adapter outputs/online_rl/final \
     --base-model Nanbeige/Nanbeige4.1-3B \
     --output outputs/merged
 ```

@@ -98,6 +98,16 @@ scripts/**/*.pid
 scripts/**/tmp/
 scripts/**/*_targets.json
 
+# Local planning/research notes
+new.md
+FRAMEWORK_COMPARISON_*.md
+
+# One-off RunPod orchestration scripts
+scripts/deploy/runpod_*.sh
+
+# Generated challenge metadata snapshots
+configs/challenges/*_metadata.json
+
 # Keep lightweight metadata/docs in data/, ignore generated datasets.
 data/**/*.jsonl
 data/**/*.jsonl.gz

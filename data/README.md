@@ -1,75 +1,70 @@
 # Training Data
 
-Generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) via `open-ctf-convert` + `open-ctf-split`, then filtered for training quality.
+This folder contains the curated datasets used by the training pipeline.
 
-## Datasets
+## Active Datasets
 
-| File | Traces | Size | Description |
-|------|--------|------|-------------|
-| `sft.jsonl` | 820 | 62.5MB | Successful solves for supervised fine-tuning |
-| `grpo_cybench40.jsonl` | 87 | 7.3MB | CyBench-only traces with ground truth flags for online GRPO |
-| `grpo_offline_683.jsonl` | 676 | 38.8MB | Cross-platform traces for offline GRPO / reward validation |
-| `dataset_info.json` | — | — | LlamaFactory dataset metadata (maps dataset names to files) |
+| File | Purpose |
+|---|---|
+| `sft_quality.jsonl` | Stage-1 supervised fine-tuning traces (high-quality solved trajectories). |
+| `online_rl_quality.jsonl` | Stage-2 online RL seed tasks (challenge prompts + metadata + `ground_truth_flag`). |
+| `dataset_info.json` | LlamaFactory dataset registration metadata (SFT-oriented). |
 
-### SFT vs GRPO Split
+## What `online_rl_quality.jsonl` Is For
 
-- **SFT** (`sft.jsonl`): Successful solves across all platforms. Used for supervised fine-tuning with LlamaFactory.
-- **GRPO online** (`grpo_cybench40.jsonl`): CyBench challenges only — these have Docker infrastructure for live tool execution during online GRPO. Each trace includes `ground_truth_flag` and `optimal_steps` for the reward function.
-- **GRPO offline** (`grpo_offline_683.jsonl`): Cross-platform traces for offline advantage estimation or reward model validation. Not used for live rollouts.
+`online_rl_quality.jsonl` is not an offline reward dataset.
+It seeds online RL episodes with challenge context and ground-truth flags so the environment can score live rollouts.
 
-## Format
+In online RL:
+- The model generates actions live.
+- Tools run live against challenge targets.
+- Rewards are computed online from rollout behavior + flag verification.
 
-Each line is a JSON object with OpenAI-format messages:
+## Scalable Practice (Recommended)
 
-```json
-{
-  "messages": [
-    {"role": "system", "content": "..."},
-    {"role": "user", "content": "Solve: http://target"},
-    {"role": "assistant", "content": "...", "tool_calls": [...]},
-    {"role": "tool", "tool_call_id": "...", "name": "shell_command", "content": "..."}
-  ],
-  "metadata": {
-    "source": "boxpwnr", "platform": "cybench", "challenge": "...",
-    "success": true, "total_turns": 12, "model": "..."
-  },
-  "ground_truth_flag": "FLAG{...}",
-  "optimal_steps": 8
-}
-```
+Treat online RL data as generated artifacts from benchmark infra, not hand-edited files.
 
-## Known Characteristics
-
-- **~50% of entries end with a `tool` message** (no final assistant response). This is inherent to the BoxPwnr trace format — the agent submits the flag via `flag_found` and the conversation ends on the tool response. Filtering these would halve the dataset.
-- **BoxPwnr system prompt** contains `<FLAG>content_of_flag_here</FLAG>` as an instruction example. This is the agent format spec, not a data quality issue.
-- **`reasoning_content` field** present on ~37% of entries (from models with thinking tokens). GLM-4.7-Flash renders these as `<think>` blocks.
-
-## Regenerating
+1. Generate from registry + metadata:
 
 ```bash
-git clone --depth 1 https://github.com/0ca/BoxPwnr-Traces.git /tmp/BoxPwnr-Traces
-
-open-ctf-convert \
-    --input /tmp/BoxPwnr-Traces \
-    --output /tmp/all_traces.jsonl \
-    --output-failure /tmp/failed_traces.jsonl
-
-cat /tmp/all_traces.jsonl /tmp/failed_traces.jsonl > /tmp/combined.jsonl
-
-open-ctf-split \
-    --input /tmp/combined.jsonl \
-    --sft-output data/sft.jsonl \
-    --grpo-output data/grpo.jsonl
+python scripts/generate_online_rl_from_registry.py \
+  --registry configs/challenges/cybench.yaml \
+  --metadata configs/challenges/cybench_metadata.json \
+  --output data/online_rl_quality.jsonl
 ```
 
-Then apply filters (see `scripts/filter_training_data.py` or the criteria below).
+2. (RunPod/DGX) Apply target overrides and verify endpoints before writing data:
 
-## Filters Applied
+```bash
+python scripts/generate_online_rl_from_registry.py \
+  --registry configs/challenges/cybench.yaml \
+  --target-map configs/challenges/cybench_target_map_runpod.json \
+  --probe-targets \
+  --strict-target-probe \
+  --output data/online_rl_quality.jsonl
+```
 
-Three filters are applied after conversion and splitting to remove samples that would degrade training:
+This generator now also writes `data/online_rl_quality.jsonl.manifest.json`
+with source file hashes (registry/metadata/target map) and challenge coverage.
 
-1. **No-assistant traces removed (GRPO only)** — entries with only `[system, user]` messages (no agent actions). These are failed runs where the agent never started and provide no trajectory signal.
+3. Audit registry/data/target consistency:
 
-2. **Token outliers removed (>100K estimated tokens)** — entries with extremely long tool outputs that exceed any reasonable `max_seq_length` and waste compute on truncated data.
+```bash
+python scripts/deploy/online_rl_readiness_audit.py \
+  --run-root /tmp/online_rl_audit \
+  --registry configs/challenges/cybench.yaml \
+  --online-rl-quality data/online_rl_quality.jsonl
+```
 
-3. **Placeholder flag removed** — entries with `ground_truth_flag: "FLAG{placeholder}"` that would poison the reward signal.
+4. Preflight gate before launch (fails on registry/data drift):
+
+```bash
+open-ctf-validate --mode grpo-preflight \
+  --online-rl-data data/online_rl_quality.jsonl \
+  --challenge-registry configs/challenges/cybench.yaml \
+  --target-map configs/challenges/cybench_target_map_runpod.json \
+  --require-manifest \
+  --require-target-map-coverage
+```
+
+This keeps data naming, target mapping, and challenge reachability reproducible across new instances.

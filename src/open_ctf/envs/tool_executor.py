@@ -170,17 +170,19 @@ class SessionManager:
 # ---------------------------------------------------------------------------
 
 def _default_shell(command: str, timeout: int, workdir: str | None = None) -> tuple[str, str, int]:
-    """Execute a shell command via ``bash -lc`` (login shell).
+    """Execute a shell command via ``bash -c`` (non-login shell).
 
-    Using a login shell ensures PATH, aliases, and profile settings are
-    available, matching BoxPwnr's execution semantics.
+    Using a non-login shell avoids issues where container ``.bashrc``
+    contains ``exit 0`` (e.g. NGC PyTorch images), which kills the login
+    shell before the command executes.  PATH is inherited from the parent
+    process, so tools remain available.
     """
     try:
         script = command
         if workdir:
             script = f"cd {shlex.quote(workdir)} && {script}"
         result = subprocess.run(
-            ["bash", "-lc", script],
+            ["bash", "-c", script],
             capture_output=True,
             text=True,
             timeout=timeout,

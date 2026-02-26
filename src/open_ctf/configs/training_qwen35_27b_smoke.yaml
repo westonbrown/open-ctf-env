@@ -39,9 +39,14 @@ grpo:
   enable_prefix_caching: false
   enable_chunked_prefill: true
   enforce_eager: true
-  max_prompt_length: 4096
-  vllm_max_model_len: 6144
+  # Keep smoke limits aligned with real multi-turn prompt growth to avoid
+  # decoder prompt > max_model_len failures during tool loops.
+  max_prompt_length: 8192
+  vllm_max_model_len: 16384
   vllm_language_model_only: true
+  # Force Triton attention backend to avoid PTX/toolchain incompatibilities
+  # observed with flash-kernel paths on this runtime.
+  vllm_attention_backend: "TRITON_ATTN"
   max_grad_norm: 0.1
   epsilon_high: 0.28
   weight_decay: 0.1
@@ -52,7 +57,7 @@ grpo:
   gpu_memory_utilization: 0.68
   max_num_seqs: 4
   max_num_batched_tokens: 8192
-  flash_attn: true
+  flash_attn: false
   use_sample_packing: false
   require_fast_linear_attention: true
   pytorch_cuda_alloc_conf: "expandable_segments:True"

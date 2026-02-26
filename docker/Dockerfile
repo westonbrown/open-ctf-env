@@ -26,7 +26,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /workspace/open-ctf-env
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl \
+    git curl ca-certificates \
+    nmap net-tools libimage-exiftool-perl \
+    gobuster nikto sqlmap \
+    dnsutils netcat-openbsd ncat \
+    jq whois traceroute iputils-ping \
+    ffuf tcpdump smbclient \
     && rm -rf /var/lib/apt/lists/*
 
 # Project source

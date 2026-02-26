@@ -142,7 +142,8 @@ class TestFlagSubmission:
         result = exe.step("flag_found", {"content": "FLAG{wrong}"})
         assert "Incorrect submission: FLAG{wrong}" in result["stdout"]
         assert result["reward"] < 0
-        assert result["done"] is True
+        # Incorrect flag allows agent to retry (done only at max_steps)
+        assert result["done"] is False
 
     def test_submit_flag_alias(self):
         """submit_flag should work the same as flag_found."""
@@ -157,7 +158,8 @@ class TestFlagSubmission:
         exe.reset()
         result = exe.step("flag_found", {"content": "FLAG{anything}"})
         assert "Incorrect" in result["stdout"]
-        assert result["done"] is True
+        # No ground truth means never correct; done only at max_steps
+        assert result["done"] is False
 
 
 # ---------------------------------------------------------------------------

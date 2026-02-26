@@ -1,13 +1,13 @@
 # SkyRL GRPO config for Qwen/Qwen3.5-27B (27B dense, local non-colocated vLLM)
 # Matches SkyRLConfig dataclass schema.
-# Used as reference — actual config is built by grpo.py from training_qwen35_27b.yaml.
+# Used as reference — actual config is built by training/online_rl/runtime.py from training_qwen35_27b.yaml.
 #
 # Note: With LoRA enabled, keep run_engines_locally=true. Upstream SkyRL
 # remote inference mode does not support LoRA adapter sync.
 
 data:
   train_data:
-    - outputs/skyrl_grpo_data.jsonl
+    - outputs/skyrl_online_rl_data.jsonl
 
 trainer:
   strategy: fsdp2
@@ -20,12 +20,12 @@ trainer:
   train_batch_size: 1
   micro_train_batch_size_per_gpu: 1
   max_prompt_length: 16384
-  ckpt_path: outputs/grpo
+  ckpt_path: outputs/online_rl
   ckpt_interval: 25
-  export_path: outputs/grpo/final
-  log_path: outputs/grpo/logs
+  export_path: outputs/online_rl/final
+  log_path: outputs/online_rl/logs
   project_name: open-ctf
-  run_name: grpo-qwen35-27b
+  run_name: online-rl-qwen35-27b
   logger: none
 
   # Non-colocated local engines let trainer and generator use separate GPUs.

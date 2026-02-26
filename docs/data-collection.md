@@ -135,8 +135,8 @@ open-ctf-convert \
 open-ctf-split \
   --input data/sft.jsonl \
   --sft-output data/sft_final.jsonl \
-  --grpo-output data/grpo_final.jsonl \
-  --max-grpo-tokens 32768
+  --online-rl-output data/online_rl_final.jsonl \
+  --max-online-rl-tokens 32768
 ```
 
 ## Step 5: (Optional) Mass Scale with Synthetic Data Generation
@@ -165,7 +165,7 @@ open-ctf-validate
 
 # Check sample records
 head -1 data/sft_final.jsonl | jq '.messages[0:3]'
-head -1 data/grpo_final.jsonl | jq '.ground_truth_flag'
+head -1 data/online_rl_final.jsonl | jq '.ground_truth_flag'
 ```
 
 ## Data Collection Strategies

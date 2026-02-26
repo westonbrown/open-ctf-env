@@ -17,7 +17,7 @@ import threading
 import pytest
 
 from open_ctf.rewards.reward import CTFReward
-from open_ctf.training.trajectory_logger import TrajectoryLogger
+from open_ctf.training.online_rl.trajectory_logger import TrajectoryLogger
 
 
 # ---------------------------------------------------------------------------

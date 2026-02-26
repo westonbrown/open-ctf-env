@@ -69,10 +69,15 @@ src/open_ctf/
 ├── rewards/
 │   └── reward.py                # CTFReward (8 signals + hallucination penalty)
 └── training/
-    ├── sft.py                   # LlamaFactory SFT orchestrator
-    ├── grpo.py                  # SkyRL GRPO orchestrator
-    ├── gepa.py                  # GEPA prompt optimizer (DSPy + CTFAgentDSPyAdapter)
-    └── step_reward.py           # CTFReward adapter for SkyRL per-step rewards
+    ├── sft/
+    │   ├── llamafactory.py      # LlamaFactory SFT backend
+    │   └── trl.py               # TRL SFT backend
+    ├── online_rl/
+    │   ├── entrypoint.py        # Stage-2 online RL entrypoint
+    │   ├── runtime.py           # SkyRL runtime + config conversion
+    │   ├── step_reward.py       # Per-step shaping reward adapter
+    │   └── trajectory_logger.py # Rollout + reward telemetry
+    └── gepa.py                  # GEPA prompt optimizer (DSPy + CTFAgentDSPyAdapter)
 
 configs/
 ├── challenges/

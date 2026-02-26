@@ -4,7 +4,7 @@
 
 data:
   train_data:
-    - outputs/skyrl_grpo_data.jsonl
+    - outputs/skyrl_online_rl_data.jsonl
 
 trainer:
   strategy: fsdp2
@@ -15,12 +15,12 @@ trainer:
   train_batch_size: 1
   micro_train_batch_size_per_gpu: 1
   max_prompt_length: 32768
-  ckpt_path: outputs/grpo
+  ckpt_path: outputs/online_rl
   ckpt_interval: 50
-  export_path: outputs/grpo/final
-  log_path: outputs/grpo/logs
+  export_path: outputs/online_rl/final
+  log_path: outputs/online_rl/logs
   project_name: open-ctf
-  run_name: grpo-glm47-flash
+  run_name: online-rl-glm47-flash
   logger: none
 
   # MoE safe default: colocate avoids weight sync for MoE fused projections.

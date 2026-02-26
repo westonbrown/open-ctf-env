@@ -2,9 +2,9 @@
 """Open CTF training CLI.
 
 3-stage pipeline:
-  Stage 1 (SFT):  LlamaFactory — battle-tested tool format support, packing, DeepSpeed
-  Stage 2 (GRPO): SkyRL — fully async Ray-based trainer, vLLM in separate process
-  Stage 3 (GEPA): DSPy — prompt evolution, no weight updates
+  Stage 1 (SFT):       LlamaFactory/TRL
+  Stage 2 (online RL): SkyRL (GRPO/RLOO style policy updates)
+  Stage 3 (GEPA):      DSPy prompt evolution, no weight updates
 
 Usage:
     # Stage 1: SFT via LlamaFactory
@@ -13,17 +13,17 @@ Usage:
         --data data/sft.jsonl \\
         --output outputs/sft
 
-    # Stage 2: GRPO via SkyRL (requires SFT merged model)
-    open-ctf-train grpo \\
+    # Stage 2: online RL via SkyRL (requires SFT merged model)
+    open-ctf-train rl \\
         --model outputs/sft-merged \\
-        --data data/grpo.jsonl \\
-        --output outputs/grpo
+        --data data/online_rl.jsonl \\
+        --output outputs/online_rl
 
     # Stage 3: GEPA prompt optimization (no weight updates)
     # Both agent and reflection LMs default to the same model (local vLLM).
     open-ctf-train gepa \\
         --model openai/ctf-agent \\
-        --data data/grpo.jsonl \\
+        --data data/online_rl.jsonl \\
         --output outputs/gepa
 
     # Merge LoRA adapter into base weights
@@ -36,7 +36,9 @@ Usage:
 import argparse
 import json
 import logging
+import subprocess
 import shutil
+import sys
 from pathlib import Path
 
 import yaml
@@ -146,15 +148,14 @@ def _patch_merged_tokenizer_config(base_model_id: str, output_dir: str) -> bool:
 def _auto_detect_backend(model_id: str) -> str:
     """Auto-detect the best SFT backend for a given model.
 
-    Returns 'trl' for models that need transformers >= 5.2.0 (e.g. Qwen3.5),
-    'llamafactory' for models with good LlamaFactory support.
+    Defaults to 'trl' — uses the model's native tokenizer.apply_chat_template()
+    which guarantees correct tool call formatting, thinking block handling, and
+    special token rendering for any HuggingFace model.
+
+    Use 'llamafactory' only when its extra features (DeepSpeed ZeRO, neat_packing,
+    built-in tool format adapters) are specifically needed.
     """
-    model_lower = model_id.lower()
-    # Models requiring transformers >= 5.2.0 (LlamaFactory pins <= 4.57.1)
-    if any(p in model_lower for p in ("qwen3.5", "qwen3_5", "qwen/qwen3.5")):
-        return "trl"
-    # LlamaFactory has native support for these
-    return "llamafactory"
+    return "trl"
 
 
 def cmd_sft(args: argparse.Namespace) -> None:
@@ -171,7 +172,7 @@ def cmd_sft(args: argparse.Namespace) -> None:
     logger.info("SFT backend: %s", backend)
 
     if backend == "trl":
-        from open_ctf.training.sft_trl import train_sft
+        from open_ctf.training.sft import train_sft_trl as train_sft
     else:
         from open_ctf.training.sft import train_sft
 
@@ -185,13 +186,77 @@ def cmd_sft(args: argparse.Namespace) -> None:
     )
 
 
-def cmd_grpo(args: argparse.Namespace) -> None:
-    """Run GRPO training via SkyRL."""
-    from open_ctf.training.grpo import train_grpo
+def _add_online_rl_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", required=True, help="Path to SFT merged model")
+    parser.add_argument("--data", required=True, help="Path to online RL JSONL data")
+    parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument("--resume", default=None, help="Resume from checkpoint")
+    parser.add_argument(
+        "--challenge-registry", default=None,
+        help="Path to challenge registry YAML for target URL resolution",
+    )
+    parser.add_argument(
+        "--agent", default=None,
+        help="Dotted path to a StepAgent class for tool execution (e.g. my_module.MyAgent)",
+    )
+    parser.add_argument(
+        "--target-map",
+        default=None,
+        help="Optional challenge target map JSON used by preflight checks.",
+    )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip online RL preflight validation gate before launch.",
+    )
+    parser.add_argument(
+        "--allow-missing-manifest",
+        action="store_true",
+        help="Allow dataset launch without <data>.manifest.json provenance file.",
+    )
+    parser.add_argument(
+        "--require-target-map-coverage",
+        action="store_true",
+        help="Require dataset to include all challenge IDs present in --target-map.",
+    )
+
+
+def _run_online_rl_preflight(args: argparse.Namespace) -> None:
+    """Run preflight gate and fail fast before stage-2 training starts."""
+    if args.skip_preflight:
+        logger.warning("Skipping online RL preflight (--skip-preflight).")
+        return
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "open_ctf.cli.validate_pipeline",
+        "--mode",
+        "grpo-preflight",
+        "--online-rl-data",
+        args.data,
+    ]
+    if getattr(args, "challenge_registry", None):
+        cmd.extend(["--challenge-registry", args.challenge_registry])
+    if getattr(args, "target_map", None):
+        cmd.extend(["--target-map", args.target_map])
+    if not getattr(args, "allow_missing_manifest", False):
+        cmd.append("--require-manifest")
+    if getattr(args, "require_target_map_coverage", False):
+        cmd.append("--require-target-map-coverage")
+
+    logger.info("Running online RL preflight gate...")
+    subprocess.run(cmd, check=True)
+
+
+def cmd_rl(args: argparse.Namespace) -> None:
+    """Run stage-2 online RL training (``grpo`` remains a CLI alias)."""
+    from open_ctf.training.online_rl import train_online_rl
 
     config = load_config(args.config)
+    _run_online_rl_preflight(args)
 
-    train_grpo(
+    train_online_rl(
         model_path=args.model,
         data_path=args.data,
         output_dir=args.output,
@@ -203,7 +268,7 @@ def cmd_grpo(args: argparse.Namespace) -> None:
 
 
 def cmd_gepa(args: argparse.Namespace) -> None:
-    """Run GEPA prompt optimization (Stage 3, after SFT + GRPO)."""
+    """Run GEPA prompt optimization (Stage 3, after SFT + online RL)."""
     from open_ctf.training.gepa import run_gepa
 
     config = load_config(args.config)
@@ -272,7 +337,7 @@ def cmd_merge(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Open CTF Training Pipeline (LlamaFactory SFT + SkyRL GRPO + GEPA)",
+        description="Open CTF Training Pipeline (SFT + online RL + GEPA)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -302,21 +367,21 @@ def main() -> None:
     )
     sft_parser.set_defaults(func=cmd_sft)
 
-    # -- grpo (SkyRL) -----------------------------------------------------
-    grpo_parser = subparsers.add_parser("grpo", help="Run GRPO via SkyRL")
-    grpo_parser.add_argument("--model", required=True, help="Path to SFT merged model")
-    grpo_parser.add_argument("--data", required=True, help="Path to GRPO JSONL data")
-    grpo_parser.add_argument("--output", required=True, help="Output directory")
-    grpo_parser.add_argument("--resume", default=None, help="Resume from checkpoint")
-    grpo_parser.add_argument(
-        "--challenge-registry", default=None,
-        help="Path to challenge registry YAML for target URL resolution",
+    # -- stage-2 online RL (SkyRL) ---------------------------------------
+    rl_parser = subparsers.add_parser(
+        "rl",
+        help="Run stage-2 online RL via SkyRL (preferred command)",
     )
-    grpo_parser.add_argument(
-        "--agent", default=None,
-        help="Dotted path to a StepAgent class for tool execution (e.g. my_module.MyAgent)",
+    _add_online_rl_args(rl_parser)
+    rl_parser.set_defaults(func=cmd_rl)
+
+    # Backward-compatible alias for existing scripts/users.
+    grpo_parser = subparsers.add_parser(
+        "grpo",
+        help="Legacy alias for 'rl' (online RL via SkyRL)",
     )
-    grpo_parser.set_defaults(func=cmd_grpo)
+    _add_online_rl_args(grpo_parser)
+    grpo_parser.set_defaults(func=cmd_rl)
 
     # -- gepa (unchanged) -------------------------------------------------
     gepa_parser = subparsers.add_parser(
@@ -324,7 +389,7 @@ def main() -> None:
         help="Optimize system prompt with GEPA (Stage 3, no weight updates)",
     )
     gepa_parser.add_argument("--model", required=True, help="LLM model id for dspy.LM")
-    gepa_parser.add_argument("--data", required=True, help="Path to GRPO JSONL data (challenges)")
+    gepa_parser.add_argument("--data", required=True, help="Path to online RL JSONL data (challenges)")
     gepa_parser.add_argument("--output", required=True, help="Output directory for optimized prompt")
     gepa_parser.add_argument("--val-data", default=None, help="Validation JSONL (separate from train)")
     gepa_parser.add_argument(

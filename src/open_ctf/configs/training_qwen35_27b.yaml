@@ -71,9 +71,9 @@ sft:
 
 grpo:
   epochs: 1
-  # Difficulty curriculum: 27B model can handle up to hard challenges.
-  # Expert and master are excluded to keep gradient signal useful.
-  difficulty_max: "hard"
+  # Use full CyBench coverage for production runs.
+  # Includes master difficulty so all 40 registry challenges can participate.
+  difficulty_max: "master"
   batch_size: 1
   # batch_size(1) * grad_accum(4) must be divisible by num_gen(4): 4 % 4 = 0 (valid)
   gradient_accumulation_steps: 4
@@ -81,17 +81,35 @@ grpo:
   warmup_ratio: 0.10
   beta: 0.0
   loss_type: dapo
-  # 2 generations per prompt improves wall-clock throughput while preserving
-  # a group-relative signal for GRPO.
-  num_generations: 2
+  # 4 generations per prompt increases policy signal diversity for RLOO/GRPO.
+  num_generations: 4
   advantage_estimator: rloo
-  # Per-turn generation cap (multi-turn): 6144 keeps long-horizon behavior
-  # while reducing policy-backward memory spikes during FA canary runs.
+  # Per-turn generation cap (multi-turn): keep enough headroom for long-horizon
+  # reasoning while avoiding prompt+completion overflow on 2xB200.
   max_completion_length: 6144
   # 60 tool iterations for long-horizon BoxPwnr-style runs.
   max_tool_calling_iterations: 60
+  # Progressive horizon schedule:
+  # ramp to full 60 turns within the first quarter of a 40-step run.
+  horizon_schedule:
+    rounds: [24, 40, 60]
+    step_interval: 4
+  # Rollout statuses that should be hard-masked (reward=0) so infra/parser
+  # failures do not contaminate policy gradients.
+  hard_mask_statuses:
+    - infra_unreachable
+    - target_mismatch
+    - parser_error
+    - tool_timeout
+  # Warmup curriculum: for early steps, mask non-positive rollout rewards so
+  # failed trajectories do not dominate updates before tool usage stabilizes.
+  positive_only_until_step: 120
+  positive_only_reward_floor: 0.0
   # Cap to one sample per challenge for broad coverage with predictable ETA.
   max_samples_per_challenge: 1
+  # Include static challenges in online RL conversion (file-based targets).
+  # Required for full CyBench40 coverage.
+  drop_static_challenges: false
   # When a challenge registry is supplied, drop samples that cannot be mapped
   # to the canonical benchmark challenge IDs.
   drop_unresolved_registry_samples: true
@@ -110,6 +128,12 @@ grpo:
   # Fail fast when multiple challenge IDs collapse onto one URL (common stale
   # tunnel mapping failure mode).
   fail_on_target_collisions: true
+  # Fail fast when dataset flags drift from canonical registry flags.
+  fail_on_flag_mismatch: true
+  # Fail fast if registry entries used by training have empty flags.
+  fail_on_missing_registry_flag: true
+  # Conference/production profile expects full benchmark coverage after filters.
+  require_all_registry_challenges: true
   # Legacy vLLM engine path crashes on LoRA startup for Qwen3.5
   # (adapter activation during cudagraph warmup). Keep new inference enabled.
   use_new_inference: true
@@ -120,13 +144,17 @@ grpo:
   enable_chunked_prefill: true
   enforce_eager: true
   # Cap prompt length for GRPO/vLLM memory while preserving long trajectories.
-  max_prompt_length: 8192
+  max_prompt_length: 12288
   # Explicit vLLM max model len for stable KV-cache sizing.
-  # Keep this aligned with prompt + completion (+small headroom).
-  vllm_max_model_len: 16384
+  # Keep this aligned with prompt + completion (+headroom) to avoid 400
+  # context-length rejects on long tool loops.
+  vllm_max_model_len: 24576
   # Qwen3.5 uses a conditional-generation config in merged checkpoints.
   # Force text-only vLLM path so local engines do not initialize vision processors.
   vllm_language_model_only: true
+  # Force Triton attention backend to avoid PTX/toolchain incompatibilities
+  # observed with flash-kernel paths on this runtime.
+  vllm_attention_backend: "TRITON_ATTN"
   max_grad_norm: 0.1
   epsilon_high: 0.28
   weight_decay: 0.1
@@ -137,17 +165,19 @@ grpo:
   use_vllm: true
   vllm_mode: server
   vllm_server_url: null
-  # Dedicated GPU0 local vLLM engine: keep utilization high but leave cushion
-  # for LoRA adapter reloads and fragmented KV cache pages.
-  gpu_memory_utilization: 0.68
-  # vLLM scheduling bounds (configurable in grpo.py; avoid hardcoded 32 seqs).
-  max_num_seqs: 16
+  # Dedicated GPU0 local vLLM engine: reserve more KV-cache while keeping
+  # safety headroom for adapter reloads / fragmentation.
+  gpu_memory_utilization: 0.72
+  # vLLM scheduling bounds (configurable in training/online_rl/runtime.py; avoid hardcoded 32 seqs).
+  # Lower seq concurrency to stabilize memory at higher context windows.
+  max_num_seqs: 8
   max_num_batched_tokens: 16384
+  # Skip overlong rollouts instead of failing the entire run.
+  apply_overlong_filtering: true
   # Parallel env workers (up to one per challenge in CyBench40 profile).
   max_env_workers: 40
-  # Enable FlashAttention for this canary after installing fast-path deps.
-  # If instability reappears, revert to false and keep the reduced token bounds.
-  flash_attn: true
+  # Disable trainer flash-attn path on this runtime due PTX/toolchain mismatch.
+  flash_attn: false
   use_sample_packing: false
   # Qwen3.5 linear-attention blocks require flash-linear-attention + causal-conv1d.
   # Keep this strict in production to fail fast on new instances instead of
@@ -174,13 +204,10 @@ grpo:
   dynamic_sampling:
     type: "filter"
     max_sample_batches: 10
-  # SkyRL step-wise trajectories: assign per-step rewards instead of
-  # only terminal reward. Enables credit assignment at each tool-call
-  # step (format compliance + phase progression signals).
-  step_wise_trajectories: true
-  # Explicit opt-in: requires patched SkyRL support for step-wise trajectories
-  # when using custom chat templates (qwen3_without_thinking).
-  allow_step_wise_with_custom_chat_template: true
+  # Use episodic terminal reward for stability with custom chat templates.
+  # Step-wise mode currently emits malformed-trajectory warnings in this stack.
+  step_wise_trajectories: false
+  allow_step_wise_with_custom_chat_template: false
   # Early-stop runaway trajectories when the model repeatedly emits text
   # without valid tool calls.
   agent_kwargs:

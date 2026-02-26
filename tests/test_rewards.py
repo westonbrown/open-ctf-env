@@ -1,7 +1,7 @@
 """Tests for CTFReward function.
 
 Validates all four reward components (flag, uniqueness, efficiency, format)
-plus integration tests against data/grpo.jsonl.
+plus integration tests against online RL dataset JSONL.
 """
 
 import json
@@ -33,10 +33,12 @@ def reward_no_noise():
 
 @pytest.fixture
 def grpo_samples():
-    """Load GRPO samples from data/grpo.jsonl."""
-    path = DATA_DIR / "grpo.jsonl"
+    """Load online RL samples from data/online_rl.jsonl (fallback: grpo.jsonl)."""
+    path = DATA_DIR / "online_rl.jsonl"
     if not path.exists():
-        pytest.skip("data/grpo.jsonl not found (run open-ctf-convert + open-ctf-split)")
+        path = DATA_DIR / "grpo.jsonl"
+    if not path.exists():
+        pytest.skip("online RL dataset not found (run open-ctf-convert + open-ctf-split)")
     samples = []
     with open(path) as f:
         for line in f:
@@ -550,7 +552,7 @@ class TestCallIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Integration: data/grpo.jsonl validation
+# Integration: online RL dataset validation
 # ---------------------------------------------------------------------------
 
 

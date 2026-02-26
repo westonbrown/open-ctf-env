@@ -64,8 +64,28 @@ grpo = [
     "ray[default]>=2.40.0",
     "torch>=2.5.0",
     "transformers>=5.2.0",
+    # Required by transformers loss import path (object-detection loss module
+    # imports scipy.optimize.linear_sum_assignment at import time).
+    "scipy>=1.16.0",
     # Qwen3.5 linear-attention fast path dependencies (module imports: fla, causal_conv1d)
     # Pin known-good versions for SkyRL GRPO on CUDA 12.x hosts.
+    "flash-linear-attention==0.4.1; sys_platform == 'linux'",
+    "causal-conv1d==1.6.0; sys_platform == 'linux'",
+    "peft>=0.15.0",
+    "accelerate>=1.4.0",
+    "omegaconf",
+    "hydra-core",
+    "wandb",
+    "jmespath",
+]
+# Stage 2 alias: semantic name for online reinforcement learning.
+# Kept alongside `grpo` for backward compatibility with existing setups.
+online-rl = [
+    "skyrl-gym>=0.1.0",
+    "ray[default]>=2.40.0",
+    "torch>=2.5.0",
+    "transformers>=5.2.0",
+    "scipy>=1.16.0",
     "flash-linear-attention==0.4.1; sys_platform == 'linux'",
     "causal-conv1d==1.6.0; sys_platform == 'linux'",
     "peft>=0.15.0",
@@ -127,6 +147,10 @@ conflicts = [
     [
         { extra = "sft" },
         { extra = "grpo" },
+    ],
+    [
+        { extra = "sft" },
+        { extra = "online-rl" },
     ],
     [
         { extra = "sft" },

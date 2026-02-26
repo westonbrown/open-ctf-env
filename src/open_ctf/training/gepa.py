@@ -279,7 +279,7 @@ def _load_challenges(
             if not challenge_text:
                 continue
 
-            # Extract target URL from user messages (same as grpo.py)
+            # Extract target URL from user messages (same as online_rl/runtime.py)
             target = _extract_target_from_messages(messages)
             if not target:
                 target = metadata.get("target")

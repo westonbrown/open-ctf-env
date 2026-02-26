@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-memory-gpu0", default="175GiB")
     parser.add_argument("--max-memory-gpu1", default="175GiB")
     parser.add_argument("--attn-impl", default="sdpa", choices=["sdpa", "eager", "flash_attention_2"])
+    parser.add_argument(
+        "--device-map",
+        default="balanced",
+        choices=["auto", "balanced", "balanced_low_0", "sequential"],
+        help="HF device placement strategy for multi-GPU sharding.",
+    )
     parser.add_argument("--packing", action="store_true")
     parser.add_argument("--no-packing", dest="packing", action="store_false")
     parser.set_defaults(packing=False)
@@ -56,6 +62,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-liger-kernel", action="store_true")
     parser.add_argument("--require-both-gpus", action="store_true")
     parser.set_defaults(require_both_gpus=True)
+    parser.add_argument(
+        "--torch-cuda-alloc-conf",
+        default="expandable_segments:True",
+        help="Value for PYTORCH_CUDA_ALLOC_CONF (empty disables override).",
+    )
+    parser.add_argument(
+        "--torch-empty-cache-steps",
+        type=int,
+        default=1,
+        help="Call torch empty-cache every N steps when supported by TrainingArguments.",
+    )
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -161,7 +178,12 @@ def main() -> None:
     LOGGER.info("data=%s", args.data)
     LOGGER.info("output=%s", args.output)
     LOGGER.info("max_length=%d | qlora_4bit=%s | attn=%s", args.max_length, args.load_in_4bit, args.attn_impl)
+    LOGGER.info("device_map=%s", args.device_map)
     LOGGER.info("=" * 72)
+
+    if args.torch_cuda_alloc_conf:
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", args.torch_cuda_alloc_conf)
+        LOGGER.info("PYTORCH_CUDA_ALLOC_CONF=%s", os.environ["PYTORCH_CUDA_ALLOC_CONF"])
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
@@ -175,7 +197,7 @@ def main() -> None:
         "trust_remote_code": True,
         "torch_dtype": "auto",
         "attn_implementation": args.attn_impl,
-        "device_map": "auto",
+        "device_map": args.device_map,
         "max_memory": {0: args.max_memory_gpu0, 1: args.max_memory_gpu1},
         "low_cpu_mem_usage": True,
     }
@@ -189,7 +211,7 @@ def main() -> None:
     else:
         model_kwargs["torch_dtype"] = torch.bfloat16
 
-    LOGGER.info("Loading base model with device_map=auto ...")
+    LOGGER.info("Loading base model with device_map=%s ...", args.device_map)
     model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
     model.config.use_cache = False
 
@@ -226,33 +248,38 @@ def main() -> None:
         ],
     )
 
-    sft_config = SFTConfig(
-        output_dir=args.output,
-        num_train_epochs=args.epochs,
-        max_steps=args.max_steps,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        warmup_ratio=args.warmup_ratio,
-        weight_decay=args.weight_decay,
-        lr_scheduler_type="cosine",
-        max_length=args.max_length,
-        bf16=True,
-        optim="adamw_8bit",
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        dataset_text_field="text",
-        packing=args.packing,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_only_model=True,
-        save_total_limit=4,
-        report_to="none",
-        seed=args.seed,
-        dataloader_num_workers=2,
-        remove_unused_columns=True,
-        use_liger_kernel=args.use_liger_kernel,
-    )
+    sft_kwargs: dict[str, Any] = {
+        "output_dir": args.output,
+        "num_train_epochs": args.epochs,
+        "max_steps": args.max_steps,
+        "per_device_train_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "warmup_ratio": args.warmup_ratio,
+        "weight_decay": args.weight_decay,
+        "lr_scheduler_type": "cosine",
+        "max_length": args.max_length,
+        "bf16": True,
+        "optim": "adamw_8bit",
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "dataset_text_field": "text",
+        "packing": args.packing,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "save_only_model": True,
+        "save_total_limit": 4,
+        "report_to": "none",
+        "seed": args.seed,
+        "dataloader_num_workers": 2,
+        "remove_unused_columns": True,
+        "use_liger_kernel": args.use_liger_kernel,
+    }
+
+    if args.torch_empty_cache_steps > 0 and "torch_empty_cache_steps" in getattr(SFTConfig, "__dataclass_fields__", {}):
+        sft_kwargs["torch_empty_cache_steps"] = args.torch_empty_cache_steps
+
+    sft_config = SFTConfig(**sft_kwargs)
 
     trainer = SFTTrainer(
         model=model,
