@@ -40,32 +40,95 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-# BoxPwnr system prompt seed (from references/boxpwnr/prompts/generic_prompt.yaml)
-# GEPA evolves this instruction to maximize CTF solve performance.
+# Default seed prompt for GEPA prompt evolution.
+# GEPA evolves this instruction to maximize task solve performance.
+# Override with a domain-specific seed via gepa.seed_prompt in config.
 SEED_PROMPT = """\
-You are an autonomous security testing agent authorized to conduct this assessment.
-
-# ENVIRONMENT
-You operate in a Kali Linux Docker container with comprehensive security tools.
-Install additional tools with apt-get if needed.
+You are an autonomous agent authorized to solve the given task.
 
 # APPROACH
 - Break problems into smaller steps
 - Be methodical: test one component at a time
-- Prefer simple, debuggable commands
-- After discovering a vulnerability, exploit it immediately
-- When you find credentials, try them right away
-- Enumerate systematically (e.g., user IDs, endpoints, parameters)
-- Use curl with custom headers for IDOR testing
-- Check JavaScript source for hidden API endpoints and headers
-- Follow the RECON -> ENUM -> EXPLOIT methodology
+- Prefer simple, debuggable actions
+- After discovering useful information, act on it immediately
+- Enumerate systematically before attempting solutions
+- Use the available tools to gather information and take action
+- When you find the answer, submit it immediately
 
 # STRATEGY
-- Start with reconnaissance: nmap, whatweb, curl
-- Enumerate endpoints: gobuster, ffuf, manual discovery
-- Test default credentials on login forms
-- Look for IDOR, SSRF, SQLi, command injection
-- When you find a flag, submit it immediately with flag_found"""
+- Start with reconnaissance: understand the problem space
+- Enumerate: discover endpoints, files, parameters, or entry points
+- Act: use what you've discovered to reach the goal
+- Verify: confirm your answer before submitting"""
+
+
+def _strip_react_boilerplate(instruction: str) -> str:
+    """Strip DSPy ReAct agent framing, keeping only the CTF instructions.
+
+    DSPy ReAct prepends boilerplate like::
+
+        You are an Agent designed to complete any task by
+        calling tools. At each step, ...
+
+    followed by tool schemas and the original seed instructions.  We want
+    just the CTF-specific part (evolved or original) — i.e. everything that
+    came from our seed prompt or GEPA mutations.
+
+    Strategy: look for known boilerplate markers and strip them.  If the
+    instruction doesn't contain boilerplate, return it as-is.
+    """
+    if not instruction:
+        return instruction
+
+    # Pattern 1: DSPy ReAct wraps instructions in a larger agent prompt.
+    # The original seed instructions typically appear after the tool list.
+    # Look for the last occurrence of known seed markers.
+    markers = [
+        "You are an autonomous",
+        "# APPROACH",
+        "# STRATEGY",
+        "# ENVIRONMENT",
+    ]
+
+    for marker in markers:
+        idx = instruction.find(marker)
+        if idx >= 0:
+            # Found our seed content — extract from this point
+            extracted = instruction[idx:].strip()
+            if len(extracted) > 50:  # sanity check — not a trivial fragment
+                return extracted
+
+    # Pattern 2: If "You are an Agent designed to" appears, strip everything
+    # before the actual CTF instructions.  Look for double-newline separation.
+    agent_marker = "You are an Agent designed to"
+    if agent_marker in instruction:
+        # Try to find where the ReAct boilerplate ends and content begins.
+        # DSPy typically puts the original instructions after tool schemas.
+        # Look for sections that look like our domain content.
+        sections = re.split(r"\n{2,}", instruction)
+        content_sections = []
+        in_boilerplate = True
+        for section in sections:
+            stripped = section.strip()
+            if not stripped:
+                continue
+            # Boilerplate indicators
+            if in_boilerplate and any(bp in stripped for bp in [
+                "You are an Agent designed to",
+                "At each step,",
+                "Tool Name:",
+                "Tool Description:",
+                "Tool Arguments:",
+            ]):
+                continue
+            in_boilerplate = False
+            content_sections.append(stripped)
+
+        if content_sections:
+            return "\n\n".join(content_sections)
+
+    # No boilerplate detected — return as-is
+    return instruction.strip()
 
 
 def _extract_first_url(text: str) -> Optional[str]:
@@ -83,24 +146,28 @@ def _extract_first_url(text: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# GEPA metric (wraps CTFReward for trajectory scoring + textual feedback)
+# GEPA metric (wraps reward function for trajectory scoring + feedback)
 # ---------------------------------------------------------------------------
 
 
 def _build_metric(reward_fn):
-    """Wrap CTFReward as a GEPA feedback metric.
+    """Wrap a reward function as a GEPA feedback metric.
 
     Returns a callable matching the ``GEPAFeedbackMetric`` protocol::
 
         (gold, pred, trace, pred_name, pred_trace) -> ScoreWithFeedback
 
-    Per-challenge routing: before scoring, reinitializes the ToolExecutor
-    with the challenge's target URL and ground truth flag so tool calls
-    execute against the correct challenge endpoint.
+    Produces both a numeric score (from the reward function) and textual
+    diagnostic feedback (tool trace, diversity analysis) that the GEPA
+    reflection LM uses to propose improved instructions.
     """
     from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
-    def ctf_metric(gold, pred, trace, pred_name, pred_trace):
+    def ctf_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+        # DSPy Evaluate calls metric(gold, pred) with 2 args.
+        # GEPA reflection calls metric(gold, pred, trace, pred_name, pred_trace)
+        # with 5 args.  Accept both by defaulting trace/pred_name/pred_trace.
+
         # Reinitialize env for this challenge's target before scoring.
         # This ensures tool calls (if re-executed during reflection) hit
         # the correct challenge endpoint.
@@ -151,74 +218,82 @@ def _build_metric(reward_fn):
 
         # Build diagnostic feedback for GEPA reflection.
         # GEPA uses this textual feedback to propose better instructions.
+        # Include concrete trace data so the reflection LM knows exactly
+        # what the agent did and where it got stuck.
         feedback_parts = []
+
+        # Score bucket
         if score >= 0.8:
             feedback_parts.append(
-                "Strong performance. The agent followed a structured "
-                "exploitation methodology and used tools effectively."
+                "Strong performance (score={:.2f}). Flag was captured.".format(score)
             )
         elif score >= 0.5:
             feedback_parts.append(
-                "Moderate performance. Some CTF phases were completed "
-                "but the exploit was not fully successful."
+                "Moderate performance (score={:.2f}). Some phases completed "
+                "but flag not captured.".format(score)
             )
         elif score >= 0.2:
             feedback_parts.append(
-                "Weak performance. The agent attempted some tool calls "
-                "but lacked a structured approach."
+                "Weak performance (score={:.2f}). Agent attempted tool calls "
+                "but lacked a structured approach.".format(score)
             )
         else:
             feedback_parts.append(
-                "Very weak performance. The agent failed to engage "
-                "with the challenge effectively."
+                "Very weak performance (score={:.2f}). Agent failed to engage "
+                "effectively.".format(score)
             )
 
-        # Phase analysis
-        phases_seen = set()
-        for tc in tool_calls:
-            phase = reward_fn._classify_phase(tc)
-            if phase:
-                phases_seen.add(phase)
-
-        if not phases_seen:
+        # Concrete trace summary — show what commands ran and what happened.
+        # This gives the reflection LM actionable context for mutations.
+        # Generic: works with any tool set, not just BoxPwnr tools.
+        if tool_calls:
+            trace_lines = []
+            for i, tc in enumerate(tool_calls[:10], 1):  # cap at 10 for brevity
+                name = tc["name"]
+                try:
+                    args = json.loads(tc["arguments"])
+                except (json.JSONDecodeError, TypeError):
+                    args = tc["arguments"]
+                # Generic formatting: show tool name + truncated arguments
+                if isinstance(args, dict):
+                    # Show first meaningful arg value for readability
+                    first_val = next(
+                        (str(v)[:100] for v in args.values() if v),
+                        str(args)[:100],
+                    )
+                    trace_lines.append(f"  {i}. {name}: {first_val}")
+                else:
+                    trace_lines.append(f"  {i}. {name}({str(args)[:100]})")
+            if len(tool_calls) > 10:
+                trace_lines.append(f"  ... and {len(tool_calls) - 10} more calls")
             feedback_parts.append(
-                "No CTF phases detected. The instruction should guide "
-                "the agent to follow RECON->ENUM->EXPLOIT methodology."
+                "Tool trace:\n" + "\n".join(trace_lines)
             )
-        else:
-            missing = {"recon", "enum", "exploit"} - phases_seen
-            if missing:
-                feedback_parts.append(
-                    f"Missing phases: {', '.join(sorted(missing))}. "
-                    f"The instruction should emphasize "
-                    f"{'reconnaissance' if 'recon' in missing else ''}"
-                    f"{'enumeration' if 'enum' in missing else ''}"
-                    f"{'exploitation' if 'exploit' in missing else ''}."
-                )
-            else:
-                feedback_parts.append(
-                    "All CTF phases (recon, enum, exploit) were attempted."
-                )
 
-        # Tool diversity
+        # Tool diversity analysis (generic — works with any tool set)
         tool_names = {tc["name"] for tc in tool_calls}
         if len(tool_calls) == 0:
             feedback_parts.append(
                 "No tool calls made. The instruction should encourage "
-                "active use of shell_command, python_code, and other tools."
+                "active use of available tools."
             )
         elif len(tool_names) <= 1:
             feedback_parts.append(
-                f"Only used {tool_names}. The instruction should encourage "
-                "diverse tool usage across execution tiers."
+                f"Only used tool: {next(iter(tool_names))}. "
+                "The instruction should encourage diverse tool usage."
             )
         elif len(tool_calls) > 25:
             feedback_parts.append(
-                f"Used {len(tool_calls)} tool calls. The instruction "
-                "should emphasize efficiency and focused exploitation."
+                f"Used {len(tool_calls)} tool calls ({len(tool_names)} unique tools). "
+                "The instruction should emphasize efficiency."
+            )
+        else:
+            feedback_parts.append(
+                f"Used {len(tool_calls)} tool calls across "
+                f"{len(tool_names)} tools: {', '.join(sorted(tool_names))}."
             )
 
-        feedback = " ".join(feedback_parts)
+        feedback = "\n".join(feedback_parts)
         return ScoreWithFeedback(score=score, feedback=feedback)
 
     return ctf_metric
@@ -381,6 +456,107 @@ class CTFAgentDSPyAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Environment-aware ReAct wrapper
+# ---------------------------------------------------------------------------
+
+
+class _EnvAwareReAct:
+    """Wraps a DSPy ReAct module to initialize the ToolExecutor before each episode.
+
+    The core problem: ``init_env()`` is called once at module setup with empty
+    ``ground_truth``, so ``flag_found()`` always rejects submitted flags.
+    This wrapper intercepts each ``__call__`` to:
+
+    1. Look up the ground-truth flag for this challenge's target URL
+    2. Call ``mark_step_begin(ground_truth=...)`` to reset episode state and
+       set the correct flag for verification
+    3. Delegate to the inner ReAct module
+
+    All DSPy introspection methods (``named_predictors``, ``predictors``,
+    ``parameters``, ``save``, ``load``) delegate to the inner module so GEPA
+    can still inspect and evolve the prompt.
+    """
+
+    def __init__(self, inner: "dspy.ReAct", challenge_flags: Dict[str, str]):
+        self._inner = inner
+        self._challenge_flags = challenge_flags
+
+    def _resolve_ground_truth(self, challenge: str) -> str:
+        """Resolve ground-truth flag from target URL or challenge text."""
+        # Try to extract target URL from the challenge text
+        target = _extract_first_url(challenge)
+        if target and target in self._challenge_flags:
+            return self._challenge_flags[target]
+
+        # Fallback: match by challenge text prefix
+        prefix = challenge[:128] if challenge else ""
+        if prefix in self._challenge_flags:
+            return self._challenge_flags[prefix]
+
+        # Last resort: if we only have one challenge, use its flag
+        flags = list(set(self._challenge_flags.values()))
+        if len(flags) == 1:
+            return flags[0]
+
+        return ""
+
+    def __call__(self, challenge: str = "", **kwargs):
+        from open_ctf.training.tools import mark_step_begin
+
+        gt_flag = self._resolve_ground_truth(challenge)
+        if gt_flag:
+            mark_step_begin(ground_truth=gt_flag)
+            logger.debug(
+                "Episode initialized: target extracted, ground_truth=%s...%s",
+                gt_flag[:6], gt_flag[-4:],
+            )
+        else:
+            mark_step_begin()
+            logger.warning(
+                "No ground_truth found for challenge (first 80 chars: %s)",
+                challenge[:80],
+            )
+
+        return self._inner(challenge=challenge, **kwargs)
+
+    # --- DSPy introspection delegation ---
+    # GEPA needs these to inspect and evolve the prompt on the inner ReAct.
+
+    def named_predictors(self):
+        return self._inner.named_predictors()
+
+    def predictors(self):
+        return self._inner.predictors()
+
+    def parameters(self):
+        if hasattr(self._inner, "parameters"):
+            return self._inner.parameters()
+        return []
+
+    def named_parameters(self):
+        if hasattr(self._inner, "named_parameters"):
+            return self._inner.named_parameters()
+        return []
+
+    def save(self, path, *args, **kwargs):
+        return self._inner.save(path, *args, **kwargs)
+
+    def load(self, path, *args, **kwargs):
+        return self._inner.load(path, *args, **kwargs)
+
+    def __deepcopy__(self, memo):
+        import copy
+        return _EnvAwareReAct(
+            copy.deepcopy(self._inner, memo),
+            self._challenge_flags.copy(),
+        )
+
+    def __getattr__(self, name):
+        """Delegate any other attribute access to the inner ReAct module."""
+        return getattr(self._inner, name)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -396,20 +572,22 @@ def run_gepa(
     max_samples: Optional[int] = None,
     challenge_registry: Optional[str] = None,
     agent_class: Optional[str] = None,
+    tools: Optional[list] = None,
 ) -> str:
     """Run GEPA prompt optimization.
 
-    Evolves the CTF agent's system prompt by reflecting on execution
-    traces. Uses DSPy ReAct with BoxPwnr tool schemas and the
-    CTFReward metric for scoring.
+    Evolves the agent's system prompt by reflecting on execution traces.
+    Uses DSPy ReAct with pluggable tools and the CTFReward metric for
+    scoring.
 
-    Tools execute via ToolExecutor (direct subprocess, no HTTP server).
+    Tools execute via ToolExecutor (direct subprocess, no HTTP server)
+    by default. Pass custom ``tools`` to use any callable set.
 
     Args:
         model_id: LLM model identifier for ``dspy.LM``
             (e.g. ``openai/my-model`` with ``OPENAI_API_BASE``
             pointing at a local vLLM server).
-        data_path: Path to GRPO JSONL data (challenges with flags).
+        data_path: Path to JSONL data (challenges with flags).
         output_dir: Directory for optimized prompts and logs.
         config: Merged config dict (may contain ``gepa:`` section).
         reflection_model: LLM for GEPA reflection. Defaults to
@@ -422,6 +600,8 @@ def run_gepa(
             URL resolution.
         agent_class: Dotted path to a CTFAgent class. When set, wraps
             the agent in a DSPy Module adapter instead of using DSPy ReAct.
+        tools: Optional list of callable tools for DSPy ReAct. When
+            ``None``, loads the default tool set from ToolExecutor.
 
     Returns:
         Path to saved optimized prompt file.
@@ -490,10 +670,15 @@ def run_gepa(
         logger.info("Using CTFAgent adapter: %s", agent_class)
     else:
         # Default: DSPy ReAct with direct tool execution.
-        from open_ctf.training.tools import get_all_tools, init_env
-        init_env()
-        tools = get_all_tools()
-        logger.info("Tools initialized (direct execution via ToolExecutor)")
+        if tools is not None:
+            # Custom tools provided by caller — use directly.
+            logger.info("Using %d custom tools", len(tools))
+        else:
+            # Fall back to default ToolExecutor tools.
+            from open_ctf.training.tools import get_all_tools, init_env
+            init_env()
+            tools = get_all_tools()
+            logger.info("Tools initialized (default ToolExecutor, %d tools)", len(tools))
 
         class CTFAgentSignature(dspy.Signature):
             """Placeholder instructions (replaced by seed prompt below)."""
@@ -505,11 +690,30 @@ def run_gepa(
                 desc="The captured flag or final answer",
             )
 
-        agent = dspy.ReAct(
+        # max_iters controls how many tool calls per ReAct episode.
+        # Each iteration = 1 LLM call + 1 tool execution, so this directly
+        # affects latency.  Default 15; override via gepa.max_iters in config.
+        inner_react = dspy.ReAct(
             signature=CTFAgentSignature.with_instructions(seed),
             tools=tools,
-            max_iters=gepa_cfg.get("max_iters", 20),
+            max_iters=gepa_cfg.get("max_iters", 15),
         )
+
+        # Build target→ground_truth lookup so the wrapper can initialize the
+        # ToolExecutor with the correct flag BEFORE each ReAct episode.
+        challenge_flags = {}
+        for ex in trainset:
+            target = ex.get("target", "")
+            gt = ex.get("ground_truth_flag", "")
+            challenge_text = ex.get("challenge", "")
+            if gt:
+                if target:
+                    challenge_flags[target] = gt
+                # Also key by challenge text prefix (128 chars) for fallback
+                if challenge_text:
+                    challenge_flags[challenge_text[:128]] = gt
+
+        agent = _EnvAwareReAct(inner_react, challenge_flags)
 
     # --- Build metric ------------------------------------------------------
     reward_fn = CTFReward()
@@ -523,9 +727,11 @@ def run_gepa(
     # produces ~736 rollouts even for 1 challenge — far too many for a smoke test.
     max_metric_calls = gepa_cfg.get("max_metric_calls")
     if max_metric_calls is None and len(trainset) <= 3:
-        # Small dataset heuristic: 20 rollouts per challenge is plenty for a
-        # quick test while still giving GEPA enough signal to evolve.
-        max_metric_calls = max(20 * len(trainset), 20)
+        # Small dataset heuristic: each metric call = a full ReAct agent loop
+        # (up to max_iters LLM calls + tool executions).  auto="light" with
+        # default minibatch_size=35 produces ~736 calls even for 1 challenge.
+        # 10 per challenge is enough for 1-2 GEPA reflection cycles.
+        max_metric_calls = max(10 * len(trainset), 10)
         logger.info(
             "Small dataset (%d examples) — using max_metric_calls=%d "
             "(override via gepa.max_metric_calls in config)",
@@ -563,8 +769,22 @@ def run_gepa(
         optimized_instruction = pred.signature.instructions
         break
 
+    # Strip DSPy ReAct boilerplate from the instruction.
+    # DSPy prepends agent framing like "You are an Agent designed to..." and
+    # tool schemas.  We only want the CTF-specific evolved instructions.
+    optimized_instruction = _strip_react_boilerplate(optimized_instruction)
+
     prompt_path.write_text(optimized_instruction)
     logger.info("Optimized prompt saved to %s", prompt_path)
+
+    # Also save the raw (unstripped) instruction for debugging
+    raw_path = out_dir / "optimized_prompt_raw.txt"
+    raw_instruction = ""
+    for _name, pred in optimized.named_predictors():
+        raw_instruction = pred.signature.instructions
+        break
+    raw_path.write_text(raw_instruction)
+    logger.info("Raw instruction (with ReAct framing) saved to %s", raw_path)
 
     # Save detailed results
     if hasattr(optimized, "detailed_results") and optimized.detailed_results:

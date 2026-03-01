@@ -29,6 +29,28 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# Canonical parameter name for flag submission is "content" (tool_registry.py),
+# but models commonly use "flag", "value", or "submission".  Accept all of them
+# and fall back to the first string value in the arguments dict.
+_FLAG_PARAM_NAMES = ("content", "flag", "value", "submission")
+
+
+def _extract_flag_value(arguments: Dict[str, Any]) -> str:
+    """Extract the submitted flag string from tool arguments.
+
+    Tries canonical name first, then common aliases, then first string value.
+    """
+    for key in _FLAG_PARAM_NAMES:
+        val = arguments.get(key)
+        if val and isinstance(val, str):
+            return val
+    # Last resort: take the first string value from the dict
+    for val in arguments.values():
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
 def _noninteractive_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Return a process env tuned for unattended tool execution."""
     env = os.environ.copy()
@@ -475,9 +497,11 @@ class SubprocessExecutor(BaseExecutor):
                 "reward": -0.02,
             }
 
-        # Flag submission (both names)
+        # Flag submission (both names).
+        # Models may use any of: content, flag, value, submission — accept all.
         if tool_name in ("submit_flag", "flag_found"):
-            return self._handle_flag_submission(arguments.get("content", ""), state)
+            submitted = _extract_flag_value(arguments)
+            return self._handle_flag_submission(submitted, state)
 
         # Dispatch to handler
         handler = self._handlers.get(tool_name)
@@ -855,9 +879,10 @@ class RemoteBatchExecutor(BaseExecutor):
                 "reward": -0.02,
             }
 
-        # Handle flag submission locally for speed
+        # Handle flag submission locally for speed.
+        # Models may use any of: content, flag, value, submission — accept all.
         if tool_name in ("submit_flag", "flag_found"):
-            submitted = arguments.get("content", "").strip()
+            submitted = _extract_flag_value(arguments).strip()
             correct = bool(self.ground_truth) and submitted == self.ground_truth
             self._done = bool(correct or self._step_count >= self.max_steps)
             if correct:

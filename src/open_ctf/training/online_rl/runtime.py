@@ -2489,14 +2489,17 @@ def _run_skyrl_training(
         logger.info("Enabled SkyRL new inference layer (_SKYRL_USE_NEW_INFERENCE=1)")
 
     # Initialize Ray cluster.
-    # CRITICAL: SkyRL's prepare_runtime_environment() does NOT propagate
-    # CUDA_VISIBLE_DEVICES into Ray's runtime_env.  When an external vLLM
-    # server occupies GPU 0, Ray workers must be restricted to the
-    # remaining GPU(s) — otherwise FSDP policy workers land on the vLLM
-    # GPU and OOM.  We monkey-patch prepare_runtime_environment to inject
-    # the caller's CUDA_VISIBLE_DEVICES into env_vars.
-    _cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if _cuda_vis is not None:
+    # CRITICAL: When SkyRL manages both vLLM and FSDP2 trainer as Ray actors,
+    # clear CUDA_VISIBLE_DEVICES before Ray init so Ray can discover all GPUs
+    # and assign them to actors via per-actor CUDA_VISIBLE_DEVICES isolation.
+    # If we leave CUDA_VISIBLE_DEVICES=0,1 set, Ray's per-actor GPU remapping
+    # may not work correctly, causing both actors to land on GPU 0 → OOM.
+    _cuda_vis = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    _external_urls = config.get("generator", {}).get("external_server_urls")
+    if _cuda_vis is not None and _external_urls:
+        # External vLLM server: re-inject CUDA_VISIBLE_DEVICES so Ray workers
+        # are restricted to the non-vLLM GPU(s).
+        os.environ["CUDA_VISIBLE_DEVICES"] = _cuda_vis
         import skyrl_train.utils as _skyrl_utils_mod
 
         _orig_prepare = _skyrl_utils_mod.prepare_runtime_environment
@@ -2508,7 +2511,13 @@ def _run_skyrl_training(
 
         _skyrl_utils_mod.prepare_runtime_environment = _prepare_with_cuda_vis
         logger.info(
-            "Injected CUDA_VISIBLE_DEVICES=%s into SkyRL Ray runtime_env",
+            "Injected CUDA_VISIBLE_DEVICES=%s into SkyRL Ray runtime_env (external vLLM)",
+            _cuda_vis,
+        )
+    elif _cuda_vis is not None:
+        logger.info(
+            "Cleared CUDA_VISIBLE_DEVICES=%s before Ray init "
+            "(SkyRL manages vLLM + trainer — Ray handles GPU isolation)",
             _cuda_vis,
         )
     initialize_ray(cfg)

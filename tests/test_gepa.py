@@ -818,10 +818,11 @@ class TestSeedPrompt:
     def test_seed_prompt_has_key_methodology(self):
         from open_ctf.training.gepa import SEED_PROMPT
 
-        assert "RECON" in SEED_PROMPT
-        assert "ENUM" in SEED_PROMPT or "Enumerate" in SEED_PROMPT
-        assert "EXPLOIT" in SEED_PROMPT
-        assert "flag_found" in SEED_PROMPT
+        # Generic methodology: approach + strategy sections
+        assert "APPROACH" in SEED_PROMPT
+        assert "STRATEGY" in SEED_PROMPT
+        assert "reconnaissance" in SEED_PROMPT.lower() or "Enumerate" in SEED_PROMPT
+        assert "submit" in SEED_PROMPT.lower()
 
 
 # ---------------------------------------------------------------------------

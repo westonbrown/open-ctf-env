@@ -26,7 +26,7 @@ flowchart LR
 
     subgraph convert["2) Build Datasets"]
         traces["conversation.json + stats.json"] --> converter["BoxPwnrConverter"]
-        converter --> sft_data["SFT dataset<br/>(820 successes)"]
+        converter --> sft_data["SFT dataset<br/>(285 successes)"]
         converter --> grpo_data["GRPO dataset<br/>(87 CyBench + flags)"]
         synth["Synthetic Generator"] --> sft_data
         synth --> grpo_data
@@ -136,7 +136,7 @@ git clone https://github.com/westonbrown/open-ctf-env.git
 cd open-ctf-env
 
 # Install core + SFT dependencies (TRL backend)
-pip install -e ".[sft-trl]"
+pip install -e ".[sft]"
 
 # For GRPO (requires Ray + SkyRL + vLLM nightly)
 pip install git+https://github.com/SkyRL-Team/SkyRL-Train.git
@@ -168,7 +168,7 @@ open-ctf-convert \
 cat data/all_traces.jsonl data/failed_traces.jsonl > data/combined.jsonl
 open-ctf-split \
     --input data/combined.jsonl \
-    --sft-output data/sft.jsonl \
+    --sft-output data/sft_v6.jsonl \
     --online-rl-output data/online_rl.jsonl
 
 # Synthesize Massively Parallel Agent Traces
@@ -184,7 +184,7 @@ open-ctf-synthetic-data \
 # Stage 1: SFT via TRL (Qwen3.5 baseline)
 open-ctf-train sft \
     --model Qwen/Qwen3.5-27B \
-    --data data/sft.jsonl \
+    --data data/sft_v6.jsonl \
     --output outputs/sft-qwen35 \
     --config configs/training/training_qwen35_27b.yaml
 
@@ -258,7 +258,7 @@ Data is generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) -
 
 | Dataset | Traces | Size | Description |
 |---------|--------|------|-------------|
-| `data/sft.jsonl` | 820 | 62.5MB | Successful solves for SFT |
+| `data/sft_v6.jsonl` | 285 | 14MB | Successful solves for SFT |
 | `data/online_rl_cybench40.jsonl` | 87 | 7.3MB | CyBench traces with flags for online GRPO |
 | `data/grpo_offline_683.jsonl` | 676 | 38.8MB | Cross-platform traces for offline GRPO |
 
@@ -359,7 +359,7 @@ open-ctf-env/
 │   ├── training/                    # Unified training configurations
 │   └── skyrl/                       # Per-model GRPO configs
 ├── data/                            # Training data (generated)
-│   ├── sft.jsonl                    # 820 successful traces
+│   ├── sft_v6.jsonl                 # 285 successful traces
 │   ├── online_rl_cybench40.jsonl    # 87 CyBench traces with flags
 │   ├── dataset_info.json            # SFT dataset metadata
 ├── docker/Dockerfile                # Multi-stage (targets: base, sft, grpo)
