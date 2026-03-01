@@ -9,7 +9,7 @@ from typing import Dict, List, Any, Optional
 class Service:
     port: int
     name: str
-    version: str
+    version: str = ""
     banner: str = ""
 
 @dataclass

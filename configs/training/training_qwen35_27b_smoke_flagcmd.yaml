@@ -103,6 +103,12 @@ online_rl:
   chat_template: "qwen3_without_thinking"
   chat_template_kwargs:
     enable_thinking: true
+  # SkyRL's custom qwen3_without_thinking template does NOT have a
+  # {% if tools %} block — passing tools via chat_template_kwargs silently
+  # drops them.  Use text injection via _inject_tool_schemas() instead,
+  # which adds explicit qwen3_coder XML format instructions to the system
+  # message.  See Issue #38.
+  native_tool_schemas: false
   zero_variance_filter: true
   dynamic_sampling:
     type: "filter"

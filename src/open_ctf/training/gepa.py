@@ -98,13 +98,13 @@ def _strip_react_boilerplate(instruction: str) -> str:
             if len(extracted) > 50:  # sanity check — not a trivial fragment
                 return extracted
 
-    # Pattern 2: If "You are an Agent designed to" appears, strip everything
-    # before the actual CTF instructions.  Look for double-newline separation.
-    agent_marker = "You are an Agent designed to"
-    if agent_marker in instruction:
+    # Pattern 2: If DSPy ReAct agent framing is detected, strip it.
+    # DSPy ReAct prepends: "You are an Agent. In each episode, you will be
+    # given the fields {inputs} as input..." followed by numbered tool schemas.
+    agent_markers = ["You are an Agent.", "You are an Agent designed to"]
+    if any(m in instruction for m in agent_markers):
         # Try to find where the ReAct boilerplate ends and content begins.
-        # DSPy typically puts the original instructions after tool schemas.
-        # Look for sections that look like our domain content.
+        # DSPy puts the original instructions after tool schemas.
         sections = re.split(r"\n{2,}", instruction)
         content_sections = []
         in_boilerplate = True
@@ -112,14 +112,20 @@ def _strip_react_boilerplate(instruction: str) -> str:
             stripped = section.strip()
             if not stripped:
                 continue
-            # Boilerplate indicators
+            # Boilerplate indicators (match DSPy's actual ReAct format)
             if in_boilerplate and any(bp in stripped for bp in [
-                "You are an Agent designed to",
+                "You are an Agent",
+                "In each episode,",
                 "At each step,",
+                "next_tool_name",
+                "next_tool_args",
                 "Tool Name:",
                 "Tool Description:",
                 "Tool Arguments:",
             ]):
+                continue
+            # Numbered tool entries: "(1) shell_command: ..."
+            if in_boilerplate and re.match(r"^\(\d+\)\s+\w+", stripped):
                 continue
             in_boilerplate = False
             content_sections.append(stripped)
@@ -544,6 +550,25 @@ class _EnvAwareReAct:
     def load(self, path, *args, **kwargs):
         return self._inner.load(path, *args, **kwargs)
 
+    def deepcopy(self):
+        """DSPy BaseModule.deepcopy() — GEPA calls this, not copy.deepcopy().
+
+        Must return an _EnvAwareReAct wrapping a deep copy of the inner
+        ReAct, otherwise GEPA's build_program loses the wrapper and
+        mark_step_begin() won't be called during evaluation episodes.
+        """
+        return _EnvAwareReAct(
+            self._inner.deepcopy(),
+            self._challenge_flags.copy(),
+        )
+
+    def reset_copy(self):
+        """DSPy BaseModule.reset_copy() — returns a wrapper with a reset inner copy."""
+        return _EnvAwareReAct(
+            self._inner.reset_copy(),
+            self._challenge_flags.copy(),
+        )
+
     def __deepcopy__(self, memo):
         import copy
         return _EnvAwareReAct(
@@ -721,6 +746,16 @@ def run_gepa(
 
     # --- Run GEPA ----------------------------------------------------------
     num_threads = gepa_cfg.get("num_threads", 1)
+    if num_threads > 1 and tools is None:
+        # ToolExecutor is a module-level singleton — concurrent threads
+        # will race on ground_truth and episode state.  Only safe with
+        # custom thread-safe tools.
+        logger.warning(
+            "num_threads=%d with default ToolExecutor is unsafe "
+            "(shared executor state). Forcing num_threads=1.",
+            num_threads,
+        )
+        num_threads = 1
 
     # Budget: prefer explicit max_metric_calls (from config or small datasets),
     # fall back to auto preset.  auto="light" with default minibatch_size=35
@@ -764,27 +799,20 @@ def run_gepa(
 
     # --- Save optimized prompt ---------------------------------------------
     prompt_path = out_dir / "optimized_prompt.txt"
-    optimized_instruction = ""
-    for _name, pred in optimized.named_predictors():
-        optimized_instruction = pred.signature.instructions
-        break
-
-    # Strip DSPy ReAct boilerplate from the instruction.
-    # DSPy prepends agent framing like "You are an Agent designed to..." and
-    # tool schemas.  We only want the CTF-specific evolved instructions.
-    optimized_instruction = _strip_react_boilerplate(optimized_instruction)
-
-    prompt_path.write_text(optimized_instruction)
-    logger.info("Optimized prompt saved to %s", prompt_path)
-
-    # Also save the raw (unstripped) instruction for debugging
-    raw_path = out_dir / "optimized_prompt_raw.txt"
     raw_instruction = ""
     for _name, pred in optimized.named_predictors():
         raw_instruction = pred.signature.instructions
         break
+
+    # Save raw instruction (with ReAct framing) for debugging
+    raw_path = out_dir / "optimized_prompt_raw.txt"
     raw_path.write_text(raw_instruction)
     logger.info("Raw instruction (with ReAct framing) saved to %s", raw_path)
+
+    # Strip DSPy ReAct boilerplate — only keep the evolved CTF instructions.
+    optimized_instruction = _strip_react_boilerplate(raw_instruction)
+    prompt_path.write_text(optimized_instruction)
+    logger.info("Optimized prompt saved to %s", prompt_path)
 
     # Save detailed results
     if hasattr(optimized, "detailed_results") and optimized.detailed_results:

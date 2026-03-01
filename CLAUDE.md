@@ -183,7 +183,7 @@ vllm serve /workspace/models/qwen35-27b --max-model-len 8192 --dtype bfloat16 \
 | 35 | OmegaConf breaks `apply_chat_template` | DictConfig fails `isinstance(dict)` check | Patch #19: resolve to plain Python types |
 | 36 | Terminal reward never fires | `max_turns` (20) != `max_tool_calling_iterations` (10) | Clamp env max_turns to agent loop limit |
 | 37 | **`flag_found` parameter mismatch** | Models generate `flag_found(flag="...")` but executor reads `arguments.get("content", "")` — flag value silently dropped, reward=0 despite correct flag | `_extract_flag_value()` helper tries `content`, `flag`, `value`, `submission`, then first string value |
-| 38 | SkyRL uses `/v1/completions` not `/v1/chat/completions` | vLLM `--tool-call-parser qwen3_coder` only works on chat completions; text completions are unconstrained → model falls back to Python-style `func(arg="val")` | Fallback parser catches Python-style calls; proper fix: patch SkyRL generator or set `native_tool_schemas: false` |
+| 38 | **Custom template silently drops tool schemas** | SkyRL's `qwen3_without_thinking` template has no `{% if tools %}` block; with `native_tool_schemas: true`, env skips text injection AND template ignores `tools=` kwarg → model sees **no tool definitions or format instructions** | Config: `native_tool_schemas: false`; Guard: `runtime.py` auto-downgrades when custom template detected; Patch #20: safety-net injection in generator |
 | 39 | FSDP2 `sharded_sd` memory leak | `fsdp2_load_full_state_dict()` holds GPU tensor references in `sharded_sd` dict after `load_state_dict(assign=True)` → offload/reload cycle OOMs | `del sharded_sd; gc.collect(); torch.cuda.empty_cache()` after load |
 | 40 | SkyRL overrides `enforce_eager=True` to `False` | `main_base.py:79` sets `engine_kwargs["enforce_eager"] = False` → cudagraph warmup crashes Qwen3.5 LoRA | Patch line 79 to `pass` |
 | 41 | `CUDA_VISIBLE_DEVICES` defeats Ray GPU isolation | Injecting `CUDA_VISIBLE_DEVICES=0,1` into Ray runtime_env overrides per-actor GPU assignment → both actors on GPU 0 | `os.environ.pop("CUDA_VISIBLE_DEVICES")` before `initialize_ray()` when SkyRL manages both actors |
@@ -200,7 +200,7 @@ vllm serve /workspace/models/qwen35-27b --max-model-len 8192 --dtype bfloat16 \
 
 **Validation**: v6 (before fix): reward=0.078, flag_found=False. v7 (after fix): reward=0.743, flag_found=True. Both generations solved Flag Command in 9-11 tool calls.
 
-**19 patches total** (10 SkyRL, 3 vLLM, 1 Ray, 1 flash_attn stub, 1 torchaudio stub, 3 additional). Patch #5 (fsdp_mixed_precision) is fixed upstream and safely no-ops. Must re-apply on container restart: `bash docker/patches/apply_all_patches.sh`.
+**20 patches total** (11 SkyRL, 3 vLLM, 1 Ray, 1 flash_attn stub, 1 torchaudio stub, 3 additional). Patch #5 (fsdp_mixed_precision) is fixed upstream and safely no-ops. Patch #20 (custom_template_tools) is a safety-net for Issue #38. Must re-apply on container restart: `bash docker/patches/apply_all_patches.sh`.
 
 Patches not listed in the issue table above (infrastructure/operational, no corresponding bug #):
 - `patch_torchaudio_stub.py`: NGC PyTorch ABI incompatibility stub
@@ -210,6 +210,7 @@ Patches not listed in the issue table above (infrastructure/operational, no corr
 - `patch_skyrl_stepwise_index_guard.py`: Step-wise reward index guard (skip out-of-range `resp_end_idx` writes)
 - `patch_skyrl_empty_reward_fallback.py`: Empty `per_token_reward` fallback (prevents ValueError when step has 0 tokens)
 - `patch_skyrl_loss_diagnostics.py`: `loss_mask` diagnostics + all-zero fallback (root-causes `policy_loss=0.0`)
+- `patch_skyrl_custom_template_tools.py`: Safety-net for Issue #38 — injects tools into system message when custom chat template lacks `{% if tools %}` support
 
 ## 9) Deployment Topology
 
@@ -331,9 +332,10 @@ Confirmed across 4 configurations (SkyRL GRPO, BoxPwnr chat, LangChain tools). M
 9. **Terminal reward must align with agent loop** — `max_turns` vs `max_tool_calling_iterations` mismatch = reward never fires.
 10. **Tool response truncation matters** — 1200 chars hid the JS import revealing the API endpoint. 2500+ needed.
 11. **CRITICAL: Tool parameter names must be flexible** — Models generate `flag_found(flag="...")` not `flag_found(content="...")`. The tool registry schema says `content` but no model follows this during free-form generation. 4 days to diagnose because the flag was silently dropped (empty string submission). Always accept multiple parameter name aliases for critical tools. See Issue #37.
-12. **SkyRL uses text completion, not chat completion** — vLLM's `--tool-call-parser` and `--enable-auto-tool-choice` only work on `/v1/chat/completions`. SkyRL's multi-turn generator uses `/v1/completions` (raw text), so the model generates unconstrained text. The fallback parser catches Python-style calls, but the model doesn't learn the XML format it was SFT'd on. See Issue #38.
+12. **CRITICAL: SkyRL custom templates silently drop tool schemas** — SkyRL's `qwen3_without_thinking` and `qwen3_with_thinking` templates do NOT have `{% if tools %}`. The native Qwen3.5 tokenizer template handles tools (renders `qwen3_coder` XML + format instructions), but the custom templates ignore the `tools=` kwarg entirely. With `native_tool_schemas: true`, the env skips text injection (`_inject_tool_schemas()`) AND the template drops tools = **model sees zero tool definitions**. Fix: always set `native_tool_schemas: false` when using custom templates. Guard in `runtime.py` auto-downgrades. See Issue #38.
 13. **FSDP2 state dict lifecycle** — After `model.load_state_dict(sharded_sd, assign=True)`, the `sharded_sd` dict still holds GPU tensor references. Must `del sharded_sd; gc.collect(); torch.cuda.empty_cache()` before offload/reload cycles or OOM is guaranteed. See Issue #39.
 14. **Ray GPU isolation requires clean env** — Never inject `CUDA_VISIBLE_DEVICES` into Ray runtime_env when SkyRL manages both vLLM and trainer actors. Clear the env var before `initialize_ray()` and let Ray assign GPUs per-actor. See Issue #41.
+15. **Custom template vs native template trade-offs** — The native Qwen3.5 template handles tools, thinking, multimodal, and `tool_calls` natively but lacks SkyRL's `{% generation %}` tags for loss masking. The custom `qwen3_without_thinking` has `{% generation %}` but drops tools. Use `native_tool_schemas: false` + text injection to get both. Future fix: create a hybrid template with both `{% generation %}` tags AND `{% if tools %}` support.
 
 ## 15) References
 

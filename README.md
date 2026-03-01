@@ -16,35 +16,37 @@ Base open-weight models understand security concepts but cannot execute multi-st
 ## How It Works
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph collect["1) Collect Traces"]
-        box["BoxPwnr Agent"] -- "prompt + tools" --> model["Base Model"]
-        model -- "tool calls" --> box
-        box -- "execute actions" --> targets["CTF Targets"]
-        targets -- "stdout + flags" --> box
+        direction LR
+        Model(["Base Model"]) <-->|Prompt / Tools| Box[["BoxPwnr Agent"]]
+        Box <-->|Execute / Stdout| Targets[("CTF Targets")]
     end
 
     subgraph convert["2) Build Datasets"]
-        traces["conversation.json + stats.json"] --> converter["BoxPwnrConverter"]
-        converter --> sft_data["SFT dataset<br/>(285 successes)"]
-        converter --> grpo_data["GRPO dataset<br/>(87 CyBench + flags)"]
-        synth["Synthetic Generator"] --> sft_data
-        synth --> grpo_data
-    end
-
-    subgraph train["3) Train"]
         direction LR
-        sft["Stage 1: SFT<br/>(TRL)"] --> merge["Merge LoRA"]
-        merge --> grpo["Stage 2: Online GRPO<br/>(SkyRL + ToolExecutor)"]
-        grpo --> gepa["Stage 3: GEPA<br/>(prompt optimization)"]
+        Traces[/"Raw Traces"/] --> Converter[["BoxPwnrConverter"]]
+        Converter --> SFT_DB[("SFT Dataset<br/>(285 successes)")]
+        Converter --> GRPO_DB[("GRPO Dataset<br/>(87 CyBench + flags)")]
+        Synth[/"Synthetic Generator"/] -.-> SFT_DB & GRPO_DB
     end
 
-    subgraph deploy["4) Evaluate + Deploy"]
-        final_model["Final CTF Agent"] --> eval_bench["CyBench Eval"]
-        final_model --> export["GGUF Export"]
+    subgraph train["3) Train Pipeline"]
+        direction LR
+        SFT("Stage 1: SFT<br/>(TRL)") --> Merge[["Merge LoRA"]]
+        Merge --> GRPO("Stage 2: Online GRPO<br/>(SkyRL)")
+        GRPO --> GEPA("Stage 3: GEPA<br/>(DSPy)")
     end
 
-    collect --> convert --> train --> deploy
+    subgraph deploy["4) Evaluate & Deploy"]
+        direction LR
+        Final(["Final CTF Agent"]) --> Eval{{"CyBench Eval"}}
+        Final --> Export[/"GGUF Export"/]
+    end
+
+    collect -->|conversations.json| convert
+    convert -->|sft.jsonl / grpo.jsonl| train
+    train -->|trained weights| deploy
 ```
 
 The same scaffold (BoxPwnr) runs both the baseline and fine-tuned models against identical challenges. The only variable is the model weights -- architecture, tools, and evaluation harness are held constant.
@@ -61,11 +63,11 @@ The same scaffold (BoxPwnr) runs both the baseline and fine-tuned models against
 
 ```mermaid
 flowchart LR
-    step1["1) Prepare datasets<br/>(SFT + GRPO)"] --> step2["2) Run SFT<br/>(LoRA adapter)"]
-    step2 --> step3["3) Merge adapter<br/>into base model"]
-    step3 --> step4["4) Run online GRPO<br/>(tools + reward)"]
-    step4 --> step5["5) Run GEPA (optional)<br/>prompt optimization"]
-    step5 --> step6["6) Final model + prompt package"]
+    D[("Datasets<br/>(SFT + GRPO)")] --> S("Stage 1: SFT<br/>(LoRA)")
+    S --> M[["Merge Weights"]]
+    M --> G("Stage 2: GRPO<br/>(Tools + Reward)")
+    G --> P("Stage 3: GEPA<br/>(Prompt Optimize)")
+    P --> F(("Deployable Model"))
 ```
 
 **Online GRPO** executes tool calls via the built-in ToolExecutor during training. The model generates tool calls, the ToolExecutor runs them directly as subprocesses (shell commands, Python code, file operations), and the CTF reward function scores the full trajectory. No HTTP server required -- SkyRL's per-worker process isolation makes the former HTTP layer redundant.

@@ -37,15 +37,48 @@ files:
 
 tool_responses:
   "shell_command":
-    "kubectl get pods --all-namespaces": |
+    "kubectl get pods": |
       NAMESPACE       NAME                                READY   STATUS    RESTARTS   AGE
       kube-system     coredns-5d78c9869d-v5h44            1/1     Running   0          10d
       kube-system     kube-proxy-8jmq7                    1/1     Running   0          10d
       rogue-namespace unexpected-worker-3a9f              1/1     Running   0          2h
-    "kubectl exec -n rogue-namespace unexpected-worker-3a9f -- ps aux": |
+    "kubectl get ns": |
+      NAME              STATUS   AGE
+      default           Active   10d
+      kube-system       Active   10d
+      rogue-namespace   Active   2h
+    "kubectl describe.*unexpected-worker": |
+      Name:         unexpected-worker-3a9f
+      Namespace:    rogue-namespace
+      Node:         k8s-node-1/10.96.0.2
+      Status:       Running
+      IP:           10.244.1.15
+      Containers:
+        worker:
+          Image:    alpine:latest
+          Command:  /bin/sh -c xmrig -o pool.minexmr.com:3333
+          State:    Running (Started 2h ago)
+          Resources:
+            cpu: 4000m (99.9% usage — ANOMALOUS)
+    "kubectl logs.*unexpected-worker": |
+      [2026-03-01 08:00:12] xmrig/6.21.0 (Linux x86_64)
+      [2026-03-01 08:00:12] Pool: pool.minexmr.com:3333
+      [2026-03-01 08:00:12] Mining started: RandomX algorithm
+      [2026-03-01 10:00:12] Hashrate: 2847.3 H/s
+      [2026-03-01 10:00:12] Shares accepted: 1452
+    "kubectl exec.*unexpected-worker.*ps": |
       USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
       root           1  0.0  0.0   2416   512 ?        Ss   10:00   0:00 /bin/sh -c xmrig -o pool.minexmr.com:3333
       root           7 99.9  1.2 145232 45812 ?        Rl   10:00 119:23 xmrig -o pool.minexmr.com:3333
-    "kubectl delete pod unexpected-worker-3a9f -n rogue-namespace": |
+    "kubectl exec.*unexpected-worker": |
+      root@unexpected-worker-3a9f:/# (interactive shell)
+      PID    CPU%  COMMAND
+      1      0.0   /bin/sh
+      7      99.9  xmrig -o pool.minexmr.com:3333
+    "kubectl delete.*unexpected-worker": |
       pod "unexpected-worker-3a9f" deleted
       FLAG{xmrig_process_identified_and_killed}
+    "kubectl get events.*rogue": |
+      LAST SEEN   TYPE      REASON    OBJECT                           MESSAGE
+      2h          Normal    Pulled    pod/unexpected-worker-3a9f       Container image "alpine:latest" already present
+      2h          Normal    Started   pod/unexpected-worker-3a9f       Started container worker

@@ -5,29 +5,39 @@ Open CTF Environment is a **3-stage post-training pipeline** for fine-tuning LLM
 ## System Overview
 
 ```mermaid
-flowchart TB
-    subgraph data["Data Collection + Synthesis"]
-        boxpwnr["BoxPwnr Agent"] --> traces["conversation.json + stats.json"]
-        traces --> converter["BoxPwnrConverter<br/>(lossless, 13 tools)"]
-        synth["Synthetic Generator"] --> sft_data
-        synth --> grpo_data
-        converter --> sft_data["SFT data<br/>(339 successes)"]
-        converter --> grpo_data["GRPO data<br/>(33 CyBench + flags)"]
-    end
+flowchart TD
+    %% Node Definitions
+    Traces[/"Raw BoxPwnr Traces"/]
+    Synth[/"Synthetic Data"/]
+    Convert[["Converter & Splitter"]]
+    
+    SFTData[("SFT Dataset")]
+    GRPOData[("GRPO Dataset")]
+    
+    SFT("Stage 1: SFT (TRL)")
+    Merge[["Merge LoRA"]]
+    GRPO("Stage 2: Online GRPO (SkyRL)")
+    GEPA("Stage 3: GEPA (DSPy)")
+    
+    Model(("Final CTF Agent"))
+    Eval{{"CyBench Evaluation"}}
 
-    subgraph pipeline["3-Stage Training Pipeline"]
-        direction TB
-        sft["Stage 1: SFT<br/>(TRL)"] -->|"LoRA adapter"| merge["Merge<br/>(PEFT)"]
-        merge -->|"Merged checkpoint"| grpo["Stage 2: Online GRPO<br/>(SkyRL)"]
-        grpo -->|"Updated model"| gepa["Stage 3: GEPA<br/>(DSPy)"]
-    end
+    %% Data Flow
+    Traces --> Convert
+    Convert -->|"Successes"| SFTData
+    Convert -->|"All + Flags"| GRPOData
+    Synth -.-> SFTData & GRPOData
 
-    subgraph eval["Evaluate + Deploy"]
-        bench["CyBench<br/>40 challenges"]
-        gguf["GGUF export<br/>+ Ollama"]
-    end
-
-    data --> pipeline --> eval
+    %% Training Flow
+    SFTData --> SFT
+    SFT --> Merge
+    Merge --> GRPO
+    GRPOData --> GRPO
+    GRPO --> GEPA
+    
+    %% Output
+    GEPA --> Model
+    Model --> Eval
 ```
 
 ## Module Structure
@@ -94,18 +104,30 @@ configs/
 
 ```mermaid
 flowchart LR
-    boxpwnr["BoxPwnr traces"] --> converter["BoxPwnrConverter"]
-    synth["Synthetic data generator"] --> sft
-    synth --> grpo
-    converter --> splitter["DatasetSplitter"]
-    splitter -->|"successes"| sft["sft.jsonl (SFT)"]
-    splitter -->|"all + flags"| grpo["grpo_cybench40.jsonl (GRPO)"]
-    sft --> sft_stage["SFT stage"]
-    sft_stage -->|"LoRA"| merge["PEFT merge"]
-    merge --> skyrl["GRPO stage"]
-    grpo --> skyrl
-    skyrl --> gepa["GEPA stage"]
-    gepa --> final["Final model package"]
+    %% Definitions
+    Traces[/"Raw Traces"/]
+    Synth[/"Synthetic Gens"/]
+    Converter[["BoxPwnrConverter"]]
+    Splitter[["DatasetSplitter"]]
+    
+    SFT_DB[("sft.jsonl")]
+    GRPO_DB[("grpo_cybench40.jsonl")]
+
+    SFT("SFT Stage")
+    Merge[["PEFT Merge"]]
+    GRPO("GRPO Stage")
+    GEPA("GEPA Stage")
+    Model(("Final Export"))
+
+    %% Flow
+    Traces --> Converter --> Splitter
+    Splitter -- "Successes" --> SFT_DB
+    Splitter -- "All + Flags" --> GRPO_DB
+    Synth -.-> SFT_DB & GRPO_DB
+
+    SFT_DB --> SFT --> Merge --> GRPO
+    GRPO_DB --> GRPO
+    GRPO --> GEPA --> Model
 ```
 
 ## CTF Reward Function
@@ -154,15 +176,44 @@ We deliberately use `skyrl-gym`'s low-level `BaseTextEnv` interface rather than 
 flowchart LR
     subgraph skyrl["SkyRL BasePPOExp"]
         direction LR
-        vllm["vLLM generator<br/>prefix caching + continuous batching"]
-        parse["Parse tool calls"]
-        exec["ToolExecutor<br/>subprocess execution"]
-        obs["Observation + reward"]
-        trainer["FSDP2 trainer<br/>DAPO loss + RLOO-N"]
+        vLLM("vLLM Generator<br/>(Prefix Cache + Cont. Batching)")
+        Parser[["Tool Parser"]]
+        Exec[["ToolExecutor"]]
+        Env("OpenCTFTextEnv<br/>(Reward Computation)")
+        Trainer("FSDP2 Trainer<br/>(DAPO + RLOO-N)")
 
-        vllm --> parse --> exec --> obs --> trainer
-        trainer -. "updated weights" .-> vllm
+        vLLM -->|"Generates Call"| Parser
+        Parser --> Exec
+        Exec -->|"Stdout/Flag"| Env
+        Env -->|"Observation"| Trainer
+        Trainer -.->|"Weight Sync"| vLLM
     end
+```
+
+### Execution Sequence
+
+To keep GRPO scalable, environments operate autonomously and execute commands directly as subprocesses, bypassing the HTTP bottleneck. The training iteration loops are securely coordinated between the model generators and physical containers.
+
+```mermaid
+sequenceDiagram
+    participant Model as vLLM Generator
+    participant Env as OpenCTFTextEnv
+    participant Tool as ToolExecutor
+    participant Target as CyBench Container
+    participant Trainer as FSDP2 Trainer
+    
+    loop Trajectory Generation (Per Turn)
+        Model->>Env: Generate Tool Call (e.g. nmap)
+        Env->>Tool: Extract & Parse Action
+        Tool->>Target: Execute Subprocess
+        Target-->>Tool: Return Stdout / Stderr
+        Tool-->>Env: Raw Execution Output
+        Env-->>Model: Formatted Observation
+    end
+    
+    Env->>Trainer: Calculate CTFReward (8 Signals)
+    Trainer->>Trainer: Compute DAPO Loss & Step
+    Trainer-->>Model: Sync Updated Weights via Ray
 ```
 
 - **Generator** (Ray actor): vLLM inference engine produces 8 completions per prompt.
@@ -229,9 +280,9 @@ docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
 
 ```mermaid
 flowchart LR
-    model["Trained model"] --> agent["BoxPwnr agent<br/>(CTFAgent protocol)"]
-    agent --> challenges["CyBench<br/>40 challenges"]
-    challenges --> metrics["Solve rate<br/>Avg turns<br/>Avg time"]
+    Model(("Trained Model")) --> Agent[["CTFAgent (BoxPwnr)"]]
+    Agent <--> Challenges[("CyBench 40")]
+    Challenges --> Metrics[["Compute Metrics:<br/>Solve rate, Turns, Time"]]
 ```
 Evaluation uses the same BoxPwnr scaffold as data collection. The only variable is model weights — architecture, tools, and evaluation harness are held constant. The `CTFAgent` protocol supports pluggable agents: use `--agent boxpwnr` (default) or `--agent custom:module.Class`.
 

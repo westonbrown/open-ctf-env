@@ -34,25 +34,31 @@ class TestNativeToolSchemasDefault:
         result = _build_skyrl_config("/model", "/out", base_config, "/data.jsonl")
         assert result["generator"]["native_tool_schemas"] is True
 
-    def test_defaults_true_with_chat_template(self, base_config):
-        """When chat_template IS set, native_tool_schemas should STILL be True.
+    def test_auto_downgraded_with_custom_chat_template(self, base_config):
+        """When custom chat_template is set, native_tool_schemas auto-downgrades.
 
-        This is the bug fix: previously defaulted to False when chat_template
-        was set, which broke native tool support for Qwen3.5.
+        SkyRL custom templates (qwen3_without_thinking) don't have {% if tools %}
+        so tools in chat_template_kwargs are silently dropped.  runtime.py
+        auto-downgrades to native_tool_schemas=False so the env uses text
+        injection via _inject_tool_schemas() instead.  See Issue #38.
         """
         base_config["online_rl"]["chat_template"] = "qwen3_without_thinking"
         result = _build_skyrl_config("/model", "/out", base_config, "/data.jsonl")
-        assert result["generator"]["native_tool_schemas"] is True
+        assert result["generator"]["native_tool_schemas"] is False
 
-    def test_tools_injected_with_chat_template(self, base_config):
-        """Tools should be in chat_template_kwargs even with a custom template."""
+    def test_tools_not_in_kwargs_with_custom_template(self, base_config):
+        """Tools should NOT be in chat_template_kwargs with a custom template.
+
+        Custom templates ignore tools= kwarg.  Tools are injected as text
+        by _inject_tool_schemas() in OpenCTFTextEnv.init() instead.
+        """
         base_config["online_rl"]["chat_template"] = "qwen3_without_thinking"
         result = _build_skyrl_config("/model", "/out", base_config, "/data.jsonl")
         kwargs = result["generator"]["chat_template_kwargs"]
-        tools = kwargs.get("tools", [])
-        assert len(tools) > 0, "Tools should be injected even with custom chat_template"
-        tool_names = [t["function"]["name"] for t in tools]
-        assert "shell_command" in tool_names
+        assert "tools" not in kwargs, (
+            "Tools should NOT be in chat_template_kwargs when custom template "
+            "is set — template would silently drop them"
+        )
 
 
 class TestNativeToolSchemasExplicitFalse:

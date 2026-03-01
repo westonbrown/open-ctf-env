@@ -6,26 +6,31 @@ Open CTF uses a **3-stage training pipeline**: SFT (supervised fine-tuning) for 
 
 ```mermaid
 flowchart LR
-    traces["BoxPwnr traces"] --> convert["Convert traces"] --> split["Split datasets"]
-    split -->|"successes"| sft_data["SFT data"]
-    split -->|"all + flags"| grpo_data["GRPO data"]
-    sft_data --> sft["SFT stage<br/>(TRL)"]
-    sft --> merge["Merge LoRA"]
-    merge --> grpo["GRPO stage<br/>(SkyRL)"]
-    grpo_data --> grpo
-    grpo --> gepa["GEPA stage"]
-    gepa --> final["Final model package"]
+    %% Data Flow
+    Traces[/"BoxPwnr Traces"/] --> Convert[["Convert & Split"]]
+    Convert -->|"Successes"| SFTData[("SFT Data")]
+    Convert -->|"All + Flags"| GRPOData[("GRPO Data")]
+
+    %% Train
+    SFTData --> SFT("SFT Stage<br/>(TRL)")
+    SFT -.->|"LoRA"| Merge[["PEFT Merge"]]
+    Merge --> GRPO("GRPO Stage<br/>(SkyRL)")
+    GRPOData --> GRPO
+    
+    %% Post-train
+    GRPO --> GEPA("GEPA Stage<br/>(DSPy)")
+    GEPA --> Final(("Final Model"))
 ```
 
 ### High-Level Training Sequence
 
 ```mermaid
 flowchart LR
-    step1["1) Prepare datasets<br/>(SFT + GRPO)"] --> step2["2) Run SFT<br/>(LoRA adapter)"]
-    step2 --> step3["3) Merge adapter<br/>into base model"]
-    step3 --> step4["4) Run online GRPO<br/>(tools + reward)"]
-    step4 --> step5["5) Run GEPA (optional)<br/>prompt optimization"]
-    step5 --> step6["6) Final model + prompt package"]
+    D[("Datasets<br/>(SFT + GRPO)")] --> S("Stage 1: SFT<br/>(LoRA)")
+    S --> M[["Merge Weights"]]
+    M --> G("Stage 2: GRPO<br/>(Tools + Reward)")
+    G --> P("Stage 3: GEPA<br/>(Prompt Optimize)")
+    P --> F(("Deployable Model"))
 ```
 
 | Stage | Framework | What It Does | Weight Updates |

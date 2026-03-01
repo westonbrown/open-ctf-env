@@ -103,6 +103,13 @@ run_patch "skyrl_loss_diagnostics" optional python3 "$PATCH_DIR/patch_skyrl_loss
 #     validation rejects DictConfig; blocks native_tool_schemas=true)
 run_patch "skyrl_chat_template_kwargs" optional python3 "$PATCH_DIR/patch_skyrl_chat_template_kwargs.py"
 
+# --- Custom template tool injection safety net ---
+
+# 20. When custom chat_template (qwen3_without_thinking) doesn't have
+#     {% if tools %}, inject tools into system message as text instead
+#     of silently dropping them (Issue #38 safety net)
+run_patch "skyrl_custom_template_tools" optional python3 "$PATCH_DIR/patch_skyrl_custom_template_tools.py"
+
 # --- Cleanup ---
 echo ""
 echo "Clearing __pycache__..."

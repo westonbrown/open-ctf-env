@@ -25,17 +25,21 @@ hosts:
     services:
       - port: 445
         name: "microsoft-ds"
+        version: "Windows Server 2022"
       - port: 135
         name: "msrpc"
+        version: "Microsoft Windows RPC"
       - port: 389
         name: "ldap"
-        
+        version: "Active Directory LDAP"
+
   - hostname: "WS-105.corp.local"
     ip: "10.0.5.105"
     os_type: "windows"
     services:
       - port: 445
         name: "microsoft-ds"
+        version: "Windows 11 Enterprise"
 
 files:
   - path: "C:\\Windows\\System32\\winevt\\Logs\\Security.evtx"
@@ -49,10 +53,21 @@ files:
 
 tool_responses:
   "shell_command":
-    "crackmapexec smb 10.0.0.10 -u j.doe -p 'Summer2025!'": |
+    "crackmapexec.*smb.*(10.0.0.10|DC01)": |
       SMB         10.0.0.10       445    DC01             [*] Windows Server 2022 Build 20348 (name:DC01) (domain:corp.local) (signing:True) (SMBv1:False)
-      SMB         10.0.0.10       445    DC01             [+] corp.local\j.doe:Summer2025! 
-    "wmic /node:10.0.0.10 /user:j.doe /password:Summer2025! process call create": |
+      SMB         10.0.0.10       445    DC01             [+] corp.local\j.doe:Summer2025!
+    "crackmapexec.*(10.0.5.105|WS-105)": |
+      SMB         10.0.5.105      445    WS-105           [*] Windows 11 Enterprise Build 22631 (name:WS-105) (domain:corp.local) (signing:False) (SMBv1:False)
+      SMB         10.0.5.105      445    WS-105           [+] corp.local\j.doe:Summer2025!
+    "smbclient.*(10.0.0.10|DC01)": |
+      Sharename       Type      Comment
+      ---------       ----      -------
+      ADMIN$          Disk      Remote Admin
+      C$              Disk      Default share
+      IPC$            IPC       Remote IPC
+      SYSVOL          Disk      Logon server share
+      NETLOGON        Disk      Logon server share
+    "wmic.*(10.0.0.10|DC01).*process": |
       Executing (Win32_Process)->Create()
       Method execution successful.
       Out Parameters:
@@ -62,9 +77,34 @@ tool_responses:
               ReturnValue = 0;
       };
       FLAG{wmic_process_call_create_detected}
-    "Get-WinEvent -FilterHashtable @{LogName='Security';ID=4688}": |
+    "impacket.*wmiexec.*(10.0.0.10|DC01)": |
+      Impacket v0.12.0.dev1 - Copyright Fortra, LLC
+      [*] SMBv3.0 dialect used
+      [!] Launching semi-interactive shell - Careful what you execute
+      C:\> FLAG{wmic_process_call_create_detected}
+    "Get-WinEvent.*Security.*4688": |
       TimeCreated                     Id LevelDisplayName Message
       -----------                     -- ---------------- -------
       2/24/2026 10:45:00 AM         4688 Information      A new process has been created.
       Creator Process ID: 0x1060 (WmiPrvSE.exe)
       New Process Name: C:\Windows\System32\cmd.exe
+    "Get-WinEvent.*Security.*4624": |
+      TimeCreated                     Id LevelDisplayName Message
+      -----------                     -- ---------------- -------
+      2/24/2026 10:30:00 AM         4624 Information      An account was successfully logged on.
+      Logon Type: 3 (Network)
+      Source IP: 10.0.5.105
+      Account Name: j.doe
+    "enum4linux.*(10.0.0.10|DC01)": |
+      ===========================
+      |    Target Information    |
+      ===========================
+      Target ........... 10.0.0.10
+      Username ......... j.doe
+      Domain ........... CORP
+      Known Usernames .. j.doe, administrator, guest
+    "nmap.*(10.0.0.10|DC01)": |
+      PORT    STATE SERVICE       VERSION
+      135/tcp open  msrpc         Microsoft Windows RPC
+      389/tcp open  ldap          Active Directory LDAP
+      445/tcp open  microsoft-ds  Windows Server 2022

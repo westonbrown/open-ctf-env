@@ -751,22 +751,24 @@ class TestBuildSkyrlConfig:
         # native_tool_schemas flag should be in generator for env propagation
         assert result["generator"]["native_tool_schemas"] is True
 
-    def test_native_tool_schemas_enabled_with_custom_template(self, config):
-        """With custom chat_template, tools should STILL be auto-injected.
+    def test_native_tool_schemas_auto_downgraded_with_custom_template(self, config):
+        """With custom chat_template, native_tool_schemas auto-downgrades to False.
 
-        native_tool_schemas now defaults to True regardless of whether a
-        custom chat_template is set (e.g. qwen3_without_thinking for Qwen3.5).
-        Models with native tool support need schemas injected via the
-        tokenizer even when using a custom template variant.
+        SkyRL's custom templates (qwen3_without_thinking, qwen3_with_thinking)
+        do NOT have a {% if tools %} block.  Passing tools via
+        chat_template_kwargs would silently drop them.  The guard in runtime.py
+        auto-downgrades to native_tool_schemas=False so the env uses text
+        injection via _inject_tool_schemas() instead.  See Issue #38.
         """
         cfg = json.loads(json.dumps(config))
         cfg["online_rl"]["chat_template"] = "qwen3_without_thinking"
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         kwargs = result["generator"]["chat_template_kwargs"]
-        assert "tools" in kwargs, (
-            "Custom chat_template should NOT disable native tool schema injection"
+        assert "tools" not in kwargs, (
+            "Custom chat_template should auto-downgrade native_tool_schemas "
+            "— tools must NOT be in chat_template_kwargs (template ignores them)"
         )
-        assert result["generator"]["native_tool_schemas"] is True
+        assert result["generator"]["native_tool_schemas"] is False
 
     def test_native_tool_schemas_explicit_override(self, config):
         """Explicit native_tool_schemas=false should skip injection."""

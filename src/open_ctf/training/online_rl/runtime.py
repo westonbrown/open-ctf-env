@@ -1549,20 +1549,31 @@ def _build_skyrl_config(
     chat_template_kwargs = online_rl_cfg.get("chat_template_kwargs", {})
 
     # --- Native tool schema injection via chat_template_kwargs ---------
-    # Most modern tokenizers (ChatML, Qwen, Llama) have a
-    # {%- if tools %} block that formats tool schemas natively.
-    # By adding tools= to chat_template_kwargs, SkyRL spreads them into
-    # every apply_chat_template() call, producing model-native tool format
-    # instead of our manual text injection (_inject_tool_schemas).
+    # When True, tools are passed as chat_template_kwargs["tools"] so the
+    # tokenizer's Jinja2 template formats them natively (e.g. Qwen3.5's
+    # native template renders qwen3_coder XML with format instructions).
     #
-    # Default True: even when a custom chat_template is set (e.g.
-    # "qwen3_without_thinking" for Qwen3.5), native tool schemas should
-    # still be injected.  Set native_tool_schemas: false explicitly to
-    # disable.  See SkyRL's skyrl_gym_generator.py where
-    # **self.generator_cfg.chat_template_kwargs is spread into 5/6 calls.
+    # IMPORTANT: SkyRL's custom chat templates (qwen3_without_thinking,
+    # qwen3_with_thinking) do NOT have a {% if tools %} block — they
+    # silently ignore the tools= kwarg.  When a custom template is in use,
+    # we MUST fall back to text injection via _inject_tool_schemas() in
+    # OpenCTFTextEnv.init().  This guard auto-downgrades to avoid the
+    # silent tool-drop bug (Issue #38).
     native_tool_schemas = bool(
         online_rl_cfg.get("native_tool_schemas", True)
     )
+    if native_tool_schemas and chat_template_name:
+        # SkyRL custom templates (qwen3_without_thinking, qwen3_with_thinking)
+        # don't handle tools= kwarg.  Auto-downgrade to text injection.
+        logger.warning(
+            "native_tool_schemas=True but custom chat_template=%r is set. "
+            "SkyRL custom templates do NOT have {%% if tools %%} — tools "
+            "would be silently dropped.  Auto-downgrading to "
+            "native_tool_schemas=False (text injection via "
+            "_inject_tool_schemas).  [Issue #38]",
+            chat_template_name,
+        )
+        native_tool_schemas = False
     if native_tool_schemas and "tools" not in chat_template_kwargs:
         from open_ctf.formatters.tool_registry import get_runtime_tools
         chat_template_kwargs = dict(chat_template_kwargs)  # avoid mutating config
