@@ -120,7 +120,9 @@ data/**/*.csv
 data/archive/
 !data/.gitkeep
 !data/README.md
-!data/dataset_info.json
+!data/sft_v6.jsonl
+!data/online_rl_quality.jsonl
+!data/online_rl_quality.jsonl.manifest.json
 
 checkpoints/
 *.ckpt
