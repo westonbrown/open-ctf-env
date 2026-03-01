@@ -6,9 +6,9 @@ This folder contains the curated datasets used by the training pipeline.
 
 | File | Purpose |
 |---|---|
-| `sft_quality.jsonl` | Stage-1 supervised fine-tuning traces (high-quality solved trajectories). |
+| `sft_v6.jsonl` | Stage-1 supervised fine-tuning traces (high-quality solved trajectories). |
 | `online_rl_quality.jsonl` | Stage-2 online RL seed tasks (challenge prompts + metadata + `ground_truth_flag`). |
-| `dataset_info.json` | SFT dataset registration metadata. |
+| `online_rl_quality.jsonl.manifest.json` | Manifest for online RL metadata containing dataset fingerprints. |
 
 ## What `online_rl_quality.jsonl` Is For
 
