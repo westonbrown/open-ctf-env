@@ -17,7 +17,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .base import ModelFormatter
-from .tool_registry import BOXPWNR_TOOLS
+from .tool_registry import AGENT_TOOLS
 
 
 class DevstralFormatter(ModelFormatter):
@@ -47,7 +47,7 @@ class DevstralFormatter(ModelFormatter):
                 cleaned,
                 tokenize=False,
                 add_generation_prompt=False,
-                tools=[t["function"] for t in BOXPWNR_TOOLS],
+                tools=[t["function"] for t in AGENT_TOOLS],
             )
 
         # Manual rendering.
@@ -102,7 +102,7 @@ class DevstralFormatter(ModelFormatter):
         Mistral models accept the standard schema when served via vLLM
         with ``--tool-call-parser mistral``.
         """
-        return list(BOXPWNR_TOOLS)
+        return list(AGENT_TOOLS)
 
     # ── Helpers ───────────────────────────────────────────────────────
 

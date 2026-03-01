@@ -376,6 +376,10 @@ def train_sft(
         # Evaluation
         eval_strategy="steps" if eval_dataset else "no",
         eval_steps=cfg["save_steps"] if eval_dataset else None,
+        # Liger Kernel: fused cross-entropy avoids materializing full
+        # vocab_size×seq_len float32 logits tensor. Critical for large-vocab
+        # models (Nanbeige 166K vocab at 131K ctx = 82GB float32 logits OOM).
+        use_liger_kernel=cfg.get("use_liger_kernel", True),
     )
 
     if resume_from:

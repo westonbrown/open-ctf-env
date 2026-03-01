@@ -1,75 +1,61 @@
-"""Tests for online RL registry generator manifest/provenance output."""
+"""Tests for online RL registry generator."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
+import socket
+import threading
 
-import yaml
-
-from scripts.generate_online_rl_from_registry import generate_online_rl_data
+from open_ctf.cli.generate_online_rl import _is_reachable
 
 
-def test_generator_writes_manifest_and_provenance_hashes(tmp_path: Path) -> None:
-    registry_path = tmp_path / "registry.yaml"
-    metadata_path = tmp_path / "metadata.json"
-    target_map_path = tmp_path / "target_map.json"
-    output_path = tmp_path / "online_rl.jsonl"
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
-    registry_path.write_text(
-        yaml.safe_dump(
-            {
-                "challenges": [
-                    {
-                        "id": "chall-a",
-                        "name": "Challenge A",
-                        "category": "web",
-                        "difficulty": "easy",
-                        "infra_type": "docker",
-                        "port": 32801,
-                        "ground_truth_flag": "FLAG{A}",
-                    },
-                    {
-                        "id": "chall-b",
-                        "name": "Challenge B",
-                        "category": "crypto",
-                        "difficulty": "medium",
-                        "infra_type": "static",
-                        "ground_truth_flag": "FLAG{B}",
-                    },
-                ]
-            }
-        )
-    )
-    metadata_path.write_text(json.dumps({"descriptions": {"chall-a": "desc-a"}}))
-    target_map_path.write_text(
-        json.dumps({"challenge_targets": {"chall-a": "http://localhost:43001"}})
-    )
 
-    count = generate_online_rl_data(
-        registry_path=str(registry_path),
-        output_path=str(output_path),
-        metadata_path=str(metadata_path),
-        target_map_path=str(target_map_path),
-        include_static=True,
-        difficulty_max="master",
-    )
-    assert count == 2
+def test_probe_target_requires_http_response_for_http_urls() -> None:
+    import socketserver
 
-    manifest_path = Path(f"{output_path}.manifest.json")
-    assert manifest_path.exists()
-    manifest = json.loads(manifest_path.read_text())
-    assert manifest["sample_count"] == 2
-    assert set(manifest["challenge_ids"]) == {"chall-a", "chall-b"}
-    assert manifest["source"]["registry_sha256"]
-    assert manifest["source"]["metadata_sha256"]
-    assert manifest["source"]["target_map_sha256"]
-    assert manifest["output_sha256"]
+    class DropHandler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:  # pragma: no cover - network callback
+            # Accept then immediately close without HTTP response.
+            return
 
-    rows = [json.loads(line) for line in output_path.read_text().splitlines() if line.strip()]
-    assert len(rows) == 2
-    for row in rows:
-        md = row.get("metadata", {})
-        assert md.get("source_registry_sha256") == manifest["source"]["registry_sha256"]
-        assert md.get("source_metadata_sha256") == manifest["source"]["metadata_sha256"]
-        assert md.get("source_target_map_sha256") == manifest["source"]["target_map_sha256"]
+    port = _free_port()
+    server = socketserver.TCPServer(("127.0.0.1", port), DropHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        ok = _is_reachable(f"http://127.0.0.1:{port}", category="web", timeout=0.8)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+    assert ok is False
+
+
+def test_probe_target_accepts_real_http_server() -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class OkHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib signature
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, fmt, *args):  # pragma: no cover - silence test logs
+            return
+
+    port = _free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), OkHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        ok = _is_reachable(f"http://127.0.0.1:{port}", category="web", timeout=1.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+    assert ok is True

@@ -11,30 +11,7 @@ Validates parse_tool_calls() across all supported formats:
 import pytest
 
 
-def _import_parse_tool_calls():
-    """Import parse_tool_calls without triggering class definition errors.
-
-    The OpenCTFTextEnv class in openctf_env.py may have a missing Tuple import
-    (pre-existing bug tracked by grpo-auditor). We work around this by patching
-    the missing name before importing.
-    """
-    import typing
-    import open_ctf.envs.skyrl.openctf_env as mod
-    # If Tuple is not in the module's namespace (missing import), inject it
-    if not hasattr(mod, "Tuple"):
-        mod.Tuple = typing.Tuple
-    # Re-import to get parse_tool_calls
-    from open_ctf.envs.skyrl.openctf_env import parse_tool_calls
-    return parse_tool_calls
-
-
-# parse_tool_calls is a module-level function defined before the class,
-# but importing the module triggers the class definition which uses Tuple.
-# Fix: add Tuple to typing imports at module scope via the workaround above.
-try:
-    from open_ctf.envs.skyrl.openctf_env import parse_tool_calls
-except NameError:
-    parse_tool_calls = _import_parse_tool_calls()
+from open_ctf.parsing import parse_tool_calls
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +160,21 @@ class TestPythonStyleFormat:
         assert calls[0]["name"] == "read_file"
         assert calls[0]["arguments"]["file_path"] == "/root/challenge/index.php"
 
+    def test_inline_call_inside_prose(self):
+        text = (
+            "First I will probe the target. Use this next: "
+            'shell_command(command="curl -s http://localhost:43010").'
+        )
+        calls = parse_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0]["name"] == "shell_command"
+        assert calls[0]["arguments"]["command"] == "curl -s http://localhost:43010"
+
+    def test_placeholder_call_is_ignored(self):
+        text = 'For web challenges start with shell_command(command="curl -s <target_url>").'
+        calls = parse_tool_calls(text)
+        assert calls == []
+
 
 # ---------------------------------------------------------------------------
 # Plain text (no tool calls)
@@ -222,3 +214,39 @@ Also has bare JSON: {"name": "read_file", "arguments": {"path": "/tmp"}}'''
         # Hermes should be returned, bare JSON should be ignored
         assert len(calls) == 1
         assert calls[0]["arguments"]["command"] == "from_hermes"
+
+
+# ---------------------------------------------------------------------------
+# Native tool schema integration
+# ---------------------------------------------------------------------------
+
+
+class TestNativeToolSchemas:
+    """Verify native_tool_schemas flag skips _inject_tool_schemas()."""
+
+    def test_native_flag_skips_text_injection(self):
+        """When native_tool_schemas=True, _inject_tool_schemas is skipped."""
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+
+        env = OpenCTFTextEnv(target="http://localhost:8000", native_tool_schemas=True)
+        prompt = [{"role": "system", "content": "You are a CTF agent."}]
+        result = env.init(prompt)
+        injected = result[0] if isinstance(result, tuple) else result
+        # System message should NOT have "# Available Tools" injected
+        sys_content = injected[0]["content"]
+        assert "# Available Tools" not in sys_content, (
+            "native_tool_schemas=True should skip _inject_tool_schemas()"
+        )
+
+    def test_default_flag_injects_text(self):
+        """Default (native_tool_schemas=False) still injects tool schemas."""
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+
+        env = OpenCTFTextEnv(target="http://localhost:8000")
+        prompt = [{"role": "system", "content": "You are a CTF agent."}]
+        result = env.init(prompt)
+        injected = result[0] if isinstance(result, tuple) else result
+        sys_content = injected[0]["content"]
+        assert "# Available Tools" in sys_content, (
+            "Default should inject tool schemas via _inject_tool_schemas()"
+        )

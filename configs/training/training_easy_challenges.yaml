@@ -1,0 +1,210 @@
+# Easy Challenges GRPO Training Configuration — v4 (RunPod Tunnel + Long Context)
+# ======================================================================
+# Purpose: Online RL on Very Easy + Easy CyBench challenges for reliable flag capture.
+#
+# v4 changes (RunPod tunnel profile + long-context settings):
+#   - target_host_override: "127.0.0.1" (DGX challenge tunnels are bound on loopback)
+#   - max_prompt_length/max_completion_length raised to 12288
+#   - vllm_max_model_len raised to 32768
+#   - max_tool_calling_iterations raised to 60
+#   - max_num_seqs set to 12, max_num_batched_tokens set to 65536
+#
+# v2 changes (fix response-length collapse observed in v1):
+#   - efficiency_weight: 0.15 -> 0.0 (was rewarding shorter responses, causing collapse)
+#   - noise_range: 0.01 -> 0.10 (10x increase for meaningful RLOO advantages)
+#   - zero_variance_filter: true -> false (force gradient even with similar rewards)
+#   - use_entropy_loss: NEW true (prevent peaked distribution collapse)
+#   - entropy_loss_coef: NEW 0.05 (penalize deterministic policy)
+#   - beta: 0.0 -> 0.01 (mild KL anchor against collapse)
+#   - repetition_penalty: 1.05 -> 1.0 (don't suppress repeated exploration commands)
+#   - drop_static_challenges: false -> true (TCP challenges need netcat, model can't solve)
+#   - max_tool_calling_iterations: 20 -> 30 (more room for exploration)
+#   - max_samples_per_challenge: 2 -> 1 (with fewer challenges, avoid oversampling)
+#
+# Root cause of v1 collapse:
+#   1. efficiency_weight=0.15 rewarded 1-step episodes over multi-step exploration
+#   2. use_entropy_loss=False (hardcoded) allowed policy to collapse to deterministic
+#   3. noise_range=0.01 too small for meaningful advantages (~0.005 gap)
+#   4. zero_variance_filter killed all gradient when rewards were near-identical
+#   5. beta=0.0 gave no KL anchor to prevent drift to degenerate policy
+#   6. 3/6 challenges were TCP (socat), unsolvable via curl
+#
+# Hardware targets:
+#   - DGX Spark GB10 (120GB): Nanbeige4.1-3B in external vLLM server mode
+#   - RunPod B200 (183GB): Qwen3.5-27B in server mode (2 GPUs)
+#
+# Usage:
+#   open-ctf-train rl \
+#       --model outputs/sft-merged \
+#       --data data/online_rl_quality.jsonl \
+#       --config configs/training/training_easy_challenges.yaml \
+#       --challenge-registry configs/challenges/cybench.yaml \
+#       --output outputs/online_rl-easy-v2
+
+model:
+  name: "Nanbeige/Nanbeige4.1-3B"
+  # H200 profile: allow longer retained context from multi-turn tool trajectories.
+  max_seq_length: 24576
+  load_in_4bit: false
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+online_rl:
+  epochs: 5
+  batch_size: 1
+
+  # batch(1) * accum(4) = 4, divisible by num_gen(4): 4 % 4 = 0
+  gradient_accumulation_steps: 4
+
+  # 1e-6: matches OpenThoughts-Agent production (their standard for RL).
+  learning_rate: 1.0e-6
+  warmup_ratio: 0.05
+
+  # v2: Mild KL anchor to prevent unconstrained policy collapse.
+  # v1 had beta=0.0 which allowed the model to drift to a degenerate policy.
+  beta: 0.01
+  loss_type: dapo
+
+  # 4 generations per prompt. RLOO baseline from 3 other samples.
+  num_generations: 4
+  advantage_estimator: rloo
+
+  # H200 profile (3B model): increased generation/context headroom.
+  max_completion_length: 12288
+  max_prompt_length: 12288
+  # Keep above prompt + completion with margin for templates/tool traces.
+  vllm_max_model_len: 32768
+
+  # Long-horizon baseline for BoxPwnr-style challenge runs.
+  max_tool_calling_iterations: 60
+
+  max_grad_norm: 0.5
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+
+  # v2: No repetition penalty (was 1.05). Repeated curl commands to different
+  # endpoints are valid CTF behavior, not degenerate repetition.
+  repetition_penalty: 1.0
+
+  # Only Very Easy + Easy challenges for reliable reward signal.
+  difficulty_max: "easy"
+
+  drop_static_challenges: false
+
+  # v2: Exclude TCP/socat challenges that need netcat (model only knows curl).
+  # These are docker challenges but use socat, not HTTP. The model gets
+  # zero useful feedback from them (curl returns 000, empty response).
+  exclude_challenge_ids:
+    - "[Easy] Unbreakable"
+    - "eval-me"
+    - "skilift"
+
+  # v2: 1 sample per challenge (was 2). With only 3 HTTP challenges,
+  # 2 samples each = 6 prompt groups. 1 sample = 3 groups.
+  # Fewer groups means more diversity per epoch.
+  max_samples_per_challenge: 1
+
+  # RunPod tunnel profile: challenge forwards are bound on loopback (127.0.0.1:328xx).
+  # Use loopback rewrite so prompts with localhost resolve through active SSH tunnels.
+  target_host_override: "127.0.0.1"
+
+  # Use canonical registry targets.
+  prefer_registry_target: true
+  fail_on_flag_mismatch: true
+  fail_on_missing_registry_flag: true
+  require_all_registry_challenges: false
+  drop_unresolved_registry_samples: true
+
+  # Thinking mode (Nanbeige / Qwen3.5 compatible)
+  chat_template_kwargs:
+    keep_all_think: false
+
+  # v2: DISABLE zero-variance filter. Force gradient computation even when
+  # all 4 generations get similar rewards. With noise_range=0.10, rewards
+  # should have variance, but the filter was too aggressive in v1.
+  zero_variance_filter: false
+  step_wise_trajectories: true
+  agent_class: open_ctf.agent.default_agent.DefaultStepAgent
+
+  # v2: Enable entropy loss to prevent policy collapse to deterministic output.
+  # v1 had use_entropy_loss=False (hardcoded!) which allowed the model to
+  # converge to a peaked distribution producing identical 16-token responses.
+  use_entropy_loss: true
+  entropy_loss_coef: 0.05
+
+  agent_kwargs:
+    max_consecutive_no_tool_calls: 3
+    max_tool_response_chars: 2000
+    # Generic framework runtime bridge; BoxPwnr is the default framework.
+    runtime_cmd: "python src/open_ctf/agent/framework_runtime_bridge.py"
+    runtime_timeout_seconds: 20
+    runtime_passthrough: false
+    runtime_fallback_to_parser: false
+    runtime_env:
+      OPEN_CTF_AGENT_FRAMEWORK: "boxpwnr_langgraph"
+      OPEN_CTF_AGENT_MODE: "tool_calls"
+
+  # External vLLM server mode
+  use_vllm: true
+  vllm_mode: server
+  vllm_server_url: "http://localhost:18001"
+  allow_remote_lora: true
+  # Dedicated generation GPU on 2xH200 runs.
+  gpu_memory_utilization: 0.80
+  # Reduce seq concurrency as context grows to keep KV cache stable.
+  max_num_seqs: 12
+  max_num_batched_tokens: 65536
+  flash_attn: false
+  use_sample_packing: false
+
+reward:
+  # Flag-dominant reward.
+  flag_weight: 0.40
+
+  # v2: ZERO efficiency weight (was 0.15). Efficiency reward = min(optimal/actual, 1.0)
+  # which gives maximum reward for 1-step episodes. This directly caused the collapse:
+  # model learned that 1 tool call = maximum efficiency score.
+  # When flag capture rate is 0%, efficiency is counterproductive.
+  efficiency_weight: 0.0
+
+  # v3: Redistribute efficiency_weight (0.15->0.0) across other 7 weights.
+  # 8 primary weights must sum to 1.0 (interaction_quality is additive bonus).
+  # flag=0.40 + prog=0.15 + expl=0.12 + uniq=0.05 + fmt=0.10 + rec=0.10 + cog=0.08 = 1.00
+  progression_weight: 0.15
+  exploration_weight: 0.12
+  uniqueness_weight: 0.05
+  format_weight: 0.10
+  recovery_weight: 0.10
+  cognitive_weight: 0.08
+  hallucination_penalty: 0.20
+  interaction_quality_weight: 0.10
+
+  # v2: 10x noise (was 0.01). With base rewards ~0.02-0.10, noise of ±0.10
+  # creates RLOO advantages of ~0.05-0.10 — enough for meaningful gradient.
+  # v1's ±0.01 noise produced ~0.005 advantages that were numerically zero.
+  noise_range: 0.10
+
+  exploration_gamma: 0.95
+  use_gdpo: false
+
+output:
+  save_steps: 5
+  logging_steps: 1
+  report_to: tensorboard
+
+online_rl_logging:
+  enable_trajectory_logging: true

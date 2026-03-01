@@ -1,9 +1,9 @@
 """Smoke tests for DatasetSplitter.
 
 Validates:
-- SFT/GRPO split logic (success → SFT, all → GRPO)
-- GRPO records have ground_truth_flag cross-referenced
-- Token length filtering for GRPO
+- SFT/online-RL split logic (success → SFT, all → online RL)
+- Online RL records have ground_truth_flag cross-referenced
+- Token length filtering for online RL
 - Optimal steps computation (min across successful traces)
 - Chat-command normalization during split
 """
@@ -92,10 +92,10 @@ def input_jsonl(tmp_path) -> Path:
 class TestDatasetSplitter:
     def test_sft_only_successes(self, input_jsonl, tmp_path):
         sft_path = str(tmp_path / "sft.jsonl")
-        grpo_path = str(tmp_path / "grpo.jsonl")
+        online_rl_path = str(tmp_path / "online_rl.jsonl")
 
         splitter = DatasetSplitter()
-        stats = splitter.split(str(input_jsonl), sft_path, grpo_path)
+        stats = splitter.split(str(input_jsonl), sft_path, online_rl_path)
 
         # SFT should have only successful traces
         assert stats["sft_count"] == 3  # 3 successes
@@ -105,35 +105,35 @@ class TestDatasetSplitter:
         for r in sft_records:
             assert r["metadata"]["success"] is True
 
-    def test_grpo_has_all_traces(self, input_jsonl, tmp_path):
+    def test_online_rl_has_all_traces(self, input_jsonl, tmp_path):
         sft_path = str(tmp_path / "sft.jsonl")
-        grpo_path = str(tmp_path / "grpo.jsonl")
+        online_rl_path = str(tmp_path / "online_rl.jsonl")
 
         splitter = DatasetSplitter()
-        stats = splitter.split(str(input_jsonl), sft_path, grpo_path)
+        stats = splitter.split(str(input_jsonl), sft_path, online_rl_path)
 
-        # GRPO should have all traces (within token limit)
-        assert stats["grpo_count"] == 5
+        # Online RL should have all traces (within token limit)
+        assert stats["online_rl_count"] == 5
 
-    def test_grpo_records_have_ground_truth_flag(self, input_jsonl, tmp_path):
+    def test_online_rl_records_have_ground_truth_flag(self, input_jsonl, tmp_path):
         sft_path = str(tmp_path / "sft.jsonl")
-        grpo_path = str(tmp_path / "grpo.jsonl")
+        online_rl_path = str(tmp_path / "online_rl.jsonl")
 
         splitter = DatasetSplitter()
-        splitter.split(str(input_jsonl), sft_path, grpo_path)
+        splitter.split(str(input_jsonl), sft_path, online_rl_path)
 
-        with open(grpo_path) as f:
-            grpo_records = [json.loads(line) for line in f if line.strip()]
+        with open(online_rl_path) as f:
+            online_rl_records = [json.loads(line) for line in f if line.strip()]
 
-        # All GRPO records for challenges with successful siblings should
+        # All online-RL records for challenges with successful siblings should
         # have ground_truth_flag cross-referenced
-        for r in grpo_records:
+        for r in online_rl_records:
             assert r.get("ground_truth_flag") is not None, (
-                f"GRPO record for {r['metadata']['challenge']} missing ground_truth_flag"
+                f"online-RL record for {r['metadata']['challenge']} missing ground_truth_flag"
             )
 
     def test_token_filtering(self, tmp_path):
-        """Records exceeding max_grpo_tokens should be filtered out."""
+        """Records exceeding max_online_rl_tokens should be filtered out."""
         # Create a record with very large content
         large = _make_trace("p", "c", True, "FLAG{x}", num_assistant_turns=3, content_size=200000)
         small = _make_trace("p", "c", True, "FLAG{x}", num_assistant_turns=2, content_size=50)
@@ -144,28 +144,28 @@ class TestDatasetSplitter:
             f.write(json.dumps(small) + "\n")
 
         sft_path = str(tmp_path / "sft.jsonl")
-        grpo_path = str(tmp_path / "grpo.jsonl")
+        online_rl_path = str(tmp_path / "online_rl.jsonl")
 
-        splitter = DatasetSplitter(max_grpo_tokens=1000)
-        stats = splitter.split(str(path), sft_path, grpo_path)
+        splitter = DatasetSplitter(max_online_rl_tokens=1000)
+        stats = splitter.split(str(path), sft_path, online_rl_path)
 
         # Large record filtered, small kept
-        assert stats["grpo_filtered"] >= 1
-        assert stats["grpo_count"] >= 1
+        assert stats["online_rl_filtered"] >= 1
+        assert stats["online_rl_count"] >= 1
 
     def test_optimal_steps_cross_referenced(self, input_jsonl, tmp_path):
         """optimal_steps should be min across successful traces per challenge."""
         sft_path = str(tmp_path / "sft.jsonl")
-        grpo_path = str(tmp_path / "grpo.jsonl")
+        online_rl_path = str(tmp_path / "online_rl.jsonl")
 
         splitter = DatasetSplitter()
-        splitter.split(str(input_jsonl), sft_path, grpo_path)
+        splitter.split(str(input_jsonl), sft_path, online_rl_path)
 
-        with open(grpo_path) as f:
-            grpo_records = [json.loads(line) for line in f if line.strip()]
+        with open(online_rl_path) as f:
+            online_rl_records = [json.loads(line) for line in f if line.strip()]
 
         # For web-1: two successes with 5 and 3 assistant turns → optimal = 3
-        web1_records = [r for r in grpo_records if r["metadata"]["challenge"] == "web-1"]
+        web1_records = [r for r in online_rl_records if r["metadata"]["challenge"] == "web-1"]
         for r in web1_records:
             assert r["optimal_steps"] == 3, (
                 f"Expected optimal_steps=3 for web-1, got {r['optimal_steps']}"
@@ -173,15 +173,17 @@ class TestDatasetSplitter:
 
     def test_stats_summary(self, input_jsonl, tmp_path):
         sft_path = str(tmp_path / "sft.jsonl")
-        grpo_path = str(tmp_path / "grpo.jsonl")
+        online_rl_path = str(tmp_path / "online_rl.jsonl")
 
         splitter = DatasetSplitter()
-        stats = splitter.split(str(input_jsonl), sft_path, grpo_path)
+        stats = splitter.split(str(input_jsonl), sft_path, online_rl_path)
 
         assert "total_input" in stats
         assert "sft_count" in stats
-        assert "grpo_count" in stats
-        assert "grpo_filtered" in stats
+        assert "online_rl_count" in stats
+        assert "online_rl_filtered" in stats
+        assert "online_rl_missing_flag" in stats
+        assert "avg_turns_online_rl" in stats
         assert "tool_distribution" in stats
         assert stats["total_input"] == 5
 

@@ -24,7 +24,7 @@ dataset: open_ctf_sft
 dataset_dir: data
 template: chatml
 tool_format: qwen
-cutoff_len: 32768
+cutoff_len: 65536
 neat_packing: true
 preprocessing_num_workers: 4
 packing: true
@@ -40,7 +40,9 @@ report_to: none
 ### Hyperparameters
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 16
-learning_rate: 2.0e-4
+# 5e-5: with LoRA alpha/r=128/64 (2.0x scaling), effective LR is 1e-4.
+# 2e-4 base was too aggressive — caused catastrophic forgetting in SFT v4.
+learning_rate: 5.0e-5
 num_train_epochs: 5
 lr_scheduler_type: cosine
 warmup_ratio: 0.03

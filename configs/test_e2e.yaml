@@ -37,7 +37,7 @@ sft:
   lr_scheduler_type: cosine
   packing: true
 
-grpo:
+online_rl:
   epochs: 1
   batch_size: 1
   gradient_accumulation_steps: 1

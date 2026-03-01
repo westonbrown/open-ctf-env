@@ -1,6 +1,6 @@
 """Smoke tests for CTFReward function.
 
-Validates the 8-signal reward function:
+Validates the 9-signal reward function:
 - Flag capture (exact match, pattern match, env verification, no match)
 - Efficiency (optimal vs actual steps, gating at <3 steps)
 - Progression (RECON->ENUM->EXPLOIT ordering)
@@ -10,8 +10,9 @@ Validates the 8-signal reward function:
 - Recovery (pivots after stuck runs)
 - Cognitive (words-per-action density)
 - Hallucination penalty (wrong flag submission)
+- Interaction quality (output-aware HTTP progress)
 - Noise (variance guarantee for GRPO)
-- Weight validation (must sum to 1.0)
+- Weight validation (auto-normalizes to sum 1.0)
 """
 
 import json
@@ -68,9 +69,19 @@ class TestConstruction:
         )
         assert abs(total - 1.0) < 1e-6
 
-    def test_invalid_weights_rejected(self):
-        with pytest.raises(ValueError, match="sum to 1.0"):
-            CTFReward(flag_weight=0.5, efficiency_weight=0.5, progression_weight=0.5)
+    def test_invalid_weights_auto_normalized(self):
+        r = CTFReward(flag_weight=0.5, efficiency_weight=0.5, progression_weight=0.5)
+        total = (
+            r.flag_weight
+            + r.efficiency_weight
+            + r.progression_weight
+            + r.exploration_weight
+            + r.uniqueness_weight
+            + r.format_weight
+            + r.recovery_weight
+            + r.cognitive_weight
+        )
+        assert abs(total - 1.0) < 1e-6
 
     def test_custom_weights(self):
         r = CTFReward(
@@ -347,10 +358,38 @@ class TestHallucination:
         assert r._hallucination_score(tool_calls, flag_sc=1.0) == 0.0
 
     def test_wrong_flag_penalty(self, r):
+        """Wrong flag with 1 tool call gets premature multiplier (1.8x)."""
         tool_calls = [_tc("flag_found", {"content": "FLAG{wrong}"})]
         penalty = r._hallucination_score(tool_calls, flag_sc=0.1)
         assert penalty < 0  # Negative
-        assert penalty == -r.hallucination_penalty
+        # 1 tool call → premature_mult = 1.0 + max(0, 1.0 - 1/5) = 1.8
+        expected = -r.hallucination_penalty * 1.8
+        assert penalty == pytest.approx(expected)
+
+    def test_wrong_flag_penalty_many_steps(self, r):
+        """Wrong flag with 5+ tool calls gets no premature multiplier."""
+        tool_calls = [
+            _shell("nmap target"),
+            _shell("curl target/"),
+            _shell("gobuster dir target"),
+            _shell("curl target/admin"),
+            _tc("flag_found", {"content": "FLAG{wrong}"}),
+        ]
+        penalty = r._hallucination_score(tool_calls, flag_sc=0.1)
+        assert penalty < 0
+        # 5 tool calls → premature_mult = 1.0 + max(0, 1.0 - 5/5) = 1.0
+        assert penalty == pytest.approx(-r.hallucination_penalty)
+
+    def test_premature_hallucination_two_steps(self, r):
+        """Wrong flag with 2 tool calls gets 1.6x multiplier."""
+        tool_calls = [
+            _shell("curl target/"),
+            _tc("flag_found", {"content": "FLAG{wrong}"}),
+        ]
+        penalty = r._hallucination_score(tool_calls, flag_sc=0.1)
+        # 2 tool calls → premature_mult = 1.0 + max(0, 1.0 - 2/5) = 1.6
+        expected = -r.hallucination_penalty * 1.6
+        assert penalty == pytest.approx(expected)
 
     def test_no_flag_submission_no_penalty(self, r):
         tool_calls = [_shell("nmap target")]
@@ -416,3 +455,165 @@ class TestCallIntegration:
         assert isinstance(scores[0], float)
 
 
+# ---------------------------------------------------------------------------
+# Minimum work gate (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+class TestMinimumWorkGate:
+    """Tests that short episodes have capped process rewards."""
+
+    @pytest.fixture
+    def r(self):
+        return CTFReward(noise_range=0.0, seed=0)
+
+    def test_single_tool_call_caps_format(self, r):
+        """One tool call should cap format score at 0.3."""
+        tool_calls = [_tc("shell_command", {"command": "ls"})]
+        # Normally a valid known tool gets format=1.0
+        raw_fmt = r._format_score(tool_calls)
+        assert raw_fmt == 1.0
+
+        # But in _score_one, it gets capped.
+        completion = _completion_with_tools(tool_calls, text="checking files")
+        _, breakdown = r.compute_with_breakdown([completion])[0]
+        # The format signal should be capped:
+        # fmt_sc capped to 0.3, then info_density = max(uniq_sc, 0.5)
+        # where uniq_sc is also capped to 0.3 → info_density = 0.5
+        # fmt_effective = 0.3 * 0.5 = 0.15
+        assert breakdown["format"] <= 0.3 * 0.5 + 0.01
+
+    def test_two_tool_calls_caps_scores(self, r):
+        """Two tool calls still gets capped."""
+        tool_calls = [_shell("nmap target"), _shell("curl target/")]
+        completion = _completion_with_tools(tool_calls, text="scanning and enumerating")
+        _, breakdown = r.compute_with_breakdown([completion])[0]
+        # Recovery is normally 0.5 (neutral for < 3 calls)
+        # But capped at 0.3
+        assert breakdown["recovery"] <= 0.3
+
+    def test_three_tool_calls_not_capped(self, r):
+        """Three tool calls should NOT be capped."""
+        tool_calls = [
+            _shell("nmap target"),
+            _shell("curl target/"),
+            _tc("python_code", {"code": "exploit()"}),
+        ]
+        # All 3 are unique and valid → format = 1.0, uniqueness = 1.0
+        raw_fmt = r._format_score(tool_calls)
+        assert raw_fmt == 1.0
+        raw_uniq = r._uniqueness_score(tool_calls)
+        assert raw_uniq == 1.0
+
+        # Not capped with 3+ calls
+        completion = _completion_with_tools(
+            tool_calls,
+            text="Performing reconnaissance scan then enumerating endpoints and writing exploit",
+        )
+        _, breakdown = r.compute_with_breakdown([completion])[0]
+        # format = fmt_sc * info_density = 1.0 * max(1.0, 0.5) = 1.0
+        assert breakdown["format"] > 0.3
+
+    def test_short_episode_total_lower(self, r):
+        """A 1-step hallucinated flag should score much worse than a 15-step exploration."""
+        # 1-step hallucination: submits wrong flag immediately
+        bad_calls = [_tc("flag_found", {"content": "FLAG{guessed}"})]
+        bad_completion = _completion_with_tools(
+            bad_calls, text="FLAG{guessed}"
+        )
+        bad_score = r([bad_completion], ground_truth_flag=["FLAG{real}"])[0]
+
+        # 15-step exploration: uses many tools productively
+        good_calls = [
+            _shell("nmap -sV target"),
+            _shell("curl http://target/"),
+            _shell("gobuster dir -u http://target/ -w list.txt"),
+            _shell("curl http://target/admin"),
+            _shell("curl http://target/api/v1"),
+            _tc("python_code", {"code": "import requests"}),
+            _shell("curl http://target/login"),
+            _shell("curl http://target/dashboard"),
+            _shell("curl -X POST http://target/login -d user=admin"),
+            _shell("curl http://target/api/users"),
+            _shell("curl http://target/config"),
+            _shell("curl http://target/robots.txt"),
+            _shell("curl http://target/sitemap.xml"),
+            _shell("curl http://target/.env"),
+            _shell("curl http://target/api/status"),
+        ]
+        good_completion = _completion_with_tools(
+            good_calls,
+            text=(
+                "I am systematically exploring this web application. "
+                "First I need to scan for open ports and services. "
+                "Then I will enumerate endpoints and check for misconfigurations. "
+                "Let me also test for common API endpoints and configuration files."
+            ),
+        )
+        good_score = r([good_completion], ground_truth_flag=["FLAG{real}"])[0]
+
+        assert good_score > bad_score, (
+            f"15-step exploration ({good_score:.3f}) should beat "
+            f"1-step hallucination ({bad_score:.3f})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Premature hallucination penalty (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+class TestPrematureHallucinationPenalty:
+    """Verify that the premature submission multiplier works correctly."""
+
+    @pytest.fixture
+    def r(self):
+        return CTFReward(noise_range=0.0, seed=0)
+
+    def test_one_step_hallucination_stronger_penalty(self, r):
+        """1-step hallucination should have stronger penalty than 5-step."""
+        # 1 tool call (premature_mult = 1.8)
+        one_step = [_tc("flag_found", {"content": "FLAG{wrong}"})]
+        penalty_1 = r._hallucination_score(one_step, flag_sc=0.1)
+
+        # 5 tool calls (premature_mult = 1.0)
+        five_step = [
+            _shell("nmap target"),
+            _shell("curl target/"),
+            _shell("gobuster dir target"),
+            _shell("curl target/admin"),
+            _tc("flag_found", {"content": "FLAG{wrong}"}),
+        ]
+        penalty_5 = r._hallucination_score(five_step, flag_sc=0.1)
+
+        # 1-step penalty should be stronger (more negative)
+        assert penalty_1 < penalty_5
+        assert penalty_1 == pytest.approx(-0.20 * 1.8)
+        assert penalty_5 == pytest.approx(-0.20 * 1.0)
+
+    def test_premature_penalty_gradual(self, r):
+        """Penalty multiplier should decrease as tool calls increase."""
+        penalties = []
+        for n_steps in range(1, 7):
+            calls = [_shell(f"cmd_{i}") for i in range(n_steps - 1)]
+            calls.append(_tc("flag_found", {"content": "FLAG{wrong}"}))
+            pen = r._hallucination_score(calls, flag_sc=0.1)
+            penalties.append(pen)
+
+        # Each successive penalty should be less severe (closer to zero)
+        for i in range(len(penalties) - 1):
+            assert penalties[i] <= penalties[i + 1], (
+                f"Penalty at {i+1} steps ({penalties[i]}) should be "
+                f"<= penalty at {i+2} steps ({penalties[i+1]})"
+            )
+
+    def test_similarity_decay_still_works_with_premature(self, r):
+        """Near-correct flag still gets 90% decay on top of premature multiplier."""
+        # 1 tool call, near-correct flag
+        calls = [_tc("flag_found", {"content": "FLAG{almost_correct}"})]
+        penalty = r._hallucination_score(
+            calls, flag_sc=0.1, ground_truth="FLAG{almost_correct_x}"
+        )
+        # premature_mult = 1.8, similarity > 0.8 → penalty *= 0.1
+        expected = -0.20 * 1.8 * 0.1
+        assert penalty == pytest.approx(expected, abs=0.01)

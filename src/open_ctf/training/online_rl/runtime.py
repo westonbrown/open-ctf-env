@@ -1,8 +1,8 @@
 """SkyRL-backed stage-2 online RL implementation.
 
-This module keeps the legacy GRPO name for compatibility, but functionally it
-is the online-RL pipeline orchestrator: dataset conversion, SkyRL config build,
-env registration, and trainer launch. Algorithm choice (GRPO/RLOO/etc) is
+This module is the online-RL pipeline orchestrator: dataset conversion,
+SkyRL config build, env registration, and trainer launch.
+Algorithm choice (GRPO/RLOO/etc) is
 configured via ``advantage_estimator`` and related settings.
 """
 
@@ -42,19 +42,53 @@ def _as_positive_int(name: str, raw_value: Any, default: int) -> int:
     return value
 
 
+def _as_float(name: str, raw_value: Any, default: float) -> float:
+    """Parse a float config value with warning-backed fallback."""
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; defaulting to %s.", name, raw_value, default)
+        return default
+
+
 def _resolve_online_rl_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Return online RL config, preferring ``online_rl`` over legacy ``grpo``."""
+    """Return canonical ``online_rl`` config section."""
     preferred = config.get("online_rl")
-    legacy = config.get("grpo")
     if isinstance(preferred, dict):
-        if isinstance(legacy, dict):
-            logger.info(
-                "Both config.online_rl and config.grpo are set; using config.online_rl."
-            )
         return preferred
-    if isinstance(legacy, dict):
-        return legacy
     return {}
+
+
+def _resolve_policy_loss_type(online_rl_cfg: Dict[str, Any]) -> str:
+    """Resolve SkyRL ``policy_loss_type`` with backward-compatible aliases.
+
+    Historically configs used ``online_rl.loss_type`` (for example ``dapo``).
+    SkyRL actually consumes ``trainer.algorithm.policy_loss_type``.
+    """
+    raw_policy = online_rl_cfg.get("policy_loss_type")
+    if raw_policy is not None and str(raw_policy).strip():
+        return str(raw_policy).strip()
+
+    raw_legacy = online_rl_cfg.get("loss_type")
+    if raw_legacy is None:
+        return "regular"
+
+    legacy = str(raw_legacy).strip().lower()
+    alias_map = {
+        "dapo": "regular",
+        "grpo": "regular",
+        "ppo": "regular",
+    }
+    mapped = alias_map.get(legacy, legacy)
+    if mapped != legacy:
+        logger.info(
+            "Mapping online_rl.loss_type=%r -> policy_loss_type=%r for SkyRL compatibility.",
+            raw_legacy,
+            mapped,
+        )
+    return mapped
 
 
 def _detect_visible_gpu_count() -> Optional[int]:
@@ -139,7 +173,7 @@ def _missing_qwen3_5_fast_path_deps() -> list[str]:
 
 def _validate_qwen3_5_runtime_dependencies(
     hf_cfg: Any,
-    grpo_cfg: Dict[str, Any],
+    online_rl_cfg: Dict[str, Any],
 ) -> None:
     """Fail fast when Qwen3.5 runtime dependencies are missing."""
     if not _is_qwen3_5_config(hf_cfg):
@@ -156,17 +190,90 @@ def _validate_qwen3_5_runtime_dependencies(
         "`uv sync --extra grpo --frozen` (preferred) or "
         "`pip install --no-deps flash-linear-attention==0.4.1 causal-conv1d==1.6.0`. "
         "Without these libs, Transformers falls back to torch linear-attention "
-        "kernels that are unstable for long-context GRPO."
+        "kernels that are unstable for long-context online RL."
     )
-    strict = bool(grpo_cfg.get("require_fast_linear_attention", True))
+    strict = bool(online_rl_cfg.get("require_fast_linear_attention", True))
     if strict:
         raise RuntimeError(
             msg
-            + " To bypass temporarily, set grpo.require_fast_linear_attention=false "
+            + " To bypass temporarily, set online_rl.require_fast_linear_attention=false "
             "(not recommended for production)."
         )
     logger.warning(
-        "%s Proceeding because grpo.require_fast_linear_attention=false.",
+        "%s Proceeding because online_rl.require_fast_linear_attention=false.",
+        msg,
+    )
+
+
+def _has_step_wise_resp_index_guard(source: str) -> bool:
+    """Return True when SkyRL step-wise reward writes are bounds-guarded.
+
+    We specifically detect the historical crash pattern:
+        per_token_reward[resp_end_idx] = float(reward)
+    without a preceding bounds check, which can raise IndexError.
+    """
+    guarded_patterns = [
+        r"if\s+0\s*<=\s*resp_end_idx\s*<\s*len\(per_token_reward\)\s*:\s*[\r\n]+\s*per_token_reward\[resp_end_idx\]\s*=\s*float\(reward\)",
+        r"per_token_reward\[\s*max\(\s*0\s*,\s*min\(\s*resp_end_idx\s*,\s*len\(per_token_reward\)\s*-\s*1\s*\)\s*\)\s*\]\s*=",
+    ]
+    for pattern in guarded_patterns:
+        if re.search(pattern, source, flags=re.MULTILINE):
+            return True
+
+    # If the bare write isn't present, upstream may have refactored safely.
+    if re.search(r"per_token_reward\[resp_end_idx\]\s*=\s*float\(reward\)", source) is None:
+        return True
+
+    return False
+
+
+def _validate_step_wise_resp_index_guard(
+    online_rl_cfg: Dict[str, Any],
+    step_wise_trajectories: bool,
+) -> None:
+    """Fail fast if SkyRL lacks the step-wise reward index guard patch."""
+    if not step_wise_trajectories:
+        return
+
+    strict = bool(online_rl_cfg.get("require_step_wise_index_guard", True))
+    spec = importlib.util.find_spec("skyrl_train.generators.skyrl_gym_generator")
+    origin = getattr(spec, "origin", None) if spec is not None else None
+    if not origin:
+        logger.warning(
+            "Could not locate skyrl_train.generators.skyrl_gym_generator; "
+            "skipping step-wise index guard validation."
+        )
+        return
+
+    source_path = Path(origin)
+    try:
+        source = source_path.read_text()
+    except Exception as exc:
+        msg = (
+            "Failed to read SkyRL generator source while validating step-wise "
+            f"index guard ({source_path}): {exc}"
+        )
+        if strict:
+            raise RuntimeError(msg) from exc
+        logger.warning(
+            "%s Proceeding because online_rl.require_step_wise_index_guard=false.",
+            msg,
+        )
+        return
+
+    if _has_step_wise_resp_index_guard(source):
+        return
+
+    msg = (
+        "SkyRL step-wise reward index guard is missing. This can crash training "
+        "with IndexError in skyrl_gym_generator.py when resp_end_idx exceeds "
+        "per_token_reward bounds. Apply docker/patches/apply_all_patches.sh "
+        "or set online_rl.require_step_wise_index_guard=false to bypass."
+    )
+    if strict:
+        raise RuntimeError(msg)
+    logger.warning(
+        "%s Proceeding because online_rl.require_step_wise_index_guard=false.",
         msg,
     )
 
@@ -220,7 +327,7 @@ def _should_force_legacy_inference(
             "Qwen3.5 config detected at %s. Forcing SkyRL legacy inference path "
             "(new inference shows intermittent /inference/v1/generate 400s and "
             "engine-core exits on this stack). Set "
-            "grpo.allow_new_inference_for_qwen35=true to override.",
+            "online_rl.allow_new_inference_for_qwen35=true to override.",
             model_path,
         )
         return True
@@ -228,7 +335,7 @@ def _should_force_legacy_inference(
 
 
 def _resolve_vllm_ready_model_path(model_path: str) -> str:
-    """Resolve a vLLM-compatible model handoff path for GRPO.
+    """Resolve a vLLM-compatible model handoff path for online RL.
 
     Qwen3.5 merged checkpoints used for HF training can expose a text-wrapper
     config (for example ``model_type=qwen3_5_text``). SkyRL+vLLM runtime paths
@@ -283,8 +390,8 @@ def _resolve_vllm_ready_model_path(model_path: str) -> str:
 def _canonical_system_prompt() -> str:
     """Return the canonical system prompt with tool docs."""
     try:
-        from open_ctf.data.converter import CTF_SYSTEM_PROMPT
-        return str(CTF_SYSTEM_PROMPT)
+        from open_ctf.prompts import get_canonical_system_prompt
+        return str(get_canonical_system_prompt())
     except Exception:
         # Keep a minimal fallback if converter import fails in stripped envs.
         return (
@@ -414,15 +521,15 @@ def _normalize_remote_url(url: str) -> str:
     return re.sub(r"^https?://", "", str(url).strip()).rstrip("/")
 
 
-def _resolve_generator_topology(grpo_cfg: Dict[str, Any], lora_rank: int) -> Dict[str, Any]:
+def _resolve_generator_topology(online_rl_cfg: Dict[str, Any], lora_rank: int) -> Dict[str, Any]:
     """Resolve SkyRL generator topology from config.
 
     SkyRL currently supports LoRA weight sync only when engines are local
     (``run_engines_locally=true``). Remote engine mode does not support
     ``LoraLoadRequest`` in upstream SkyRL.
     """
-    vllm_mode = str(grpo_cfg.get("vllm_mode", "colocate")).strip().lower()
-    requested_remote_url = grpo_cfg.get("vllm_server_url")
+    vllm_mode = str(online_rl_cfg.get("vllm_mode", "colocate")).strip().lower()
+    requested_remote_url = online_rl_cfg.get("vllm_server_url")
     remote_requested = bool(requested_remote_url)
 
     local_disagg_modes = {
@@ -435,7 +542,7 @@ def _resolve_generator_topology(grpo_cfg: Dict[str, Any], lora_rank: int) -> Dic
     valid_modes = {"colocate", "local"} | local_disagg_modes
     if vllm_mode not in valid_modes:
         logger.warning(
-            "Unknown grpo.vllm_mode=%r; defaulting to 'colocate'.", vllm_mode
+            "Unknown online_rl.vllm_mode=%r; defaulting to 'colocate'.", vllm_mode
         )
         vllm_mode = "colocate"
 
@@ -445,13 +552,13 @@ def _resolve_generator_topology(grpo_cfg: Dict[str, Any], lora_rank: int) -> Dic
     # On constrained GPUs (e.g. GB10 unified memory), local non-colocated
     # engines crash due to vLLM V1 subprocess issues — remote is the only
     # working topology.  Set ``allow_remote_lora: true`` to keep remote mode.
-    allow_remote_lora = bool(grpo_cfg.get("allow_remote_lora", False))
+    allow_remote_lora = bool(online_rl_cfg.get("allow_remote_lora", False))
     if remote_requested and lora_rank > 0 and not allow_remote_lora:
         logger.warning(
-            "grpo.vllm_server_url=%r requested with LoRA rank=%d. "
+            "online_rl.vllm_server_url=%r requested with LoRA rank=%d. "
             "SkyRL remote engines do not support NCCL LoRA weight sync; "
             "falling back to local non-colocated vLLM engines. "
-            "Set grpo.allow_remote_lora=true to keep remote mode "
+            "Set online_rl.allow_remote_lora=true to keep remote mode "
             "(requires patch_skyrl_weight_sync.py for file-based sync).",
             requested_remote_url,
             lora_rank,
@@ -461,7 +568,7 @@ def _resolve_generator_topology(grpo_cfg: Dict[str, Any], lora_rank: int) -> Dic
     elif remote_requested and lora_rank > 0 and allow_remote_lora:
         logger.info(
             "Remote vLLM + LoRA: using file-based weight sync "
-            "(grpo.allow_remote_lora=true). Ensure patch_skyrl_weight_sync.py "
+            "(online_rl.allow_remote_lora=true). Ensure patch_skyrl_weight_sync.py "
             "is applied and vLLM server supports /v1/load_lora_adapter."
         )
 
@@ -473,12 +580,24 @@ def _resolve_generator_topology(grpo_cfg: Dict[str, Any], lora_rank: int) -> Dic
         else ["127.0.0.1:8001"]
     )
 
+    # SkyRL's _SKYRL_USE_NEW_INFERENCE=1 path reads external_proxy_url /
+    # external_server_urls instead of remote_inference_engine_urls.  When
+    # remote mode is requested we must populate BOTH so that SkyRL does NOT
+    # spawn an internal vLLM engine on the training GPU (which would OOM on
+    # multi-GPU setups where vLLM is on a different device).
+    external_proxy = str(requested_remote_url).strip() if remote_requested else None
+    external_servers = (
+        [str(requested_remote_url).strip()] if remote_requested else None
+    )
+
     return {
         "remote_vllm": remote_requested,
         "run_engines_locally": run_engines_locally,
         "colocate_all": colocate_all,
         "weight_sync_backend": "broadcast" if remote_requested else "nccl",
         "remote_inference_engine_urls": remote_urls,
+        "external_proxy_url": external_proxy,
+        "external_server_urls": external_servers,
     }
 
 
@@ -499,6 +618,7 @@ def _convert_online_rl_data(
     prefer_registry_target: bool = False,
     difficulty_min: Optional[str] = None,
     difficulty_max: Optional[str] = None,
+    exclude_challenge_ids: Optional[List[str]] = None,
 ) -> str:
     """Convert our GRPO JSONL to SkyRL dataset format.
 
@@ -588,11 +708,25 @@ def _convert_online_rl_data(
     flag_mismatch_counts: Dict[str, int] = {}
     missing_registry_flag_ids: set[str] = set()
     converted_registry_ids: set[str] = set()
+    prompt_target_mismatch_samples = 0
+    prompt_target_rewrite_samples = 0
 
     def _rewrite_target(raw_url: str) -> str:
         """Apply host/port overrides to a target URL."""
+        # Raw TCP targets (common for crypto/pwn) are stored as host:port.
+        # urlparse() treats these as scheme/path and cannot rewrite host/port,
+        # so handle this form explicitly first.
+        raw = str(raw_url or "").strip()
+        raw_host_port = re.fullmatch(r"(?P<host>[^:/\s]+):(?P<port>\d+)", raw)
+        if raw_host_port:
+            host = target_host_override or raw_host_port.group("host")
+            port = int(raw_host_port.group("port"))
+            if target_port_offset:
+                port += int(target_port_offset)
+            return f"{host}:{port}"
+
         try:
-            parsed = urlparse(raw_url)
+            parsed = urlparse(raw)
         except Exception:
             return raw_url
         if not parsed.scheme or not parsed.netloc:
@@ -622,6 +756,114 @@ def _convert_online_rl_data(
                 parsed.fragment,
             )
         )
+
+    def _first_user_url(prompt_messages: List[Dict[str, str]]) -> Optional[str]:
+        """Return first URL in user prompt text, if present."""
+        for msg in prompt_messages:
+            if msg.get("role") != "user":
+                continue
+            match = re.search(r"(?:https?|file)://[^\s)]+", str(msg.get("content", "")))
+            if match:
+                return match.group(0)
+        return None
+
+    def _rewrite_prompt_targets(
+        prompt_messages: List[Dict[str, str]],
+        canonical_target: str,
+    ) -> List[Dict[str, str]]:
+        """Rewrite stale connection URLs in user prompt text to canonical target.
+
+        This helper is intentionally benchmark-neutral. It normalizes connection
+        endpoints only, and strips known legacy prompt sections that leak
+        challenge-specific shortcuts.
+        """
+        def _strip_legacy_non_neutral_sections(text: str) -> str:
+            blocked_headers = {
+                "# WEB RECON CHECKLIST",
+                "# WEB EXPLOIT PLAYBOOK",
+                "# CHALLENGE QUICKSTART (HIGH PRIORITY)",
+            }
+            lines = text.splitlines()
+            cleaned: List[str] = []
+            skipping = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped in blocked_headers:
+                    skipping = True
+                    continue
+                if skipping and stripped.startswith("# ") and stripped not in blocked_headers:
+                    skipping = False
+                if not skipping:
+                    cleaned.append(line)
+            return "\n".join(cleaned)
+
+        def _rewrite_http_url_preserve_path(url: str) -> str:
+            """Rewrite only scheme/host/port to canonical target, preserving path/query."""
+            try:
+                canonical = urlparse(canonical_target)
+                parsed = urlparse(url)
+                if not canonical.scheme or not canonical.netloc:
+                    return canonical_target
+                return urlunparse(
+                    (
+                        canonical.scheme,
+                        canonical.netloc,
+                        parsed.path,
+                        parsed.params,
+                        parsed.query,
+                        parsed.fragment,
+                    )
+                )
+            except Exception:
+                return canonical_target
+
+        rewritten: List[Dict[str, str]] = []
+        for msg in prompt_messages:
+            role = msg.get("role")
+            content = str(msg.get("content", ""))
+            if role != "user":
+                rewritten.append({"role": role or "", "content": content})
+                continue
+
+            updated = content
+            updated = _strip_legacy_non_neutral_sections(updated)
+            # Keep structured connection lines consistent with the effective target.
+            updated = re.sub(
+                r"(\*\*Connection\*\*:\s*)([^\n]+)",
+                lambda m: f"{m.group(1)}{canonical_target}",
+                updated,
+            )
+            updated = re.sub(
+                r"(You can interact with the challenge service at:\s*)([^\n]+)",
+                lambda m: f"{m.group(1)}{canonical_target}",
+                updated,
+                flags=re.IGNORECASE,
+            )
+            # Replace stale localhost URLs (for example 328xx / 8901) with canonical target.
+            if canonical_target.startswith(("http://", "https://")):
+                updated = re.sub(
+                    r"https?://(?:localhost|127\.0\.0\.1):\d+(?:/[^\s)\"']*)?",
+                    lambda m: _rewrite_http_url_preserve_path(m.group(0)),
+                    updated,
+                )
+                # Also rewrite docker-compose service name URLs (e.g. http://web:8080)
+                # that are unreachable from the training host.
+                updated = re.sub(
+                    r"https?://(?!localhost|127\.0\.0\.1)[a-z][a-z0-9_-]*:\d+(?:/[^\s)\"']*)?",
+                    lambda m: _rewrite_http_url_preserve_path(m.group(0)),
+                    updated,
+                )
+            elif canonical_target.startswith("file://"):
+                updated = re.sub(r"file://[^\s)\"']+", canonical_target, updated)
+            elif re.fullmatch(r"[^:/\s]+:\d+", canonical_target):
+                updated = re.sub(
+                    r"https?://(?:localhost|127\.0\.0\.1):\d+(?:/[^\s)\"']*)?",
+                    lambda m: _rewrite_http_url_preserve_path(m.group(0)),
+                    updated,
+                )
+
+            rewritten.append({"role": "user", "content": updated})
+        return rewritten
 
     with jsonlines.open(data_path) as reader, jsonlines.open(output_path, "w") as writer:
         for sample in reader:
@@ -696,6 +938,13 @@ def _convert_online_rl_data(
                 except KeyError:
                     pass
 
+            # Exclude specific challenge IDs (e.g. TCP-only challenges the model can't solve).
+            if exclude_challenge_ids and resolved_challenge_id:
+                if str(resolved_challenge_id) in exclude_challenge_ids:
+                    skipped += 1
+                    logger.debug("Skipping excluded challenge: %s", resolved_challenge_id)
+                    continue
+
             # Difficulty curriculum filter: skip challenges outside the allowed range.
             if (min_rank is not None or max_rank is not None) and registry and resolved_challenge_id:
                 try:
@@ -749,16 +998,46 @@ def _convert_online_rl_data(
             if target:
                 target = _rewrite_target(str(target))
 
+            # Enforce target protocol semantics by challenge category.
+            # Web challenges should use HTTP URLs; pwn/crypto should use raw TCP
+            # host:port targets so tool usage aligns with challenge interfaces.
+            category_hint = str(
+                registry_category or metadata.get("category") or ""
+            ).strip().lower()
+            if target and category_hint in {"pwn", "crypto"}:
+                parsed_target = urlparse(str(target))
+                if (
+                    parsed_target.scheme in {"http", "https"}
+                    and parsed_target.hostname
+                    and parsed_target.port is not None
+                ):
+                    target = f"{parsed_target.hostname}:{parsed_target.port}"
+
+            # Category from registry (e.g. "crypto", "rev", "forensics", "web")
+            # falls back to metadata.category if no registry match.
+            category = registry_category or metadata.get("category")
+            prompt_first_url_before = _first_user_url(prompt)
+            if target:
+                prompt = _rewrite_prompt_targets(
+                    prompt,
+                    str(target),
+                )
+                prompt_first_url_after = _first_user_url(prompt)
+                if prompt_first_url_before and prompt_first_url_before != str(target):
+                    prompt_target_mismatch_samples += 1
+                if (
+                    prompt_first_url_before
+                    and prompt_first_url_after == str(target)
+                    and prompt_first_url_before != prompt_first_url_after
+                ):
+                    prompt_target_rewrite_samples += 1
+
             if max_samples_per_challenge and resolved_challenge_id:
                 key = str(resolved_challenge_id)
                 current = per_challenge_counts.get(key, 0)
                 if current >= int(max_samples_per_challenge):
                     skipped += 1
                     continue
-
-            # Category from registry (e.g. "crypto", "rev", "forensics", "web")
-            # falls back to metadata.category if no registry match.
-            category = registry_category or metadata.get("category")
 
             row = {
                 "prompt": prompt,
@@ -812,6 +1091,12 @@ def _convert_online_rl_data(
             skipped_difficulty,
             difficulty_min,
             difficulty_max,
+        )
+    if prompt_target_mismatch_samples:
+        logger.info(
+            "Detected %d prompt/target URL mismatches; rewrote %d prompts to canonical target URLs.",
+            prompt_target_mismatch_samples,
+            prompt_target_rewrite_samples,
         )
     if missing_registry_flag_ids:
         sorted_missing = sorted(missing_registry_flag_ids)
@@ -884,15 +1169,11 @@ def _convert_online_rl_data(
             raise ValueError(
                 "Target URL collisions detected during GRPO data conversion; "
                 "provide a challenge target map (OPEN_CTF_TARGET_MAP_PATH / "
-                "grpo.target_map_path) or disable fail_on_target_collisions."
+                "online_rl.target_map_path) or disable fail_on_target_collisions."
             )
 
     logger.info("Converted %d online RL samples → %s", converted, output_path)
     return output_path
-
-
-# Backward-compatible alias for callers/tests importing legacy name.
-_convert_grpo_data = _convert_online_rl_data
 
 
 def _resolve_skyrl_logger(report_to: str, output_dir: str) -> str:
@@ -916,7 +1197,7 @@ def _resolve_skyrl_logger(report_to: str, output_dir: str) -> str:
             os.makedirs(tb_dir, exist_ok=True)
         except OSError:
             # Output dir may not exist yet (unit tests use fake paths).
-            # The directory will be created later by train_grpo().
+            # The directory will be created later by train_online_rl().
             pass
         # SkyRL's TensorBoardLogger reads TENSORBOARD_LOGDIR from env.
         os.environ["TENSORBOARD_LOGDIR"] = tb_dir
@@ -994,19 +1275,19 @@ def _build_skyrl_config(
 
     model_cfg = config.get("model", {})
     lora_cfg = config.get("lora", {})
-    grpo_cfg = _resolve_online_rl_cfg(config)
+    online_rl_cfg = _resolve_online_rl_cfg(config)
     output_cfg = config.get("output", {})
     lora_rank = _parse_lora_rank(lora_cfg)
     lora_target_modules, lora_exclude_modules = _parse_lora_modules(lora_cfg)
-    topology = _resolve_generator_topology(grpo_cfg, lora_rank=lora_rank)
+    topology = _resolve_generator_topology(online_rl_cfg, lora_rank=lora_rank)
     remote_vllm = topology["remote_vllm"]
-    requested_flash_attn = bool(grpo_cfg.get("flash_attn", False))
+    requested_flash_attn = bool(online_rl_cfg.get("flash_attn", False))
     enable_flash_attn = requested_flash_attn and _flash_attn_available()
     if requested_flash_attn and not enable_flash_attn:
         logger.warning(
             "flash_attn requested but unavailable in this environment; falling back to SDPA."
         )
-    use_sample_packing = bool(grpo_cfg.get("use_sample_packing", False))
+    use_sample_packing = bool(online_rl_cfg.get("use_sample_packing", False))
     if use_sample_packing and not enable_flash_attn:
         logger.warning(
             "use_sample_packing requested without flash_attn support; disabling sample packing."
@@ -1018,21 +1299,21 @@ def _build_skyrl_config(
         8192,
     )
     max_completion_length = _as_positive_int(
-        "grpo.max_completion_length",
-        grpo_cfg.get("max_completion_length"),
+        "online_rl.max_completion_length",
+        online_rl_cfg.get("max_completion_length"),
         8192,
     )
     max_prompt_length = _as_positive_int(
-        "grpo.max_prompt_length",
-        grpo_cfg.get("max_prompt_length"),
+        "online_rl.max_prompt_length",
+        online_rl_cfg.get("max_prompt_length"),
         model_max_seq_length,
     )
     # Keep vLLM's max_model_len sized for actual rollout windows instead of the
     # model's full context by default (for example 262K Qwen max pos emb), which
     # can allocate excessive KV cache and OOM on otherwise-valid settings.
     vllm_headroom_tokens = _as_positive_int(
-        "grpo.vllm_context_headroom_tokens",
-        grpo_cfg.get("vllm_context_headroom_tokens"),
+        "online_rl.vllm_context_headroom_tokens",
+        online_rl_cfg.get("vllm_context_headroom_tokens"),
         1024,
     )
     min_required_vllm_len = max_prompt_length + max_completion_length
@@ -1043,13 +1324,13 @@ def _build_skyrl_config(
     if default_vllm_max_model_len < min_required_vllm_len:
         default_vllm_max_model_len = min_required_vllm_len
     vllm_max_model_len = _as_positive_int(
-        "grpo.vllm_max_model_len",
-        grpo_cfg.get("vllm_max_model_len"),
+        "online_rl.vllm_max_model_len",
+        online_rl_cfg.get("vllm_max_model_len"),
         default_vllm_max_model_len,
     )
     if vllm_max_model_len < min_required_vllm_len:
         logger.warning(
-            "grpo.vllm_max_model_len=%d is smaller than max_prompt_length + "
+            "online_rl.vllm_max_model_len=%d is smaller than max_prompt_length + "
             "max_completion_length (%d + %d = %d); overriding to %d.",
             vllm_max_model_len,
             max_prompt_length,
@@ -1058,26 +1339,26 @@ def _build_skyrl_config(
             min_required_vllm_len,
         )
         vllm_max_model_len = min_required_vllm_len
-    vllm_language_model_only = bool(grpo_cfg.get("vllm_language_model_only", False))
-    vllm_attention_backend = grpo_cfg.get("vllm_attention_backend")
+    vllm_language_model_only = bool(online_rl_cfg.get("vllm_language_model_only", False))
+    vllm_attention_backend = online_rl_cfg.get("vllm_attention_backend")
     if vllm_attention_backend is not None:
         vllm_attention_backend = str(vllm_attention_backend).strip() or None
-    vllm_mm_encoder_attn_backend = grpo_cfg.get("vllm_mm_encoder_attn_backend")
+    vllm_mm_encoder_attn_backend = online_rl_cfg.get("vllm_mm_encoder_attn_backend")
     if vllm_mm_encoder_attn_backend is not None:
         vllm_mm_encoder_attn_backend = str(vllm_mm_encoder_attn_backend).strip() or None
     num_generations = _as_positive_int(
-        "grpo.num_generations",
-        grpo_cfg.get("num_generations"),
+        "online_rl.num_generations",
+        online_rl_cfg.get("num_generations"),
         8,
     )
     max_num_seqs = _as_positive_int(
-        "grpo.max_num_seqs",
-        grpo_cfg.get("max_num_seqs"),
+        "online_rl.max_num_seqs",
+        online_rl_cfg.get("max_num_seqs"),
         max(8, num_generations * 2),
     )
     if max_num_seqs < num_generations:
         logger.warning(
-            "grpo.max_num_seqs=%d is smaller than num_generations=%d; "
+            "online_rl.max_num_seqs=%d is smaller than num_generations=%d; "
             "overriding max_num_seqs to %d.",
             max_num_seqs,
             num_generations,
@@ -1089,13 +1370,13 @@ def _build_skyrl_config(
         max(max_prompt_length, num_generations * max(1024, max_completion_length // 2)),
     )
     max_num_batched_tokens = _as_positive_int(
-        "grpo.max_num_batched_tokens",
-        grpo_cfg.get("max_num_batched_tokens"),
+        "online_rl.max_num_batched_tokens",
+        online_rl_cfg.get("max_num_batched_tokens"),
         default_batched_tokens,
     )
     if max_num_batched_tokens < max_prompt_length:
         logger.warning(
-            "grpo.max_num_batched_tokens=%d is smaller than max_prompt_length=%d; "
+            "online_rl.max_num_batched_tokens=%d is smaller than max_prompt_length=%d; "
             "overriding to %d.",
             max_num_batched_tokens,
             max_prompt_length,
@@ -1105,7 +1386,7 @@ def _build_skyrl_config(
     max_prefill_capacity = max_prompt_length * max_num_seqs
     if max_num_batched_tokens > max_prefill_capacity:
         logger.warning(
-            "grpo.max_num_batched_tokens=%d exceeds max_prefill_capacity=%d "
+            "online_rl.max_num_batched_tokens=%d exceeds max_prefill_capacity=%d "
             "(max_prompt_length * max_num_seqs); clamping.",
             max_num_batched_tokens,
             max_prefill_capacity,
@@ -1113,66 +1394,66 @@ def _build_skyrl_config(
         max_num_batched_tokens = max_prefill_capacity
 
     num_inference_engines = _as_positive_int(
-        "grpo.num_inference_engines",
-        grpo_cfg.get("num_inference_engines"),
+        "online_rl.num_inference_engines",
+        online_rl_cfg.get("num_inference_engines"),
         1,
     )
     inference_engine_tensor_parallel_size = _as_positive_int(
-        "grpo.inference_engine_tensor_parallel_size",
-        grpo_cfg.get("inference_engine_tensor_parallel_size"),
+        "online_rl.inference_engine_tensor_parallel_size",
+        online_rl_cfg.get("inference_engine_tensor_parallel_size"),
         1,
     )
     inference_engine_pipeline_parallel_size = _as_positive_int(
-        "grpo.inference_engine_pipeline_parallel_size",
-        grpo_cfg.get("inference_engine_pipeline_parallel_size"),
+        "online_rl.inference_engine_pipeline_parallel_size",
+        online_rl_cfg.get("inference_engine_pipeline_parallel_size"),
         1,
     )
     inference_engine_data_parallel_size = _as_positive_int(
-        "grpo.inference_engine_data_parallel_size",
-        grpo_cfg.get("inference_engine_data_parallel_size"),
+        "online_rl.inference_engine_data_parallel_size",
+        online_rl_cfg.get("inference_engine_data_parallel_size"),
         1,
     )
     max_tool_calling_iterations = _as_positive_int(
-        "grpo.max_tool_calling_iterations",
-        grpo_cfg.get("max_tool_calling_iterations"),
+        "online_rl.max_tool_calling_iterations",
+        online_rl_cfg.get("max_tool_calling_iterations"),
         15,
     )
-    eval_interval = int(grpo_cfg.get("eval_interval", -1))
-    eval_before_train = bool(grpo_cfg.get("eval_before_train", False))
+    eval_interval = int(online_rl_cfg.get("eval_interval", -1))
+    eval_before_train = bool(online_rl_cfg.get("eval_before_train", False))
     eval_batch_size = _as_positive_int(
-        "grpo.eval_batch_size",
-        grpo_cfg.get("eval_batch_size"),
+        "online_rl.eval_batch_size",
+        online_rl_cfg.get("eval_batch_size"),
         1,
     )
-    strategy = str(grpo_cfg.get("strategy", "fsdp2"))
-    policy_loss_type = str(grpo_cfg.get("policy_loss_type", "regular"))
-    loss_reduction = str(grpo_cfg.get("loss_reduction", "token_mean"))
-    use_tis = bool(grpo_cfg.get("use_tis", False))
-    off_policy_correction = grpo_cfg.get("off_policy_correction", {}) or {}
+    strategy = str(online_rl_cfg.get("strategy", "fsdp2"))
+    policy_loss_type = _resolve_policy_loss_type(online_rl_cfg)
+    loss_reduction = str(online_rl_cfg.get("loss_reduction", "token_mean"))
+    use_tis = bool(online_rl_cfg.get("use_tis", False))
+    off_policy_correction = online_rl_cfg.get("off_policy_correction", {}) or {}
     if not isinstance(off_policy_correction, dict):
         off_policy_correction = {}
-    fully_async_cfg = grpo_cfg.get("fully_async", {}) or {}
+    fully_async_cfg = online_rl_cfg.get("fully_async", {}) or {}
     if not isinstance(fully_async_cfg, dict):
         fully_async_cfg = {}
     fully_async_max_staleness_steps = _as_positive_int(
-        "grpo.fully_async.max_staleness_steps",
+        "online_rl.fully_async.max_staleness_steps",
         fully_async_cfg.get("max_staleness_steps"),
         4,
     )
     fully_async_num_workers = _as_positive_int(
-        "grpo.fully_async.num_parallel_generation_workers",
+        "online_rl.fully_async.num_parallel_generation_workers",
         fully_async_cfg.get("num_parallel_generation_workers"),
         1,
     )
-    async_engine = bool(grpo_cfg.get("async_engine", True))
-    batched = bool(grpo_cfg.get("batched", False))
-    apply_overlong_filtering = bool(grpo_cfg.get("apply_overlong_filtering", False))
+    async_engine = bool(online_rl_cfg.get("async_engine", True))
+    batched = bool(online_rl_cfg.get("batched", False))
+    apply_overlong_filtering = bool(online_rl_cfg.get("apply_overlong_filtering", False))
     inference_engine_expert_parallel_size = _as_positive_int(
-        "grpo.inference_engine_expert_parallel_size",
-        grpo_cfg.get("inference_engine_expert_parallel_size"),
+        "online_rl.inference_engine_expert_parallel_size",
+        online_rl_cfg.get("inference_engine_expert_parallel_size"),
         1,
     )
-    val_data_cfg = grpo_cfg.get("val_data", [])
+    val_data_cfg = online_rl_cfg.get("val_data", [])
     if isinstance(val_data_cfg, str) and val_data_cfg.strip():
         val_data = [val_data_cfg]
     elif isinstance(val_data_cfg, list):
@@ -1180,48 +1461,48 @@ def _build_skyrl_config(
     else:
         val_data = []
     max_env_workers = _as_positive_int(
-        "grpo.max_env_workers",
-        grpo_cfg.get("max_env_workers"),
+        "online_rl.max_env_workers",
+        online_rl_cfg.get("max_env_workers"),
         32,
     )
-    use_ref_model = bool(grpo_cfg.get("beta", 0.0) > 0.0 or grpo_cfg.get("use_kl_in_reward", False))
+    use_ref_model = bool(online_rl_cfg.get("beta", 0.0) > 0.0 or online_rl_cfg.get("use_kl_in_reward", False))
     policy_num_gpus_per_node = _as_positive_int(
-        "grpo.policy_num_gpus_per_node",
-        grpo_cfg.get("policy_num_gpus_per_node"),
+        "online_rl.policy_num_gpus_per_node",
+        online_rl_cfg.get("policy_num_gpus_per_node"),
         1,
     )
     policy_num_nodes = _as_positive_int(
-        "grpo.policy_num_nodes",
-        grpo_cfg.get("policy_num_nodes"),
+        "online_rl.policy_num_nodes",
+        online_rl_cfg.get("policy_num_nodes"),
         1,
     )
-    critic_model_path = grpo_cfg.get("critic_model_path")
+    critic_model_path = online_rl_cfg.get("critic_model_path")
     if critic_model_path:
         critic_num_gpus_per_node = _as_positive_int(
-            "grpo.critic_num_gpus_per_node",
-            grpo_cfg.get("critic_num_gpus_per_node"),
+            "online_rl.critic_num_gpus_per_node",
+            online_rl_cfg.get("critic_num_gpus_per_node"),
             1,
         )
     else:
         critic_num_gpus_per_node = 0
     critic_num_nodes = _as_positive_int(
-        "grpo.critic_num_nodes",
-        grpo_cfg.get("critic_num_nodes"),
+        "online_rl.critic_num_nodes",
+        online_rl_cfg.get("critic_num_nodes"),
         1,
     )
     ref_num_nodes = _as_positive_int(
-        "grpo.ref_num_nodes",
-        grpo_cfg.get("ref_num_nodes"),
+        "online_rl.ref_num_nodes",
+        online_rl_cfg.get("ref_num_nodes"),
         policy_num_nodes,
     )
     ref_num_gpus_per_node = _as_positive_int(
-        "grpo.ref_num_gpus_per_node",
-        grpo_cfg.get("ref_num_gpus_per_node"),
+        "online_rl.ref_num_gpus_per_node",
+        online_rl_cfg.get("ref_num_gpus_per_node"),
         policy_num_gpus_per_node,
     )
     if not use_ref_model:
         ref_num_gpus_per_node = 0
-    colocate_policy_ref = bool(grpo_cfg.get("colocate_policy_ref", True)) and use_ref_model
+    colocate_policy_ref = bool(online_rl_cfg.get("colocate_policy_ref", True)) and use_ref_model
 
     visible_gpu_count = _detect_visible_gpu_count()
     if (
@@ -1240,7 +1521,7 @@ def _build_skyrl_config(
         )
         required_gpus = policy_gpus + ref_gpus + critic_gpus + (num_inference_engines * gpus_per_engine)
         if required_gpus > visible_gpu_count:
-            explicit_num_engines = "num_inference_engines" in grpo_cfg
+            explicit_num_engines = "num_inference_engines" in online_rl_cfg
             available_for_inference = max(0, visible_gpu_count - policy_gpus - ref_gpus - critic_gpus)
             max_auto_engines = available_for_inference // max(1, gpus_per_engine)
             if not explicit_num_engines and max_auto_engines > 0:
@@ -1264,15 +1545,41 @@ def _build_skyrl_config(
                     num_inference_engines * gpus_per_engine,
                     visible_gpu_count,
                 )
-    chat_template_name = grpo_cfg.get("chat_template", None)
-    chat_template_kwargs = grpo_cfg.get("chat_template_kwargs", {})
-    step_wise_trajectories = bool(grpo_cfg.get("step_wise_trajectories", False))
+    chat_template_name = online_rl_cfg.get("chat_template", None)
+    chat_template_kwargs = online_rl_cfg.get("chat_template_kwargs", {})
+
+    # --- Native tool schema injection via chat_template_kwargs ---------
+    # Most modern tokenizers (ChatML, Qwen, Llama) have a
+    # {%- if tools %} block that formats tool schemas natively.
+    # By adding tools= to chat_template_kwargs, SkyRL spreads them into
+    # every apply_chat_template() call, producing model-native tool format
+    # instead of our manual text injection (_inject_tool_schemas).
+    #
+    # Default True: even when a custom chat_template is set (e.g.
+    # "qwen3_without_thinking" for Qwen3.5), native tool schemas should
+    # still be injected.  Set native_tool_schemas: false explicitly to
+    # disable.  See SkyRL's skyrl_gym_generator.py where
+    # **self.generator_cfg.chat_template_kwargs is spread into 5/6 calls.
+    native_tool_schemas = bool(
+        online_rl_cfg.get("native_tool_schemas", True)
+    )
+    if native_tool_schemas and "tools" not in chat_template_kwargs:
+        from open_ctf.formatters.tool_registry import get_runtime_tools
+        chat_template_kwargs = dict(chat_template_kwargs)  # avoid mutating config
+        chat_template_kwargs["tools"] = get_runtime_tools()
+        logger.info(
+            "Native tool schemas enabled: injecting %d tools into "
+            "chat_template_kwargs (tokenizer will format per model template).",
+            len(chat_template_kwargs["tools"]),
+        )
+
+    step_wise_trajectories = bool(online_rl_cfg.get("step_wise_trajectories", False))
     allow_step_wise_with_custom_template = bool(
-        grpo_cfg.get("allow_step_wise_with_custom_chat_template", False)
+        online_rl_cfg.get("allow_step_wise_with_custom_chat_template", False)
     )
     default_logprobs = None if remote_vllm else 0
-    train_logprobs = grpo_cfg.get("logprobs", default_logprobs)
-    eval_logprobs = grpo_cfg.get("eval_logprobs", train_logprobs)
+    train_logprobs = online_rl_cfg.get("logprobs", default_logprobs)
+    eval_logprobs = online_rl_cfg.get("eval_logprobs", train_logprobs)
 
     # SkyRL's multi-turn generator does not support response-logprob bookkeeping
     # when a custom chat template is used. Enforce this at config build time
@@ -1294,6 +1601,47 @@ def _build_skyrl_config(
         )
         eval_logprobs = None
 
+    generation_temperature = _as_float(
+        "online_rl.generation_temperature",
+        online_rl_cfg.get("generation_temperature"),
+        1.0,
+    )
+    generation_top_p = _as_float(
+        "online_rl.generation_top_p",
+        online_rl_cfg.get("generation_top_p"),
+        0.95,
+    )
+    generation_min_p = _as_float(
+        "online_rl.generation_min_p",
+        online_rl_cfg.get("generation_min_p"),
+        0.0,
+    )
+    generation_top_k = int(online_rl_cfg.get("generation_top_k", -1))
+    generation_stop = online_rl_cfg.get("generation_stop")
+    if generation_stop is not None and not isinstance(generation_stop, list):
+        generation_stop = [str(generation_stop)]
+    tool_call_format = str(online_rl_cfg.get("tool_call_format", "hermes")).strip() or "hermes"
+
+    eval_generation_temperature = _as_float(
+        "online_rl.eval_generation_temperature",
+        online_rl_cfg.get("eval_generation_temperature"),
+        0.6,
+    )
+    eval_generation_top_p = _as_float(
+        "online_rl.eval_generation_top_p",
+        online_rl_cfg.get("eval_generation_top_p"),
+        0.95,
+    )
+    eval_generation_min_p = _as_float(
+        "online_rl.eval_generation_min_p",
+        online_rl_cfg.get("eval_generation_min_p"),
+        0.0,
+    )
+    eval_generation_top_k = int(online_rl_cfg.get("eval_generation_top_k", -1))
+    eval_generation_stop = online_rl_cfg.get("eval_generation_stop")
+    if eval_generation_stop is not None and not isinstance(eval_generation_stop, list):
+        eval_generation_stop = [str(eval_generation_stop)]
+
     # SkyRL currently rejects step-wise trajectories with custom chat templates.
     # Apply one centralized compatibility policy for all model/config combinations.
     if (
@@ -1301,15 +1649,15 @@ def _build_skyrl_config(
         and step_wise_trajectories
         and not allow_step_wise_with_custom_template
     ):
-        if bool(grpo_cfg.get("step_wise_strict_compat", False)):
+        if bool(online_rl_cfg.get("step_wise_strict_compat", False)):
             raise ValueError(
-                "grpo.step_wise_trajectories=true is incompatible with "
-                f"grpo.chat_template={chat_template_name!r} in current SkyRL. "
-                "Set grpo.step_wise_trajectories=false, remove grpo.chat_template, "
-                "or set grpo.step_wise_strict_compat=false to auto-disable."
+                "online_rl.step_wise_trajectories=true is incompatible with "
+                f"online_rl.chat_template={chat_template_name!r} in current SkyRL. "
+                "Set online_rl.step_wise_trajectories=false, remove online_rl.chat_template, "
+                "or set online_rl.step_wise_strict_compat=false to auto-disable."
             )
         logger.warning(
-            "grpo.step_wise_trajectories=true is incompatible with custom "
+            "online_rl.step_wise_trajectories=true is incompatible with custom "
             "chat_template=%r in current SkyRL; auto-disabling step-wise "
             "trajectories for this run.",
             chat_template_name,
@@ -1321,11 +1669,13 @@ def _build_skyrl_config(
         and allow_step_wise_with_custom_template
     ):
         logger.warning(
-            "Using grpo.allow_step_wise_with_custom_chat_template=true with "
+            "Using online_rl.allow_step_wise_with_custom_chat_template=true with "
             "chat_template=%r. Ensure SkyRL includes the step-wise + custom "
             "chat-template compatibility fix.",
             chat_template_name,
         )
+
+    _validate_step_wise_resp_index_guard(online_rl_cfg, step_wise_trajectories)
 
     # Detect transformer layer class for FSDP wrapping.
     # model._no_split_modules returns a set on some architectures (e.g. Llama),
@@ -1353,13 +1703,29 @@ def _build_skyrl_config(
     except Exception:
         pass
     if auto_cfg is not None:
-        _validate_qwen3_5_runtime_dependencies(auto_cfg, grpo_cfg)
+        _validate_qwen3_5_runtime_dependencies(auto_cfg, online_rl_cfg)
 
     # Reference model path for KL divergence. Defaults to the policy model
     # (standard GRPO), but can be overridden for distillation.
     ref_model_path = config.get("ref_model_path", model_path)
-    eps_clip_low = grpo_cfg.get("epsilon_low", 0.2)
-    eps_clip_high = grpo_cfg.get("epsilon_high", eps_clip_low)
+    eps_clip_low = online_rl_cfg.get("epsilon_low", 0.2)
+    eps_clip_high = online_rl_cfg.get("epsilon_high", eps_clip_low)
+
+    # --- Warmup step computation from warmup_ratio -----------------------
+    # Configs specify warmup_ratio (e.g. 0.10) but SkyRL's optimizer_config
+    # expects num_warmup_steps.  Compute from the ratio and total_episodes
+    # (number of optimizer steps across all epochs).  If warmup_ratio is not
+    # set or 0, fall back to an explicit num_warmup_steps (default 0).
+    warmup_ratio = float(online_rl_cfg.get("warmup_ratio", 0.0))
+    if warmup_ratio > 0:
+        total_episodes = int(online_rl_cfg.get("total_episodes", 100))
+        num_warmup_steps = max(1, int(total_episodes * warmup_ratio))
+        logger.info(
+            "Warmup: ratio=%.3f, total_episodes=%d -> num_warmup_steps=%d",
+            warmup_ratio, total_episodes, num_warmup_steps,
+        )
+    else:
+        num_warmup_steps = int(online_rl_cfg.get("num_warmup_steps", 0))
 
     skyrl_config = {
         # Data
@@ -1376,14 +1742,17 @@ def _build_skyrl_config(
             "gradient_checkpointing_use_reentrant": False,
             "seed": 42,
             "sequence_parallel_backend": "ulysses",
-            "epochs": grpo_cfg.get("epochs", 1),
+            "epochs": online_rl_cfg.get("epochs", 1),
             "update_epochs_per_batch": 1,
-            "train_batch_size": grpo_cfg.get("batch_size", 1),
-            "policy_mini_batch_size": grpo_cfg.get("batch_size", 1),
-            "critic_mini_batch_size": grpo_cfg.get("batch_size", 1),
+            "train_batch_size": online_rl_cfg.get("batch_size", 1),
+            "policy_mini_batch_size": online_rl_cfg.get("batch_size", 1),
+            "critic_mini_batch_size": online_rl_cfg.get("batch_size", 1),
             "micro_train_batch_size_per_gpu": 1,
             "micro_forward_batch_size_per_gpu": 1,
             "max_prompt_length": max_prompt_length,
+            # Keep trainer-side response window bounded; without this,
+            # very long multi-turn traces can spike backward-pass memory.
+            "max_response_length": max_completion_length,
             "use_sample_packing": use_sample_packing,
             "eval_batch_size": eval_batch_size,
             "eval_interval": eval_interval,
@@ -1399,7 +1768,7 @@ def _build_skyrl_config(
             "export_path": os.path.join(output_dir, "final"),
             "eval_before_train": eval_before_train,
             "project_name": "open-ctf",
-            "run_name": "grpo",
+            "run_name": "online_rl",
             "logger": _resolve_skyrl_logger(
                 output_cfg.get("report_to", "tensorboard"), output_dir
             ),
@@ -1457,12 +1826,12 @@ def _build_skyrl_config(
                 "use_torch_compile": False,
                 "record_memory": False,
                 "optimizer_config": {
-                    "lr": grpo_cfg.get("learning_rate", 5e-6),
+                    "lr": online_rl_cfg.get("learning_rate", 5e-6),
                     "adam_betas": [0.9, 0.999],
-                    "weight_decay": grpo_cfg.get("weight_decay", 0.0),
-                    "max_grad_norm": grpo_cfg.get("max_grad_norm", 5.0),
+                    "weight_decay": online_rl_cfg.get("weight_decay", 0.0),
+                    "max_grad_norm": online_rl_cfg.get("max_grad_norm", 5.0),
                     "offload_after_step": True,
-                    "num_warmup_steps": 0,
+                    "num_warmup_steps": num_warmup_steps,
                     "scheduler": "constant_with_warmup",
                 },
             },
@@ -1477,9 +1846,17 @@ def _build_skyrl_config(
                 "fsdp_config": {
                     # CPU offload ref model when KL beta is 0 (ref logprobs unused).
                     # Saves ~16-32GB GPU memory for 8B+ models on single-GPU setups.
-                    "cpu_offload": grpo_cfg.get("beta", 0.0) == 0.0,
+                    "cpu_offload": online_rl_cfg.get("beta", 0.0) == 0.0,
                     "reshard_after_forward": True,
                     "fsdp_size": -1,
+                    # Mirror policy wrap hints so FSDP2 does not fall back to
+                    # model._no_split_modules (a set on some models, causing
+                    # skyrl_train/distributed/fsdp_utils.py TypeError).
+                    "wrap_policy": (
+                        {"transformer_layer_cls_to_wrap": [transformer_layer_cls]}
+                        if transformer_layer_cls
+                        else {}
+                    ),
                 },
             },
 
@@ -1508,16 +1885,16 @@ def _build_skyrl_config(
                     "weight_decay": 0.01,
                     "max_grad_norm": 1.0,
                     "offload_after_step": True,
-                    "num_warmup_steps": 0,
+                    "num_warmup_steps": num_warmup_steps,
                     "scheduler": "constant_with_warmup",
                 },
             },
 
             "algorithm": {
-                "advantage_estimator": grpo_cfg.get("advantage_estimator", "rloo"),
+                "advantage_estimator": online_rl_cfg.get("advantage_estimator", "rloo"),
                 "policy_loss_type": policy_loss_type,
-                "kl_loss_coef": grpo_cfg.get("beta", 0.0),
-                "use_kl_loss": grpo_cfg.get("beta", 0.0) > 0,
+                "kl_loss_coef": online_rl_cfg.get("beta", 0.0),
+                "use_kl_loss": online_rl_cfg.get("beta", 0.0) > 0,
                 "use_kl_in_reward": False,
                 "kl_ctrl": {
                     "type": "fixed",
@@ -1527,13 +1904,13 @@ def _build_skyrl_config(
                 "kl_estimator_type": "k3",
                 "use_kl_estimator_k3": False,
                 "use_abs_kl": False,
-                "use_entropy_loss": False,
-                "entropy_loss_coef": 0.01,
+                "use_entropy_loss": bool(online_rl_cfg.get("use_entropy_loss", False)),
+                "entropy_loss_coef": float(online_rl_cfg.get("entropy_loss_coef", 0.01)),
                 "advantage_batch_normalize": False,
                 "value_head_prefix": "value_head",
                 "loss_reduction": loss_reduction,
                 "grpo_norm_by_std": True,
-                "zero_variance_filter": bool(grpo_cfg.get("zero_variance_filter", False)),
+                "zero_variance_filter": bool(online_rl_cfg.get("zero_variance_filter", False)),
                 "lambd": 1.0,
                 "gamma": 1.0,
                 "eps_clip_low": eps_clip_low,
@@ -1564,10 +1941,10 @@ def _build_skyrl_config(
                 "sapo": {"tau_pos": 1.0, "tau_neg": 1.05},
                 "value_clip": 0.2,
                 "dynamic_sampling": {
-                    "type": grpo_cfg.get("dynamic_sampling", {}).get("type", None),
+                    "type": online_rl_cfg.get("dynamic_sampling", {}).get("type", None),
                     "max_sample_batches": _as_positive_int(
-                        "grpo.dynamic_sampling.max_sample_batches",
-                        grpo_cfg.get("dynamic_sampling", {}).get("max_sample_batches"),
+                        "online_rl.dynamic_sampling.max_sample_batches",
+                        online_rl_cfg.get("dynamic_sampling", {}).get("max_sample_batches"),
                         30,
                     ),
                     "min_replace_ratio": 0.3,
@@ -1604,17 +1981,35 @@ def _build_skyrl_config(
             "n_samples_per_prompt": num_generations,
             "async_engine": async_engine,
             "batched": batched,
-            "max_input_length": max_prompt_length,
+            # max_input_length governs when SkyRL truncates the multi-turn
+            # conversation loop.  Setting it to max_prompt_length (the initial
+            # prompt budget) starves multi-turn episodes: the conversation
+            # exceeds max_prompt_length after a few turns, SkyRL breaks the
+            # loop, and the terminal CTFReward is never computed (→ reward=0.0
+            # for all non-terminal steps in episodic mode).
+            #
+            # Use vllm_max_model_len instead — this is the actual KV-cache
+            # budget the inference server can handle, and the total context
+            # window available for the entire conversation (prompt + all
+            # response/observation turns).
+            "max_input_length": vllm_max_model_len,
             "vllm_v1_disable_multiproc": True,
-            "enable_prefix_caching": bool(grpo_cfg.get("enable_prefix_caching", True)),
-            "enable_chunked_prefill": bool(grpo_cfg.get("enable_chunked_prefill", True)),
+            "enable_prefix_caching": bool(online_rl_cfg.get("enable_prefix_caching", True)),
+            "enable_chunked_prefill": bool(online_rl_cfg.get("enable_chunked_prefill", True)),
             "max_num_batched_tokens": max_num_batched_tokens,
-            "enforce_eager": bool(grpo_cfg.get("enforce_eager", True)),
+            "enforce_eager": bool(online_rl_cfg.get("enforce_eager", True)),
             "fully_sharded_loras": False,
             "enable_ray_prometheus_stats": False,
-            "gpu_memory_utilization": grpo_cfg.get("gpu_memory_utilization", 0.4),
+            "gpu_memory_utilization": online_rl_cfg.get("gpu_memory_utilization", 0.4),
             "max_num_seqs": max_num_seqs,
             "remote_inference_engine_urls": topology["remote_inference_engine_urls"],
+            # SkyRL's _SKYRL_USE_NEW_INFERENCE=1 reads external_proxy_url /
+            # external_server_urls to decide whether to skip internal vLLM
+            # engine creation.  Without these, SkyRL spawns a 67+ GiB
+            # internal engine on the training GPU → OOM.
+            "external_proxy_url": topology.get("external_proxy_url"),
+            "external_server_urls": topology.get("external_server_urls"),
+            "tool_call_format": tool_call_format,
             "enable_http_endpoint": False,
             "http_endpoint_host": "127.0.0.1",
             "http_endpoint_port": 8000,
@@ -1634,7 +2029,11 @@ def _build_skyrl_config(
             # can exceed available GPU memory.  Set to max_input_length + headroom.
             "engine_init_kwargs": {
                 "max_model_len": vllm_max_model_len,
-                "language_model_only": vllm_language_model_only,
+                **(
+                    {"language_model_only": True}
+                    if vllm_language_model_only
+                    else {}
+                ),
                 **(
                     {"attention_backend": vllm_attention_backend}
                     if vllm_attention_backend
@@ -1649,27 +2048,27 @@ def _build_skyrl_config(
             "override_existing_update_group": "auto",
             "sampling_params": {
                 "max_generate_length": max_completion_length,
-                "repetition_penalty": grpo_cfg.get("repetition_penalty", 1.0),
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "min_p": 0.0,
-                "top_k": -1,
+                "repetition_penalty": online_rl_cfg.get("repetition_penalty", 1.0),
+                "temperature": generation_temperature,
+                "top_p": generation_top_p,
+                "min_p": generation_min_p,
+                "top_k": generation_top_k,
                 # Local default is 0, remote default is None. If a custom
                 # chat template is configured we force None above.
                 "logprobs": train_logprobs,
-                "stop": None,
+                "stop": generation_stop,
             },
             "use_conversation_multi_turn": True,
             "append_eos_token_after_stop_str_in_multi_turn": True,
             "eval_sampling_params": {
                 "max_generate_length": max_completion_length,
-                "repetition_penalty": grpo_cfg.get("repetition_penalty", 1.0),
-                "temperature": 0.6,
-                "top_p": 0.95,
-                "min_p": 0.0,
-                "top_k": -1,
+                "repetition_penalty": online_rl_cfg.get("repetition_penalty", 1.0),
+                "temperature": eval_generation_temperature,
+                "top_p": eval_generation_top_p,
+                "min_p": eval_generation_min_p,
+                "top_k": eval_generation_top_k,
                 "logprobs": eval_logprobs,
-                "stop": None,
+                "stop": eval_generation_stop,
             },
             "eval_n_samples_per_prompt": 1,
             "zero_reward_on_non_stop": False,
@@ -1677,6 +2076,8 @@ def _build_skyrl_config(
             "rope_scaling": None,
             "rope_theta": None,
             "step_wise_trajectories": step_wise_trajectories,
+            # Pass through so _build_openctf_env_kwargs can read it.
+            "native_tool_schemas": native_tool_schemas,
         },
 
         # Environment
@@ -1739,7 +2140,7 @@ def _build_skyrl_config(
     return skyrl_config
 
 
-def train_grpo(
+def train_online_rl(
     model_path: str,
     data_path: str,
     output_dir: str,
@@ -1781,11 +2182,11 @@ def train_grpo(
     logger.info("=" * 60)
 
     # 1. Convert data to SkyRL format
-    grpo_cfg = _resolve_online_rl_cfg(config)
+    online_rl_cfg = _resolve_online_rl_cfg(config)
     registry = None
     target_map_path = (
         os.getenv("OPEN_CTF_TARGET_MAP_PATH")
-        or grpo_cfg.get("target_map_path")
+        or online_rl_cfg.get("target_map_path")
         or None
     )
     if challenge_registry:
@@ -1794,42 +2195,43 @@ def train_grpo(
         if target_map_path:
             strict_map = bool(
                 int(os.getenv("OPEN_CTF_TARGET_MAP_STRICT", "0"))
-            ) or bool(grpo_cfg.get("target_map_strict", False))
+            ) or bool(online_rl_cfg.get("target_map_strict", False))
             registry.load_target_overrides(str(target_map_path), strict=strict_map)
     drop_unresolved = bool(
-        grpo_cfg.get("drop_unresolved_registry_samples", True)
+        online_rl_cfg.get("drop_unresolved_registry_samples", True)
     )
     port_offset = int(
         os.getenv(
             "OPEN_CTF_TARGET_PORT_OFFSET",
-            str(grpo_cfg.get("target_port_offset", 0)),
+            str(online_rl_cfg.get("target_port_offset", 0)),
         )
     )
     host_override = (
         os.getenv("OPEN_CTF_TARGET_HOST_OVERRIDE")
-        or grpo_cfg.get("target_host_override")
+        or online_rl_cfg.get("target_host_override")
         or None
     )
     prefer_registry_target = bool(
-        grpo_cfg.get("prefer_registry_target", bool(target_map_path))
+        online_rl_cfg.get("prefer_registry_target", bool(target_map_path))
     )
     converted_data = _convert_online_rl_data(
         data_path,
         output_dir,
         registry=registry,
         drop_unresolved_registry_samples=drop_unresolved,
-        drop_static_challenges=bool(grpo_cfg.get("drop_static_challenges", True)),
-        max_samples=grpo_cfg.get("max_samples"),
-        max_samples_per_challenge=grpo_cfg.get("max_samples_per_challenge"),
+        drop_static_challenges=bool(online_rl_cfg.get("drop_static_challenges", True)),
+        max_samples=online_rl_cfg.get("max_samples"),
+        max_samples_per_challenge=online_rl_cfg.get("max_samples_per_challenge"),
         target_port_offset=port_offset,
         target_host_override=host_override,
-        fail_on_target_collisions=bool(grpo_cfg.get("fail_on_target_collisions", False)),
-        fail_on_flag_mismatch=bool(grpo_cfg.get("fail_on_flag_mismatch", True)),
-        fail_on_missing_registry_flag=bool(grpo_cfg.get("fail_on_missing_registry_flag", True)),
-        require_all_registry_challenges=bool(grpo_cfg.get("require_all_registry_challenges", False)),
+        fail_on_target_collisions=bool(online_rl_cfg.get("fail_on_target_collisions", False)),
+        fail_on_flag_mismatch=bool(online_rl_cfg.get("fail_on_flag_mismatch", True)),
+        fail_on_missing_registry_flag=bool(online_rl_cfg.get("fail_on_missing_registry_flag", True)),
+        require_all_registry_challenges=bool(online_rl_cfg.get("require_all_registry_challenges", False)),
         prefer_registry_target=prefer_registry_target,
-        difficulty_min=grpo_cfg.get("difficulty_min"),
-        difficulty_max=grpo_cfg.get("difficulty_max"),
+        difficulty_min=online_rl_cfg.get("difficulty_min"),
+        difficulty_max=online_rl_cfg.get("difficulty_max"),
+        exclude_challenge_ids=online_rl_cfg.get("exclude_challenge_ids"),
     )
 
     # 2. Build SkyRL config
@@ -1848,9 +2250,9 @@ def train_grpo(
 
     # 4. Launch SkyRL training
     reward_config = _resolve_reward_config(config)
-    use_new_inference = bool(grpo_cfg.get("use_new_inference", False))
+    use_new_inference = bool(online_rl_cfg.get("use_new_inference", False))
     allow_qwen35_new_inference = bool(
-        grpo_cfg.get("allow_new_inference_for_qwen35", False)
+        online_rl_cfg.get("allow_new_inference_for_qwen35", False)
     )
     if use_new_inference and _should_force_legacy_inference(
         model_path,
@@ -1859,32 +2261,54 @@ def train_grpo(
         use_new_inference = False
 
     # Trajectory logging: pass output_dir through env kwargs (Ray-serializable string).
-    logging_cfg = config.get("grpo_logging", {})
+    logging_cfg = config.get("online_rl_logging", {})
     enable_trajectory_logging = bool(
         logging_cfg.get("enable_trajectory_logging", True)
     )
+    require_trajectory_files = bool(
+        logging_cfg.get("require_trajectory_files", False)
+    )
     trajectory_output_dir = output_dir if enable_trajectory_logging else None
 
-    # Agent class from CLI flag > config file > None (DefaultStepAgent)
-    resolved_agent_class = agent_class or grpo_cfg.get("agent_class")
-    resolved_agent_kwargs = grpo_cfg.get("agent_kwargs", {})
-    pytorch_cuda_alloc_conf = grpo_cfg.get("pytorch_cuda_alloc_conf")
-    horizon_schedule = grpo_cfg.get("horizon_schedule")
-    hard_mask_statuses = grpo_cfg.get("hard_mask_statuses")
+    # Agent class from CLI flag > config file > DefaultStepAgent fallback.
+    resolved_agent_class = (
+        agent_class
+        or online_rl_cfg.get("agent_class")
+        or "open_ctf.agent.default_agent.DefaultStepAgent"
+    )
+    resolved_agent_kwargs = online_rl_cfg.get("agent_kwargs", {})
+    if not isinstance(resolved_agent_kwargs, dict):
+        resolved_agent_kwargs = {}
+    else:
+        resolved_agent_kwargs = dict(resolved_agent_kwargs)
+    resolved_agent_kwargs.setdefault("tokenizer_name_or_path", str(model_path))
+    if resolved_agent_class:
+        logger.info("Using custom StepAgent class: %s", resolved_agent_class)
+    if isinstance(resolved_agent_kwargs, dict) and resolved_agent_kwargs:
+        logger.info(
+            "Using StepAgent kwargs keys: %s",
+            ", ".join(sorted(str(k) for k in resolved_agent_kwargs.keys())),
+        )
+        runtime_cmd = resolved_agent_kwargs.get("runtime_cmd")
+        if runtime_cmd:
+            logger.info("Hybrid BYO runtime enabled via runtime_cmd: %s", runtime_cmd)
+    pytorch_cuda_alloc_conf = online_rl_cfg.get("pytorch_cuda_alloc_conf")
+    horizon_schedule = online_rl_cfg.get("horizon_schedule")
+    hard_mask_statuses = online_rl_cfg.get("hard_mask_statuses")
     try:
-        positive_only_until_step = int(grpo_cfg.get("positive_only_until_step", 0) or 0)
+        positive_only_until_step = int(online_rl_cfg.get("positive_only_until_step", 0) or 0)
     except (TypeError, ValueError):
         logger.warning(
-            "Invalid grpo.positive_only_until_step=%r; defaulting to 0.",
-            grpo_cfg.get("positive_only_until_step"),
+            "Invalid online_rl.positive_only_until_step=%r; defaulting to 0.",
+            online_rl_cfg.get("positive_only_until_step"),
         )
         positive_only_until_step = 0
     try:
-        positive_only_reward_floor = float(grpo_cfg.get("positive_only_reward_floor", 0.0) or 0.0)
+        positive_only_reward_floor = float(online_rl_cfg.get("positive_only_reward_floor", 0.0) or 0.0)
     except (TypeError, ValueError):
         logger.warning(
-            "Invalid grpo.positive_only_reward_floor=%r; defaulting to 0.0.",
-            grpo_cfg.get("positive_only_reward_floor"),
+            "Invalid online_rl.positive_only_reward_floor=%r; defaulting to 0.0.",
+            online_rl_cfg.get("positive_only_reward_floor"),
         )
         positive_only_reward_floor = 0.0
     try:
@@ -1905,6 +2329,22 @@ def train_grpo(
             "SkyRL not installed. Install with: pip install skyrl-train skyrl-gym ray[default] vllm"
         )
         raise
+
+    if trajectory_output_dir and require_trajectory_files:
+        trajectories_dir = os.path.join(trajectory_output_dir, "trajectories")
+        has_step_files = False
+        has_summary = False
+        if os.path.isdir(trajectories_dir):
+            for name in os.listdir(trajectories_dir):
+                if name.startswith("step_") and name.endswith(".jsonl"):
+                    has_step_files = True
+                elif name == "step_summaries.jsonl":
+                    has_summary = True
+        if not (has_step_files or has_summary):
+            raise RuntimeError(
+                "Trajectory logging enabled but no trajectory artifacts were produced "
+                f"under {trajectories_dir}. This indicates an invalid training run."
+            )
 
     # Save challenge scoreboard after training completes.
     if trajectory_output_dir:
@@ -1978,6 +2418,60 @@ def _run_skyrl_training(
     from skyrl_train.entrypoints.main_base import validate_cfg
     from skyrl_train.utils import initialize_ray
 
+    def _build_openctf_env_kwargs(
+        cfg_obj: Any,
+        reward_cfg: Dict[str, Any],
+        *,
+        agent_cls: Optional[str],
+        agent_kw: Optional[Dict[str, Any]],
+        trajectory_dir: Optional[str],
+        horizon: Optional[Dict[str, Any]],
+        hard_mask: Optional[List[str]],
+        positive_until_step: int,
+        positive_reward_floor: float,
+    ) -> Dict[str, Any]:
+        """Build serializable kwargs passed to OpenCTFTextEnv registration."""
+        generator_max_turns = int(getattr(cfg_obj.generator, "max_turns", 15))
+        env_kwargs: Dict[str, Any] = {
+            "reward_config": reward_cfg,
+            "max_turns": generator_max_turns,
+            # Pass the generator's max_turns as the authoritative iteration
+            # limit so the env can clamp its own max_turns to match.  This
+            # prevents done=True from never firing when SkyRL's agent_loop
+            # terminates on sequence length before the env reaches its own
+            # max_turns threshold.
+            "max_tool_calling_iterations": generator_max_turns,
+            # Context-budget safety net: env proactively triggers done=True
+            # when estimated tokens reach 85% of this budget, ensuring
+            # terminal CTFReward fires BEFORE SkyRL's agent_loop length-break.
+            "max_input_length": int(getattr(cfg_obj.generator, "max_input_length", 0)),
+            "step_wise_trajectories": bool(
+                getattr(cfg_obj.generator, "step_wise_trajectories", False)
+            ),
+            "native_tool_schemas": bool(
+                getattr(cfg_obj.generator, "native_tool_schemas", False)
+            ),
+        }
+        tool_call_format = str(
+            getattr(cfg_obj.generator, "tool_call_format", "") or ""
+        ).strip()
+        if tool_call_format:
+            env_kwargs["tool_call_format"] = tool_call_format
+        if horizon:
+            env_kwargs["horizon_schedule"] = horizon
+        if hard_mask:
+            env_kwargs["hard_mask_statuses"] = hard_mask
+        if int(positive_until_step) > 0:
+            env_kwargs["positive_only_until_step"] = int(positive_until_step)
+            env_kwargs["positive_only_reward_floor"] = float(positive_reward_floor)
+        if agent_cls:
+            env_kwargs["agent_class"] = agent_cls
+        if agent_kw:
+            env_kwargs["agent_kwargs"] = agent_kw
+        if trajectory_dir:
+            env_kwargs["trajectory_output_dir"] = trajectory_dir
+        return env_kwargs
+
     # Validate config against SkyRLConfig schema
     validate_cfg(cfg)
 
@@ -1994,7 +2488,29 @@ def _run_skyrl_training(
     if use_new_inference:
         logger.info("Enabled SkyRL new inference layer (_SKYRL_USE_NEW_INFERENCE=1)")
 
-    # Initialize Ray cluster
+    # Initialize Ray cluster.
+    # CRITICAL: SkyRL's prepare_runtime_environment() does NOT propagate
+    # CUDA_VISIBLE_DEVICES into Ray's runtime_env.  When an external vLLM
+    # server occupies GPU 0, Ray workers must be restricted to the
+    # remaining GPU(s) — otherwise FSDP policy workers land on the vLLM
+    # GPU and OOM.  We monkey-patch prepare_runtime_environment to inject
+    # the caller's CUDA_VISIBLE_DEVICES into env_vars.
+    _cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if _cuda_vis is not None:
+        import skyrl_train.utils as _skyrl_utils_mod
+
+        _orig_prepare = _skyrl_utils_mod.prepare_runtime_environment
+
+        def _prepare_with_cuda_vis(cfg_inner):
+            env_vars = _orig_prepare(cfg_inner)
+            env_vars.setdefault("CUDA_VISIBLE_DEVICES", _cuda_vis)
+            return env_vars
+
+        _skyrl_utils_mod.prepare_runtime_environment = _prepare_with_cuda_vis
+        logger.info(
+            "Injected CUDA_VISIBLE_DEVICES=%s into SkyRL Ray runtime_env",
+            _cuda_vis,
+        )
     initialize_ray(cfg)
 
     # Register env and run training inside a Ray remote task.
@@ -2033,30 +2549,17 @@ def _run_skyrl_training(
         # from this config in __init__().
         # agent_class is a dotted path string (Ray-safe).
         # agent_kwargs is a dict of primitives (Ray-safe).
-        env_kwargs = {
-            "reward_config": reward_config,
-            # Keep env-side guard aligned with generator max_turns, even though
-            # SkyRL also injects max_turns per-sample via env_extras.
-            "max_turns": int(getattr(cfg.generator, "max_turns", 15)),
-            # Step-wise trajectory rewards: when enabled, per-step rewards
-            # include small format-compliance and phase-progression signals.
-            "step_wise_trajectories": bool(
-                getattr(cfg.generator, "step_wise_trajectories", False)
-            ),
-        }
-        if horizon_schedule:
-            env_kwargs["horizon_schedule"] = horizon_schedule
-        if hard_mask_statuses:
-            env_kwargs["hard_mask_statuses"] = hard_mask_statuses
-        if int(positive_only_until_step) > 0:
-            env_kwargs["positive_only_until_step"] = int(positive_only_until_step)
-            env_kwargs["positive_only_reward_floor"] = float(positive_only_reward_floor)
-        if agent_class:
-            env_kwargs["agent_class"] = agent_class
-        if agent_kwargs:
-            env_kwargs["agent_kwargs"] = agent_kwargs
-        if trajectory_output_dir:
-            env_kwargs["trajectory_output_dir"] = trajectory_output_dir
+        env_kwargs = _build_openctf_env_kwargs(
+            cfg,
+            reward_config,
+            agent_cls=agent_class,
+            agent_kw=agent_kwargs,
+            trajectory_dir=trajectory_output_dir,
+            horizon=horizon_schedule,
+            hard_mask=hard_mask_statuses,
+            positive_until_step=positive_only_until_step,
+            positive_reward_floor=positive_only_reward_floor,
+        )
 
         register(
             id="openctf",

@@ -182,7 +182,7 @@ open-ctf-train sft \
     --data data/sft.jsonl \
     --output outputs/sft-qwen35 \
     --backend trl \
-    --config src/open_ctf/configs/training_qwen35_27b.yaml
+    --config configs/training/training_qwen35_27b.yaml
 
 # Merge LoRA adapter into base
 open-ctf-train merge \
@@ -195,17 +195,17 @@ open-ctf-train rl \
     --model outputs/sft-qwen35-merged \
     --data data/online_rl_cybench40.jsonl \
     --output outputs/online_rl-qwen35 \
-    --config src/open_ctf/configs/training_qwen35_27b.yaml \
+    --config configs/training/training_qwen35_27b.yaml \
     --challenge-registry configs/challenges/cybench.yaml
 ```
 
-Stage-2 launch runs a strict preflight gate automatically (`open-ctf-validate --mode grpo-preflight`) and expects a dataset manifest at `<data>.manifest.json`.
+Stage-2 launch runs a strict preflight gate automatically (`open-ctf-validate --mode online-rl-preflight`) and expects a dataset manifest at `<data>.manifest.json`.
 
 If challenges run on a different host than the trainer (for example DGX + RunPod tunnel), export live challenge targets and pass the map at launch:
 
 ```bash
 # On challenge host
-PYTHONPATH=src python3 scripts/generate_live_target_map.py \
+PYTHONPATH=src python3 src/open_ctf/cli/generate_target_map.py \
     --registry configs/challenges/cybench.yaml \
     --benchmark-root /workspace/cybench \
     --port-offset 10200 \

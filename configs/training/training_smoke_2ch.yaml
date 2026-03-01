@@ -1,0 +1,161 @@
+# 2-Challenge Smoke Test Configuration
+# ======================================
+# Purpose: Verify full online RL pipeline E2E before a production run.
+#   - 2 web challenges: [Very Easy] Flag Command + [Easy] Labyrinth Linguist
+#   - 3 training steps (enough to see generate → tool exec → reward → update)
+#   - Full trajectory logging for post-run inspection
+#   - Uses external vLLM server mode (same as production)
+#
+# Usage:
+#   bash examples/smoke_test_2ch.sh \
+#       --model outputs/sft-nanbeige3b-merged \
+#       --vllm-port 8001
+#
+# Expected runtime: ~5-10 min on DGX Spark (3 steps × ~2 min/step)
+
+model:
+  name: "Nanbeige/Nanbeige4.1-3B"
+  max_seq_length: 65536
+  load_in_4bit: true
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+online_rl:
+  # 3 epochs × (2 samples / (batch=1 × accum=2)) = 3 training steps
+  epochs: 3
+  batch_size: 1
+  # batch(1) * accum(2) must be divisible by num_gen(2): 2 % 2 = 0 ✓
+  gradient_accumulation_steps: 2
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.0
+  # beta=0.0 eliminates the ref model entirely — saves ~6GB model weights
+  # plus all ref forward-pass memory.  For a smoke test the KL penalty
+  # is irrelevant; the goal is to verify non-zero policy_loss.
+  beta: 0.0
+  loss_type: dapo
+  # 2 generations per prompt for smoke test — saves KV cache memory
+  # (65K × 2 seqs vs 65K × 4 seqs = half the KV cache).  With 2,
+  # RLOO baseline is the other generation's reward.  This is sufficient
+  # for verifying the pipeline (non-zero policy_loss), even if reward
+  # variance is lower.  Production runs should use 4-8.
+  num_generations: 2
+  advantage_estimator: rloo
+  # Sequence lengths for 3B on 2x H200 with FP8 KV cache.
+  # 65K vLLM context gives generous headroom for 20-turn multi-step
+  # tool-calling episodes.  max_completion_length is the MODEL OUTPUT
+  # per generation step — not the full context.  Capping at 4096 tokens
+  # prevents runaway thinking (model generates 40K+ token think blocks
+  # that OOM eager attention during fwd_logprobs).  The vllm_max_model_len
+  # stays at 65K so the full conversation (prompt + all turns) can grow.
+  # With FP8 KV cache, 65K × 2 seqs uses ~7 GB (vs 14 GB in BF16).
+  max_completion_length: 4096
+  max_prompt_length: 8192
+  vllm_max_model_len: 65536
+  # 20 tool iterations — enough for easy challenges to complete.
+  # The context-budget safety net in env.step() will proactively
+  # trigger done=True at 85% of vllm_max_model_len, so even if
+  # tool outputs are large, terminal CTFReward fires before
+  # SkyRL's length-break.
+  max_tool_calling_iterations: 20
+  max_grad_norm: 0.5
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+  repetition_penalty: 1.0
+  generation_temperature: 0.70
+  generation_top_p: 0.90
+  generation_min_p: 0.0
+  generation_stop:
+    - "</tool_call>"
+    - "<|im_end|>"
+  # Only very_easy + easy challenges
+  difficulty_max: "easy"
+  drop_static_challenges: true
+  # 1 sample per challenge → exactly 2 samples
+  max_samples_per_challenge: 1
+  # Nanbeige4.1-3B's ChatML template HAS a native {%- if tools %} block that
+  # wraps tool schemas in <tools>JSON</tools> XML tags and instructs the model
+  # to respond with <tool_call>{"name": ..., "arguments": ...}</tool_call>.
+  # With native_tool_schemas=true, runtime.py injects tools into
+  # chat_template_kwargs["tools"], SkyRL passes them to apply_chat_template(),
+  # and the tokenizer formats them using the model's trained template.
+  native_tool_schemas: true
+  # Thinking mode (keep_all_think may be a no-op for Nanbeige — its template
+  # doesn't have an explicit keep_all_think toggle, but the kwarg is harmless).
+  chat_template_kwargs: {}
+  # Zero-variance filter off for smoke test — we want every step to train
+  zero_variance_filter: false
+  # Episodic scoring only (terminal reward) for baseline parity.
+  step_wise_trajectories: true
+  # Default step agent with resilient mode for the online RL loop.
+  agent_class: open_ctf.agent.default_agent.DefaultStepAgent
+  agent_kwargs:
+    # Allow the model to recover within a 20-turn episode before aborting.
+    max_consecutive_no_tool_calls: 12
+    # Tool response truncation limit.  1200 was too small — Flag Command's
+    # HTML page (1471 bytes) was cut off right before the JS import that
+    # reveals fetch('/api/options'), making the challenge unsolvable.
+    # 2500 lets the model see full HTML for typical web challenges while
+    # still capping large outputs (e.g. binary dumps).
+    max_tool_response_chars: 2500
+    # Disable runtime bridge subprocess — it adds latency and failure modes
+    # while calling the same parse_tool_calls() as the local path.
+    # With runtime_cmd null, DefaultStepAgent uses direct local parsing
+    # + fallback shell command extraction (faster, more reliable).
+    runtime_fallback_to_parser: true
+  # External vLLM server (overridden by launch script)
+  use_vllm: true
+  vllm_mode: server
+  vllm_server_url: "http://localhost:8001"
+  allow_remote_lora: true
+  gpu_memory_utilization: 0.20
+  # flash_attn: false tells SkyRL not to use flash_attention_2 (which
+  # requires the flash_attn package).  On RunPod H200 the model_wrapper
+  # is patched to fall back to PyTorch SDPA (with flash/mem-eff backends)
+  # instead of eager attention.  This avoids O(n²) memory while not
+  # depending on a correctly compiled flash_attn wheel.
+  # On GB10 (sm_121a): flash_attn stub prevents import errors.
+  flash_attn: false
+  use_sample_packing: false
+
+reward:
+  # Same as production — flag-dominant
+  flag_weight: 0.40
+  efficiency_weight: 0.15
+  progression_weight: 0.08
+  exploration_weight: 0.05
+  uniqueness_weight: 0.05
+  format_weight: 0.10
+  recovery_weight: 0.09
+  cognitive_weight: 0.08
+  hallucination_penalty: 0.20
+  # Output-aware: rewards productive HTTP interactions, penalizes dead-end 404s.
+  # Additive bonus (not part of the 1.0 sum). 0.10 = up to +0.10 for good web exploration.
+  interaction_quality_weight: 0.10
+  noise_range: 0.05
+  exploration_gamma: 0.95
+  use_gdpo: false
+
+output:
+  # Save checkpoint every step for inspection
+  save_steps: 1
+  logging_steps: 1
+  report_to: tensorboard
+
+online_rl_logging:
+  enable_trajectory_logging: true
+  # Fail smoke early if no trajectory JSONL artifacts are produced.
+  require_trajectory_files: true

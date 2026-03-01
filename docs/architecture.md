@@ -11,8 +11,8 @@ flowchart TB
         traces --> converter["BoxPwnrConverter<br/>(lossless, 13 tools)"]
         synth["Synthetic Generator"] --> sft_data
         synth --> grpo_data
-        converter --> sft_data["SFT data<br/>(820 successes)"]
-        converter --> grpo_data["GRPO data<br/>(87 CyBench + flags)"]
+        converter --> sft_data["SFT data<br/>(339 successes)"]
+        converter --> grpo_data["GRPO data<br/>(33 CyBench + flags)"]
     end
 
     subgraph pipeline["3-Stage Training Pipeline"]
@@ -42,7 +42,7 @@ src/open_ctf/
 │   ├── registry.py              # ChallengeRegistry — YAML-backed challenge lookup
 │   └── manager.py               # ChallengeManager — Docker container lifecycle
 ├── cli/
-│   ├── train.py                 # open-ctf-train (sft, grpo, gepa, merge)
+│   ├── train.py                 # open-ctf-train (sft, rl, gepa, merge)
 │   ├── convert_traces.py        # open-ctf-convert
 │   ├── split_dataset.py         # open-ctf-split
 │   ├── evaluate.py              # open-ctf-eval (--agent for pluggable agents)
@@ -73,7 +73,6 @@ src/open_ctf/
     │   ├── llamafactory.py      # LlamaFactory SFT backend
     │   └── trl.py               # TRL SFT backend
     ├── online_rl/
-    │   ├── entrypoint.py        # Stage-2 online RL entrypoint
     │   ├── runtime.py           # SkyRL runtime + config conversion
     │   ├── step_reward.py       # Per-step shaping reward adapter
     │   └── trajectory_logger.py # Rollout + reward telemetry
@@ -112,17 +111,20 @@ flowchart LR
 
 ## CTF Reward Function
 
-The reward function (`src/open_ctf/rewards/reward.py`) scores agent trajectories on 6 process reward signals plus a hallucination penalty. All process signals are **ungated** — they provide gradient signal regardless of flag capture to prevent reward sparsity during early training.
+The reward function (`src/open_ctf/rewards/reward.py`) scores trajectories with **8 process signals + 1 penalty** (plus optional interaction-quality bonus). Process signals are ungated so training still gets useful gradient before first-flag success becomes common.
 
 | Signal | Weight | What It Measures |
 |--------|--------|------------------|
-| **Flag Capture** | 0.20 | `metadata.success` > exact match > pattern match (0.1) |
-| **Efficiency** | 0.25 | `min(optimal / actual, 1.0)` steps |
-| **Format** | 0.20 | Valid tool call JSON structure |
-| **Progression** | 0.15 | RECON → ENUM → EXPLOIT phase ordering |
-| **Exploration** | 0.10 | Novel tool usage weighted toward early trajectory |
-| **Uniqueness** | 0.10 | Command diversity (detects stuck loops) |
-| **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag (decayed by similarity) |
+| **Flag Capture** | 0.40 | Correct flag submission / terminal solve |
+| **Efficiency** | 0.15 | Steps vs `optimal_steps` target |
+| **Format Compliance** | 0.10 | Valid, parseable tool-call structure |
+| **Recovery** | 0.09 | Pivoting out of repeated/stuck action loops |
+| **Progression** | 0.08 | RECON → ENUM → EXPLOIT phase ordering |
+| **Cognitive** | 0.08 | Reasoning density (words per action band) |
+| **Exploration** | 0.05 | Early novelty in tool usage (decayed over time) |
+| **Uniqueness** | 0.05 | Non-redundant command/output information |
+| **Hallucination Penalty** | -0.20 | Wrong flag / fabricated-success behavior |
+| **Interaction Quality (bonus)** | 0.00 default | Optional additive signal for productive interactions |
 
 ## Model Formatters
 
@@ -191,7 +193,7 @@ configs/challenges/<benchmark>.yaml  ← Challenge registry (custom YAML)
 
 LlamaFactory and SkyRL configs use each framework's native format directly — no translation layer.
 
-### Key Settings (GLM-4.7-Flash, 32K Context)
+### Key Settings (Qwen3.5-27B, 48K Context)
 
 | Parameter | SFT | GRPO |
 |-----------|-----|------|

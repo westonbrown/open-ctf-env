@@ -6,16 +6,18 @@ model formatters, and reference projects WITHOUT requiring GPU or model weights.
 
 Usage:
     open-ctf-validate
-    open-ctf-validate --mode grpo-preflight
+    open-ctf-validate --mode online-rl-preflight
 """
 
 import argparse
 import hashlib
+import http.client
 import json
 import py_compile
 import socket
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Color helpers
@@ -46,10 +48,41 @@ def _section(msg):
 
 
 def _probe_target_url(target: str, timeout: float = 1.5) -> tuple[bool, str]:
-    host = target
+    text = str(target or "").strip()
+    if not text:
+        return False, "empty target"
+    if text.startswith("file://"):
+        return True, "file_target"
+
+    if text.startswith(("http://", "https://")):
+        parsed = urlparse(text)
+        host = parsed.hostname
+        if not host:
+            return False, f"invalid target: {text}"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        conn_cls = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        conn = conn_cls(host=host, port=port, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={"User-Agent": "open-ctf-preflight/1.0"})
+            resp = conn.getresponse()
+            return True, f"http_status_{resp.status}"
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    host = text
     port = 80
-    if "://" in host:
-        host = host.split("://", 1)[1]
     if "/" in host:
         host = host.split("/", 1)[0]
     if ":" in host:
@@ -166,14 +199,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Validate Open CTF pipeline health.")
     parser.add_argument(
         "--mode",
-        choices=["basic", "grpo-preflight"],
+        choices=["basic", "online-rl-preflight"],
         default="basic",
-        help="Validation mode. grpo-preflight adds dependency + target reachability checks.",
+        help="Validation mode. online-rl-preflight adds dependency + target reachability checks.",
     )
     parser.add_argument(
         "--online-rl-data",
-        "--grpo-data",
-        dest="online_rl_data",
         default=None,
         help=(
             "Path to online RL JSONL for preflight "
@@ -189,6 +220,11 @@ def main() -> None:
         "--target-map",
         default=None,
         help="Optional challenge target map JSON for connectivity checks.",
+    )
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host override used for challenge registry target resolution checks.",
     )
     parser.add_argument(
         "--data-manifest",
@@ -235,7 +271,6 @@ def main() -> None:
             _first_existing_path(
                 DATA_DIR / "online_rl_quality.jsonl",
                 DATA_DIR / "online_rl.jsonl",
-                DATA_DIR / "grpo.jsonl",
             ),
         ),
     ]
@@ -366,7 +401,6 @@ def main() -> None:
         "src/open_ctf/training/online_rl/runtime.py",
         [
             SRC_DIR / "open_ctf" / "training" / "online_rl" / "runtime.py",
-            SRC_DIR / "open_ctf" / "training" / "grpo.py",
         ],
         errors,
     )
@@ -385,11 +419,8 @@ def main() -> None:
             online_rl = cfg.get("online_rl")
             if isinstance(online_rl, dict):
                 _ok("training.yaml: 'online_rl' section present")
-            elif isinstance(cfg.get("grpo"), dict):
-                _ok("training.yaml: 'grpo' section present (legacy)")
-                online_rl = cfg.get("grpo", {})
             else:
-                _fail("training.yaml: Missing 'online_rl' (or legacy 'grpo') section", errors)
+                _fail("training.yaml: Missing 'online_rl' section", errors)
                 online_rl = {}
 
             if online_rl.get("beta", 1.0) <= 0.01:
@@ -400,11 +431,19 @@ def main() -> None:
                     warnings,
                 )
 
-            if online_rl.get("loss_type") == "dapo":
-                _ok("Online RL loss_type=dapo")
+            policy_loss_type = str(online_rl.get("policy_loss_type", "") or "").strip()
+            legacy_loss_type = str(online_rl.get("loss_type", "") or "").strip()
+            if policy_loss_type:
+                _ok(f"Online RL policy_loss_type={policy_loss_type}")
+            elif legacy_loss_type:
+                _ok(
+                    "Online RL legacy loss_type is set "
+                    f"({legacy_loss_type}); runtime alias mapping will apply"
+                )
             else:
                 _warn(
-                    f"Online RL loss_type={online_rl.get('loss_type', 'missing')} (should be dapo)",
+                    "Online RL loss config missing (set online_rl.policy_loss_type, "
+                    "or legacy online_rl.loss_type)",
                     warnings,
                 )
     else:
@@ -416,11 +455,11 @@ def main() -> None:
     _section("4. TOOL REGISTRY")
 
     try:
-        from open_ctf.formatters.tool_registry import BOXPWNR_TOOLS
+        from open_ctf.formatters.tool_registry import AGENT_TOOLS
 
-        _ok(f"BOXPWNR_TOOLS imported: {len(BOXPWNR_TOOLS)} tools")
+        _ok(f"AGENT_TOOLS imported: {len(AGENT_TOOLS)} tools")
 
-        tool_names = {t["function"]["name"] for t in BOXPWNR_TOOLS}
+        tool_names = {t["function"]["name"] for t in AGENT_TOOLS}
         required_tools = ["shell_command", "exec_command", "write_stdin", "flag_found"]
         for tool in required_tools:
             if tool in tool_names:
@@ -469,20 +508,32 @@ def main() -> None:
     # -------------------------------------------------------------------
     _section("6. BOXPWNR REFERENCE")
 
-    boxpwnr_ref = OCE_ROOT / "references" / "boxpwnr"
-    if boxpwnr_ref.exists():
-        if (boxpwnr_ref / ".git").exists():
-            _ok("BoxPwnr reference: Valid git repo")
-        else:
-            _warn("BoxPwnr reference exists but no .git directory", warnings)
+    try:
+        from open_ctf.agent.runner import _default_boxpwnr_source_candidates
 
-        tools_file = boxpwnr_ref / "src" / "boxpwnr" / "tools" / "tools.py"
-        if tools_file.exists():
-            _ok(f"BoxPwnr tools.py: Found ({tools_file.stat().st_size} bytes)")
+        candidates = _default_boxpwnr_source_candidates()
+        existing = [p for p in candidates if p.exists()]
+        if existing:
+            for src in existing:
+                git_dir = src.parent / ".git"
+                if git_dir.exists():
+                    _ok(f"BoxPwnr source candidate: {src} (git repo)")
+                else:
+                    _ok(f"BoxPwnr source candidate: {src}")
+
+                tools_file = src / "boxpwnr" / "tools" / "tools.py"
+                if tools_file.exists():
+                    _ok(f"BoxPwnr tools.py: Found ({tools_file.stat().st_size} bytes)")
+                else:
+                    _warn(f"BoxPwnr tools.py not found under {src}", warnings)
         else:
-            _warn("BoxPwnr tools.py not found", warnings)
-    else:
-        _warn("BoxPwnr reference not found at references/boxpwnr/", warnings)
+            _warn(
+                "No local BoxPwnr source candidates found. "
+                "Install `boxpwnr` in env or set OPEN_CTF_BOXPWNR_SRC.",
+                warnings,
+            )
+    except Exception as e:
+        _warn(f"BoxPwnr source candidate validation failed: {e}", warnings)
 
     # -------------------------------------------------------------------
     # 7. Evaluation harness
@@ -527,10 +578,10 @@ def main() -> None:
         _warn("agent/runner.py: Not found", warnings)
 
     # -------------------------------------------------------------------
-    # 9. GRPO preflight (optional)
+    # 9. ONLINE RL preflight (optional)
     # -------------------------------------------------------------------
-    if args.mode == "grpo-preflight":
-        _section("9. GRPO PREFLIGHT")
+    if args.mode == "online-rl-preflight":
+        _section("9. ONLINE RL PREFLIGHT")
 
         # Fast runtime dependency checks for Qwen3.5 linear attention path.
         try:
@@ -543,27 +594,52 @@ def main() -> None:
         except Exception as exc:
             _warn(f"Dependency probe failed: {exc}", warnings)
 
-        grpo_data = (
+        # Guard against known SkyRL step-wise crash:
+        # per_token_reward[resp_end_idx] out-of-range writes.
+        try:
+            import importlib.util
+
+            skyrl_spec = importlib.util.find_spec("skyrl_train.generators.skyrl_gym_generator")
+            skyrl_origin = getattr(skyrl_spec, "origin", None) if skyrl_spec else None
+            if skyrl_origin:
+                from open_ctf.training.online_rl.runtime import _has_step_wise_resp_index_guard
+
+                source = Path(skyrl_origin).read_text()
+                if _has_step_wise_resp_index_guard(source):
+                    _ok("SkyRL step-wise index guard: present")
+                else:
+                    _fail(
+                        "SkyRL step-wise index guard missing (run docker/patches/apply_all_patches.sh)",
+                        errors,
+                    )
+            else:
+                _warn(
+                    "SkyRL generator module not found; skipping step-wise index-guard check",
+                    warnings,
+                )
+        except Exception as exc:
+            _warn(f"SkyRL step-wise index-guard probe failed: {exc}", warnings)
+
+        online_rl_data = (
             Path(args.online_rl_data)
             if args.online_rl_data
             else _first_existing_path(
                 DATA_DIR / "online_rl_quality.jsonl",
                 DATA_DIR / "online_rl_cybench40.jsonl",
-                DATA_DIR / "grpo_cybench40.jsonl",
             )
         )
-        if grpo_data.exists():
+        if online_rl_data.exists():
             try:
-                with open(grpo_data) as f:
+                with open(online_rl_data) as f:
                     sample_count = sum(1 for line in f if line.strip())
                 if sample_count > 0:
-                    _ok(f"GRPO data: {sample_count} samples ({grpo_data})")
+                    _ok(f"Online RL data: {sample_count} samples ({online_rl_data})")
                 else:
-                    _fail(f"GRPO data is empty: {grpo_data}", errors)
+                    _fail(f"Online RL data is empty: {online_rl_data}", errors)
             except Exception as exc:
-                _fail(f"Failed to read GRPO data {grpo_data}: {exc}", errors)
+                _fail(f"Failed to read online RL data {online_rl_data}: {exc}", errors)
         else:
-            _fail(f"GRPO data not found: {grpo_data}", errors)
+            _fail(f"Online RL data not found: {online_rl_data}", errors)
 
         if args.challenge_registry:
             registry_path = Path(args.challenge_registry)
@@ -603,9 +679,9 @@ def main() -> None:
         dataset_missing_registry_flag = 0
         dataset_provenance_registry_hashes: set[str] = set()
         dataset_provenance_target_map_hashes: set[str] = set()
-        if grpo_data.exists():
+        if online_rl_data.exists():
             try:
-                with open(grpo_data) as f:
+                with open(online_rl_data) as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -635,7 +711,10 @@ def main() -> None:
                             if isinstance(src_tmap, str) and src_tmap.strip():
                                 dataset_provenance_target_map_hashes.add(src_tmap.strip())
             except Exception as exc:
-                _warn(f"Could not parse GRPO dataset for registry sync checks: {exc}", warnings)
+                _warn(
+                    f"Could not parse online RL dataset for registry sync checks: {exc}",
+                    warnings,
+                )
 
         if registry_ids:
             unknown_ids = sorted(dataset_ids - registry_ids)
@@ -671,7 +750,7 @@ def main() -> None:
         manifest_path = (
             Path(args.data_manifest)
             if args.data_manifest
-            else Path(f"{grpo_data}.manifest.json")
+            else Path(f"{online_rl_data}.manifest.json")
         )
         if manifest_path.exists():
             try:
@@ -797,6 +876,35 @@ def main() -> None:
                 _warn(f"Target map probe failed for {target_map_path}: {exc}", warnings)
         elif target_map_path:
             _warn(f"Target map not found: {target_map_path}", warnings)
+
+        # Universal runtime preflight gate:
+        # fail fast on registry/target/port/container/reachability mismatches.
+        if registry_path.exists():
+            try:
+                from open_ctf.challenges.preflight import validate_runtime_preflight
+                from open_ctf.challenges.registry import ChallengeRegistry
+
+                registry = ChallengeRegistry(str(registry_path))
+                if target_map_path and target_map_path.exists():
+                    registry.load_target_overrides(str(target_map_path), strict=False)
+
+                preflight_ids: list[str] | None = None
+                if dataset_ids:
+                    preflight_ids = sorted(dataset_ids)
+                validate_runtime_preflight(
+                    registry,
+                    host=args.host,
+                    challenge_ids=preflight_ids,
+                    timeout_seconds=2.0,
+                    require_reachable=True,
+                    strict_container_check=True,
+                )
+                _ok(
+                    "Runtime preflight gate passed "
+                    "(registry/target/port/container/connectivity)"
+                )
+            except Exception as exc:
+                _fail(f"Runtime preflight gate failed: {exc}", errors)
 
     # -------------------------------------------------------------------
     # Summary

@@ -19,7 +19,7 @@ GRAD_ACCUM="${GRAD_ACCUM:-8}"
 USE_4BIT="${USE_4BIT:-0}"
 USE_LIGER_KERNEL="${USE_LIGER_KERNEL:-1}"
 MERGE_AFTER_SFT="${MERGE_AFTER_SFT:-1}"
-TRAINING_CONFIG="${TRAINING_CONFIG:-${PROJECT_ROOT}/src/open_ctf/configs/training_qwen35_27b.yaml}"
+TRAINING_CONFIG="${TRAINING_CONFIG:-${PROJECT_ROOT}/configs/training/training_qwen35_27b.yaml}"
 
 START_VLLM_AFTER_SFT="${START_VLLM_AFTER_SFT:-1}"
 VLLM_MODEL="${VLLM_MODEL:-}"
@@ -40,7 +40,7 @@ if [[ "${AUTO_CURATE_DATA}" == "1" ]]; then
     fi
     log "Curating SFT data -> ${DATA_PATH} (platform=cybench, registry-filtered)"
     PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH:-}" \
-    python3 "${PROJECT_ROOT}/scripts/curate_sft_data.py" \
+    python3 "${PROJECT_ROOT}/src/open_ctf/data/curate_sft_data.py" \
         --input "${RAW_DATA_PATH}" \
         --output "${DATA_PATH}" \
         --registry "${CHALLENGE_REGISTRY}" \

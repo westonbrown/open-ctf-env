@@ -9,9 +9,11 @@ at import time. This stub provides:
 - flash_attn.ops.triton.rotary: apply_rotary (PyTorch fallback)
 """
 import pathlib
+import sysconfig
 import sys
 
-SITE = pathlib.Path("/usr/local/lib/python3.12/dist-packages/flash_attn")
+_site_packages = pathlib.Path(sysconfig.get_path("purelib"))
+SITE = _site_packages / "flash_attn"
 
 
 def main():

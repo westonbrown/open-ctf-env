@@ -27,7 +27,7 @@ Treat online RL data as generated artifacts from benchmark infra, not hand-edite
 1. Generate from registry + metadata:
 
 ```bash
-python scripts/generate_online_rl_from_registry.py \
+python src/open_ctf/cli/generate_online_rl.py \
   --registry configs/challenges/cybench.yaml \
   --metadata configs/challenges/cybench_metadata.json \
   --output data/online_rl_quality.jsonl
@@ -36,7 +36,7 @@ python scripts/generate_online_rl_from_registry.py \
 2. (RunPod/DGX) Apply target overrides and verify endpoints before writing data:
 
 ```bash
-python scripts/generate_online_rl_from_registry.py \
+python src/open_ctf/cli/generate_online_rl.py \
   --registry configs/challenges/cybench.yaml \
   --target-map configs/challenges/cybench_target_map_runpod.json \
   --probe-targets \

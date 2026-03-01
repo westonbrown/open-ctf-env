@@ -1,6 +1,6 @@
 """CTF reward function for online GRPO training.
 
-Physics-inspired scoring (8 signals, sum to 1.0 + penalty):
+Physics-inspired scoring (8 signals, sum to 1.0 + bonus/penalty):
   - Flag capture (0.40): Boundary condition -- did the trajectory reach the goal?
   - Efficiency (0.15): Principle of least action -- shortest path to the goal.
   - Format compliance (0.10): Signal fidelity -- valid instrument readings only.
@@ -10,6 +10,7 @@ Physics-inspired scoring (8 signals, sum to 1.0 + penalty):
   - Exploration (0.05): Exponentially-decayed novelty -- early diversity > late.
   - Uniqueness (0.05): Information entropy -- repeated observations carry zero bits.
   - Hallucination penalty (0.20): Energy loss -- false claims decay trajectory progress.
+  - (Removed) Interaction quality was disabled at weight=0.0 and has been deleted.
 
 Design principles:
   - **Principle of least action**: Flag (boundary condition) + efficiency (path
@@ -156,14 +157,38 @@ class CTFReward:
         seed: Optional[int] = None,
         use_gdpo: bool = False,
     ) -> None:
-        """Initialize reward configuration."""
+        """Initialize reward configuration.
+
+        The 8 primary weights must sum to 1.0.
+        """
         total = (flag_weight + efficiency_weight + progression_weight
                  + exploration_weight + uniqueness_weight + format_weight
                  + recovery_weight + cognitive_weight)
         if abs(total - 1.0) > 1e-6:
-            raise ValueError(
-                f"Reward weights must sum to 1.0, got {total:.4f}"
-            )
+            if total > 0:
+                import logging
+                _log = logging.getLogger(__name__)
+                _log.warning(
+                    "Reward weights sum to %.4f, auto-normalizing to 1.0 "
+                    "(flag=%.3f eff=%.3f prog=%.3f expl=%.3f uniq=%.3f "
+                    "fmt=%.3f rec=%.3f cog=%.3f)",
+                    total, flag_weight, efficiency_weight, progression_weight,
+                    exploration_weight, uniqueness_weight, format_weight,
+                    recovery_weight, cognitive_weight,
+                )
+                scale = 1.0 / total
+                flag_weight *= scale
+                efficiency_weight *= scale
+                progression_weight *= scale
+                exploration_weight *= scale
+                uniqueness_weight *= scale
+                format_weight *= scale
+                recovery_weight *= scale
+                cognitive_weight *= scale
+            else:
+                raise ValueError(
+                    f"Reward weights must sum to 1.0, got {total:.4f}"
+                )
         self.flag_weight = flag_weight
         self.efficiency_weight = efficiency_weight
         self.progression_weight = progression_weight
@@ -296,14 +321,11 @@ class CTFReward:
         """
         text, tool_calls = self._extract(completion)
 
-        metadata_success = (
-            meta.get("success") if isinstance(meta, dict) else None
-        )
         task_category = (
             meta.get("task_category", "web") if isinstance(meta, dict) else "web"
         )
 
-        flag_sc = self._flag_score(text, gt_flag, metadata_success=metadata_success)
+        flag_sc = self._flag_score(text, gt_flag)
 
         # Compute process signals (all ungated for dual-mode support).
         eff_sc = self._efficiency_score(
@@ -316,6 +338,14 @@ class CTFReward:
         hall_sc = self._hallucination_score(tool_calls, flag_sc, gt_flag)
         recov_sc = self._recovery_score(tool_calls)
         cog_sc = self._cognitive_score(text, tool_calls)
+
+        # Minimum work gate: prevent reward hacking via very short episodes.
+        # If fewer than 3 tool calls, cap easily-gamed process signals.
+        if len(tool_calls) < 3:
+            _SHORT_CAP = 0.3
+            fmt_sc = min(fmt_sc, _SHORT_CAP)
+            uniq_sc = min(uniq_sc, _SHORT_CAP)
+            recov_sc = min(recov_sc, _SHORT_CAP)
 
         # Entropy-scaled format: modulate format by information density.
         # Low uniqueness = low entropy = less format credit.
@@ -369,7 +399,7 @@ class CTFReward:
         current_cog_weight = self.cognitive_weight
         current_eff_weight = self.efficiency_weight
 
-        if str(task_category).lower() in ("crypto", "rev", "forensics"):
+        if str(task_category).lower() in ("crypto", "rev", "reverse", "forensics", "pwn"):
             # Disable strict progression and redistribute its weight
             redistribute = current_prog_weight
             current_prog_weight = 0.0
@@ -435,23 +465,19 @@ class CTFReward:
         """Score flag capture (online mode).
 
         Priority order:
-          0. metadata_success override (platform/environment confirmation)
           1. Environment verification signal in tool response text
              ("Correct! Flag verified" -> 1.0, "Incorrect submission" -> 0.0)
           2. Exact match against ground_truth_flag -> 1.0
           3. Pattern match: FLAG{<alphanumeric>} -> 0.1
           4. No flag -> 0.0
-        """
-        # 0. Metadata success override: authoritative platform signal.
-        # metadata.success=True → environment confirmed solve (even without
-        # flag text in completion). metadata.success=False → only pattern credit.
-        if metadata_success is True:
-            return 1.0
-        if metadata_success is False:
-            if re.search(r"FLAG\{[a-zA-Z0-9_-]+\}", text):
-                return 0.1
-            return 0.0
 
+        Note: metadata_success is accepted for API compatibility but ignored.
+        Flag score requires explicit submission via flag_found/submit_flag
+        (environment verification) or exact text match against ground truth.
+        The old metadata_success shortcut was removed because episode_done
+        (which feeds metadata.success) fires when ground-truth appears
+        anywhere in tool output, even if the model never called flag_found.
+        """
         # 1. Environment verification: ToolExecutor responds with
         #    "Correct! Flag verified: <flag>" on success, or
         #    "Incorrect submission: <flag>" on failure. This is the
@@ -817,7 +843,13 @@ class CTFReward:
         for tc in tool_calls:
             if tc.get("name") in ("flag_found", "submit_flag"):
                 penalty = -self.hallucination_penalty
-                
+
+                # Premature submission multiplier: penalize harder when the
+                # model hallucinated a flag very early (few tool calls).
+                # 1 tool call → penalty * 1.8, 2 → 1.6, 5+ → 1.0 (no extra).
+                premature_mult = 1.0 + max(0.0, 1.0 - len(tool_calls) / 5.0)
+                penalty *= premature_mult
+
                 if ground_truth:
                     submitted = self._extract_command(tc).strip()
                     if submitted:
@@ -825,7 +857,7 @@ class CTFReward:
                         if similarity >= 0.8:
                             # 80%+ similar (e.g., missing FLAG{} wrapper), decay the penalty by 90%
                             penalty *= 0.1
-                
+
                 return penalty
 
         return 0.0
@@ -874,4 +906,3 @@ class CTFReward:
                     tool_calls.append({"name": name, "arguments": args or ""})
             return "\n".join(text_parts), tool_calls
         return str(completion), []
-

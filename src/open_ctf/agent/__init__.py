@@ -1,6 +1,7 @@
 """CTF agent interface and implementations."""
 
-from .protocol import AgentResult, CTFAgent, StepAgent, StepResult
+from .protocol import AgentResult, CTFAgent, StepAgent, StepResult, validate_step_agent
+from .rollout_status import RolloutStatus, normalize_rollout_status
 from .default_agent import DefaultStepAgent
 from .runner import AgentRunner
 from .boxpwnr_adapter import BoxPwnrAgent
@@ -11,6 +12,9 @@ __all__ = [
     "BoxPwnrAgent",
     "CTFAgent",
     "DefaultStepAgent",
+    "RolloutStatus",
     "StepAgent",
     "StepResult",
+    "normalize_rollout_status",
+    "validate_step_agent",
 ]

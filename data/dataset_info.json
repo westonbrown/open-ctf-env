@@ -1,6 +1,6 @@
 {
   "open_ctf_sft": {
-    "file_name": "sft_quality.jsonl",
+    "file_name": "sft_v6.jsonl",
     "formatting": "openai",
     "columns": {
       "messages": "messages"

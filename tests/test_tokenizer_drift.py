@@ -45,8 +45,7 @@ def test_tokenizer_drift_schema_injection():
         'Call tools using: <tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>'
     )
     expected_tool_def = (
-        "- shell_command: Run a shell command in the CTF attacker container. Supports pipes, redirects, and multi-line scripts.\n"
-        "  - command: string [required]\n"
+        "- shell_command: Runs a shell script (string) and returns its output when finished."
     )
 
     assert expected_header in sys_content, "Tool schema injection header drifted."

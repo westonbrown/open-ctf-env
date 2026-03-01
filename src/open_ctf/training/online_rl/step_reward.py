@@ -32,6 +32,7 @@ _VALID_REWARD_KEYS = frozenset({
     "flag_weight", "efficiency_weight", "progression_weight",
     "format_weight", "exploration_weight", "uniqueness_weight",
     "recovery_weight", "cognitive_weight", "hallucination_penalty",
+    "interaction_quality_weight",
     "noise_range", "exploration_gamma", "seed", "use_gdpo",
 })
 
@@ -59,11 +60,21 @@ def create_reward_fn(config: Dict[str, Any]):
             f"Valid keys: {sorted(_VALID_REWARD_KEYS)}"
         )
 
+    # interaction_quality_weight was removed from CTFReward but kept in
+    # _VALID_REWARD_KEYS so existing configs don't crash. Warn and skip.
+    _REMOVED_KEYS = frozenset({"interaction_quality_weight"})
     _BOOL_REWARD_KEYS = frozenset({"use_gdpo"})
 
     kwargs = {}
     for key in _VALID_REWARD_KEYS:
         if key in reward_cfg:
+            if key in _REMOVED_KEYS:
+                logger.warning(
+                    "Reward config key '%s' is deprecated and ignored "
+                    "(interaction quality scoring was removed).",
+                    key,
+                )
+                continue
             if key == "seed":
                 kwargs[key] = int(reward_cfg[key]) if reward_cfg[key] is not None else None
             elif key in _BOOL_REWARD_KEYS:
@@ -107,10 +118,18 @@ def _get_phase(tool_name: str) -> int:
     return _TOOL_PHASE.get(tool_name, 1)
 
 
+# Per-step shaping reward magnitudes.
+# Kept intentionally small so the terminal CTFReward (8-signal, typical
+# range 0.0-2.0) remains the dominant learning signal.
+FORMAT_COMPLIANCE_REWARD = 0.02    # valid tool call produced
+FORMAT_COMPLIANCE_PENALTY = -0.02  # no tool call produced
+PHASE_PROGRESSION_REWARD = 0.03    # advanced to a new attack phase
+LOOP_SUPPRESSION_PENALTY = -0.03   # exact command repetition
+
+
 def per_step_reward(
     tool_calls_so_far: List[Dict[str, str]],
     step: int,
-    max_steps: int,
     *,
     step_tool_call_count: int = 0,
     step_wise: bool = False,
@@ -120,18 +139,15 @@ def per_step_reward(
     When step_wise=False (default), returns 0.0 for all non-terminal steps.
     All reward signal comes from the terminal CTFReward computation.
 
-    When step_wise=True (enabled via grpo.step_wise_trajectories config),
+    When step_wise=True (enabled via online_rl.step_wise_trajectories config),
     returns a small shaping reward:
-      - Format compliance: +0.02 for valid tool call, -0.02 for no tool call
-      - Phase progression: +0.03 if this step advances to a new attack phase
-
-    These signals are intentionally small so the terminal CTFReward
-    (8-signal, typical range 0.0-2.0) remains the dominant learning signal.
+      - Format compliance: +/- FORMAT_COMPLIANCE_REWARD for valid/no tool call
+      - Phase progression: + PHASE_PROGRESSION_REWARD if this step advances phase
+      - Loop suppression: + LOOP_SUPPRESSION_PENALTY for exact command repetition
 
     Args:
         tool_calls_so_far: All tool calls accumulated in the episode so far.
         step: Current step number (1-indexed).
-        max_steps: Maximum allowed steps.
         step_tool_call_count: Number of tool calls parsed in this step
             (0 means no valid tool call was found).
         step_wise: Whether step-wise trajectory rewards are enabled.
@@ -141,14 +157,14 @@ def per_step_reward(
 
     reward = 0.0
 
-    # Signal 1: Format compliance (+0.02 / -0.02)
+    # Signal 1: Format compliance
     # Did the model produce a well-formed tool call this step?
     if step_tool_call_count > 0:
-        reward += 0.02
+        reward += FORMAT_COMPLIANCE_REWARD
     else:
-        reward -= 0.02
+        reward += FORMAT_COMPLIANCE_PENALTY
 
-    # Signal 2: Phase progression (+0.03 if new phase reached)
+    # Signal 2: Phase progression
     # Check if this step's tool calls advanced to a phase not seen before.
     if len(tool_calls_so_far) >= 2 and step_tool_call_count > 0:
         # Phases seen before this step's tool calls
@@ -162,6 +178,21 @@ def per_step_reward(
         # Reward if any new phase was reached
         new_phases = current_phases - prev_phases
         if new_phases:
-            reward += 0.03
+            reward += PHASE_PROGRESSION_REWARD
+
+    # Signal 3: Loop suppression
+    # Discourage the common degenerate pattern where the agent repeatedly
+    # issues the same curl command (for example hitting "/" every turn).
+    if step_tool_call_count > 0:
+        start_idx = len(tool_calls_so_far) - step_tool_call_count
+        if start_idx > 0:
+            prev_call = tool_calls_so_far[start_idx - 1]
+            curr_call = tool_calls_so_far[start_idx]
+            prev_name = str(prev_call.get("name", ""))
+            curr_name = str(curr_call.get("name", ""))
+            prev_args = str(prev_call.get("arguments", ""))
+            curr_args = str(curr_call.get("arguments", ""))
+            if prev_name == curr_name and prev_args == curr_args:
+                reward += LOOP_SUPPRESSION_PENALTY
 
     return reward

@@ -15,7 +15,7 @@ from open_ctf.formatters.base import ModelFormatter
 from open_ctf.formatters.qwen3 import Qwen3Formatter
 from open_ctf.formatters.glm4 import GLM4Formatter
 from open_ctf.formatters.devstral import DevstralFormatter
-from open_ctf.formatters.tool_registry import BOXPWNR_TOOLS, get_tool_by_name, get_tools_by_names
+from open_ctf.formatters.tool_registry import AGENT_TOOLS, get_tool_by_name, get_tools_by_names
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ class TestQwen3Formatter:
     def test_get_tool_definitions(self, formatter):
         tools = formatter.get_tool_definitions()
         assert len(tools) > 0
-        assert tools == list(BOXPWNR_TOOLS)
+        assert tools == list(AGENT_TOOLS)
 
 
 # ---------------------------------------------------------------------------
@@ -224,16 +224,16 @@ class TestDevstralFormatter:
 
 class TestToolRegistry:
     def test_boxpwnr_tools_not_empty(self):
-        assert len(BOXPWNR_TOOLS) > 0
+        assert len(AGENT_TOOLS) > 0
 
     def test_required_tools_present(self):
-        names = {t["function"]["name"] for t in BOXPWNR_TOOLS}
+        names = {t["function"]["name"] for t in AGENT_TOOLS}
         required = {"shell_command", "flag_found", "python_code", "read_file", "grep"}
         for tool in required:
             assert tool in names, f"Required tool '{tool}' missing from registry"
 
     def test_tool_schema_structure(self):
-        for tool in BOXPWNR_TOOLS:
+        for tool in AGENT_TOOLS:
             assert tool["type"] == "function"
             fn = tool["function"]
             assert "name" in fn

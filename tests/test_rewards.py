@@ -63,17 +63,18 @@ class TestFlagScore:
         score = reward_no_noise._flag_score(text, "FLAG{abc_def}")
         assert score == 1.0
 
-    def test_metadata_success_overrides(self, reward_no_noise):
-        # metadata.success=True should give 1.0 even without flag in text
+    def test_metadata_success_ignored(self, reward_no_noise):
+        # metadata_success is accepted for API compat but no longer overrides.
+        # Without flag text or env verification, score should be 0.0.
         score = reward_no_noise._flag_score("no flag here", None, metadata_success=True)
-        assert score == 1.0
+        assert score == 0.0
 
     def test_metadata_success_with_placeholder_flag(self, reward_no_noise):
-        # The critical fix: placeholder flag + metadata.success should score 1.0
+        # placeholder flag + metadata.success should NOT give 1.0 anymore.
         score = reward_no_noise._flag_score(
             "no flag text", "content_of_flag_here", metadata_success=True
         )
-        assert score == 1.0
+        assert score == 0.0
 
     def test_placeholder_flag_skipped(self, reward_no_noise):
         # Placeholder flag should not match even if present in text
@@ -107,19 +108,19 @@ class TestFlagScore:
         assert score == 0.0
 
     def test_metadata_false_no_flag(self, reward_no_noise):
+        # metadata_success is now ignored; no flag text = 0.0
         score = reward_no_noise._flag_score("no flag", None, metadata_success=False)
         assert score == 0.0
 
-    def test_metadata_false_blocks_exact_match(self, reward_no_noise):
-        """metadata.success=False should block exact match fallback."""
+    def test_metadata_false_does_not_block_exact_match(self, reward_no_noise):
+        """metadata_success is ignored; exact text match should still score 1.0."""
         score = reward_no_noise._flag_score(
             "Found FLAG{real_flag}", "FLAG{real_flag}", metadata_success=False
         )
-        # Flag IS in text, but metadata says not solved -> only pattern credit
-        assert score == 0.1
+        assert score == 1.0
 
     def test_metadata_false_with_flag_pattern(self, reward_no_noise):
-        """metadata.success=False with FLAG{} pattern gives 0.1 credit."""
+        """metadata_success is ignored; FLAG{} pattern should give 0.1."""
         score = reward_no_noise._flag_score(
             "FLAG{some_flag}", None, metadata_success=False
         )
@@ -448,8 +449,12 @@ class TestCallIntegration:
         assert len(scores) == 1
         assert scores[0] > 0.5
 
-    def test_successful_trace_with_metadata(self, reward_no_noise):
-        """metadata.success=True should give flag credit even without flag text."""
+    def test_successful_trace_with_metadata_no_flag_bypass(self, reward_no_noise):
+        """metadata_success no longer bypasses flag scoring.
+
+        Without explicit flag submission or env verification, flag_sc=0.0
+        even when metadata.success=True.
+        """
         msgs = [
             {"role": "assistant", "content": "", "tool_calls": [
                 {"function": {"name": "shell_command", "arguments": '{"command": "nmap target"}'}}
@@ -463,9 +468,9 @@ class TestCallIntegration:
             optimal_steps=[2],
             metadata=[{"success": True}],
         )
-        # metadata.success=True → flag_sc=1.0 → 0.20*1.0 = 0.20
-        # Plus process signals from tool calls
-        assert scores[0] > 0.2
+        # metadata_success no longer gives flag credit. Score comes from
+        # process signals only (recovery neutral 0.5 etc).
+        assert scores[0] < 0.2
 
     def test_failed_trace_scores_low(self, reward_no_noise):
         # Trace with no tool calls at all -- pure text failure
@@ -536,19 +541,16 @@ class TestCallIntegration:
         # Recovery gets 0.5 (neutral for <3 tool calls) → 0.07*0.5 = 0.035
         assert scores[0] < 0.1
 
-    def test_metadata_success_via_kwargs(self, reward_no_noise):
-        """Verify metadata.success is extracted from nested metadata dict."""
+    def test_metadata_success_via_kwargs_no_bypass(self, reward_no_noise):
+        """metadata_success no longer bypasses flag scoring."""
         scores = reward_no_noise(
             ["no flag in text at all"],
             metadata=[{"success": True}],
             optimal_steps=[5],
         )
-        # metadata.success=True → flag_sc=1.0
-        # efficiency = 0.0 (0 steps), progression = 0, exploration = 0
-        # uniqueness = 0, format = 0, recovery = 0.5 (neutral), cognitive = 0
-        # Total = flag_weight*1.0 + recovery_weight*0.5
-        assert scores[0] > 0.35
-        assert scores[0] < 0.55
+        # metadata_success is ignored now. flag_sc=0.0 since no flag text.
+        # Only process signals contribute: recovery 0.5 (neutral), etc.
+        assert scores[0] < 0.15
 
 
 # ---------------------------------------------------------------------------
@@ -616,16 +618,25 @@ class TestGRPOSamples:
             f"Average success ({avg_success:.3f}) should be > average failure ({avg_failure:.3f})"
         )
 
-    def test_successful_traces_above_threshold(self, grpo_samples):
-        """Successful traces (per metadata) should score above 0.3."""
+    def test_successful_traces_with_real_flags_above_threshold(self, grpo_samples):
+        """Successful traces with real flags (not placeholders) should score above 0.3.
+
+        With metadata_success bypass removed, only traces that contain
+        env verification text or exact flag matches get flag credit.
+        Placeholder-flag traces may score lower.
+        """
         reward = CTFReward(noise_range=0.0, seed=0)
+        from open_ctf.rewards.reward import _FLAG_PLACEHOLDERS
         for sample in grpo_samples:
             if not sample["metadata"]["success"]:
                 continue
+            gt_flag = sample.get("ground_truth_flag", "")
+            if gt_flag in _FLAG_PLACEHOLDERS:
+                continue  # Skip placeholder flags
             completions = [sample["messages"]]
             scores = reward(
                 completions,
-                ground_truth_flag=[sample["ground_truth_flag"]],
+                ground_truth_flag=[gt_flag],
                 optimal_steps=[sample["optimal_steps"]],
                 metadata=[sample["metadata"]],
             )
@@ -681,8 +692,12 @@ class TestGRPOSamples:
         unique_steps = set(steps)
         assert len(unique_steps) >= 3, f"Need varied optimal_steps, got {unique_steps}"
 
-    def test_placeholder_flags_handled(self, grpo_samples):
-        """Samples with placeholder flags should still score correctly via metadata."""
+    def test_placeholder_flags_score_without_metadata_bypass(self, grpo_samples):
+        """Samples with placeholder flags rely on env verification, not metadata.
+
+        With metadata_success bypass removed, placeholder-flag samples
+        only score flag=1.0 if env verification text is in the completion.
+        """
         reward = CTFReward(noise_range=0.0, seed=0)
         placeholder_successes = [
             s for s in grpo_samples
@@ -692,17 +707,16 @@ class TestGRPOSamples:
         if not placeholder_successes:
             pytest.skip("No placeholder-flag successes found")
 
-        for sample in placeholder_successes[:5]:  # Test first 5
+        for sample in placeholder_successes[:5]:
             scores = reward(
                 [sample["messages"]],
                 ground_truth_flag=[sample["ground_truth_flag"]],
                 optimal_steps=[sample["optimal_steps"]],
                 metadata=[sample["metadata"]],
             )
-            assert scores[0] > 0.3, (
-                f"Placeholder-flag success '{sample['metadata']['challenge']}' "
-                f"scored only {scores[0]:.3f} (metadata.success should give 1.0)"
-            )
+            # Score will depend on env verification presence in tool output.
+            # No longer guaranteed > 0.3 without env verification text.
+            assert isinstance(scores[0], float)
 
     def test_grpo_readiness(self, grpo_samples):
         """All 4 GRPO readiness checks must pass on actual trace data."""

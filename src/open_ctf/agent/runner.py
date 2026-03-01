@@ -1,36 +1,105 @@
 """BoxPwnr-based CTF agent runner.
 
 Wraps BoxPwnr's Solver to run CTF challenges using LLM agents.
-Requires the BoxPwnr reference repo at references/boxpwnr/.
+Defaults to BoxPwnr, but resolves it generically from:
+1) installed Python package
+2) optional env-configured source paths
+3) local references/ fallback paths
 """
 
+import importlib
+import os
 import sys
 import logging
 from pathlib import Path
-from typing import Optional
-
-BOXPWNR_SRC = Path(__file__).resolve().parents[3] / "references" / "boxpwnr" / "src"
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-def _import_boxpwnr():
-    """Import BoxPwnr components. Raises ImportError with guidance if missing."""
-    # Only add BoxPwnr to path when actually needed (avoids import conflicts)
-    if BOXPWNR_SRC.exists() and str(BOXPWNR_SRC) not in sys.path:
-        sys.path.insert(0, str(BOXPWNR_SRC))
+def _default_boxpwnr_source_candidates() -> list[Path]:
+    """Return candidate source roots that may contain ``boxpwnr`` package."""
+    repo_root = Path(__file__).resolve().parents[3]
+    raw_candidates = [
+        os.getenv("OPEN_CTF_BOXPWNR_SRC", "").strip(),
+        os.getenv("OPEN_CTF_DEFAULT_AGENT_SRC", "").strip(),
+        str(repo_root / "references" / "boxpwnr" / "src"),
+        str(repo_root / "references" / "BoxPwnr" / "src"),
+    ]
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        if not raw:
+            continue
+        p = Path(raw).expanduser().resolve()
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(p)
+    return paths
+
+
+def _boxpwnr_import_origin() -> str:
+    """Return best-effort origin string for the imported ``boxpwnr`` package."""
+    try:
+        mod = importlib.import_module("boxpwnr")
+        origin = getattr(mod, "__file__", None)
+        if origin:
+            return str(Path(origin).resolve())
+    except Exception:
+        pass
+    return "python-path"
+
+
+def _import_boxpwnr() -> Tuple[object, object, object, object, object, str]:
+    """Import BoxPwnr components and return (classes..., resolved_source)."""
+    # Prefer installed package/import path first for maximum portability.
     try:
         from boxpwnr.core.solver import Solver
         from boxpwnr.executors.docker.docker_executor import DockerExecutor
         from boxpwnr.strategies import ChatCompletionToolsStrategy, ChatCompletionStrategy
         from boxpwnr.utils.secrets_manager import SecretManager
-        return Solver, DockerExecutor, ChatCompletionToolsStrategy, ChatCompletionStrategy, SecretManager
-    except ImportError as e:
-        raise ImportError(
-            f"BoxPwnr not found at {BOXPWNR_SRC}. "
-            f"Ensure references/boxpwnr/ exists with the full BoxPwnr repo. "
-            f"Original error: {e}"
-        ) from e
+        return (
+            Solver,
+            DockerExecutor,
+            ChatCompletionToolsStrategy,
+            ChatCompletionStrategy,
+            SecretManager,
+            _boxpwnr_import_origin(),
+        )
+    except ImportError as first_exc:
+        last_exc = first_exc
+
+    attempted: list[str] = []
+    for candidate in _default_boxpwnr_source_candidates():
+        attempted.append(str(candidate))
+        if not candidate.exists():
+            continue
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+        try:
+            from boxpwnr.core.solver import Solver
+            from boxpwnr.executors.docker.docker_executor import DockerExecutor
+            from boxpwnr.strategies import ChatCompletionToolsStrategy, ChatCompletionStrategy
+            from boxpwnr.utils.secrets_manager import SecretManager
+            return (
+                Solver,
+                DockerExecutor,
+                ChatCompletionToolsStrategy,
+                ChatCompletionStrategy,
+                SecretManager,
+                str(candidate),
+            )
+        except ImportError as exc:
+            last_exc = exc
+
+    raise ImportError(
+        "Could not import BoxPwnr. Install `boxpwnr` in the active environment "
+        "or set OPEN_CTF_BOXPWNR_SRC to a source path containing `boxpwnr/`. "
+        f"Attempted sources: {attempted or ['<none>']}. "
+        f"Original error: {last_exc}"
+    ) from last_exc
 
 
 def _get_platform(platform_name: str, executor, traces_dir: str, keep_target: bool = False):
@@ -122,8 +191,8 @@ class AgentRunner:
             True if all imports succeed, False otherwise.
         """
         try:
-            _import_boxpwnr()
-            print(f"BoxPwnr source: {BOXPWNR_SRC}")
+            *_, source = _import_boxpwnr()
+            print(f"BoxPwnr source: {source}")
             print(f"Platform:       {self.platform_name}")
             print(f"Model:          {self.model}")
             print(f"Strategy:       {self.strategy_name}")
@@ -139,7 +208,14 @@ class AgentRunner:
         Args:
             target: Target identifier (e.g. XBEN-003-24 for xbow).
         """
-        Solver, DockerExecutor, ChatCompletionToolsStrategy, ChatCompletionStrategy, SecretManager = _import_boxpwnr()
+        (
+            Solver,
+            DockerExecutor,
+            ChatCompletionToolsStrategy,
+            ChatCompletionStrategy,
+            SecretManager,
+            _,
+        ) = _import_boxpwnr()
 
         # Build traces dir with platform subdirectory
         traces_dir = f"{self.traces_dir}/{self.platform_name}"
@@ -198,4 +274,4 @@ class AgentRunner:
             custom_instructions=self.custom_instructions,
         )
 
-        solver.solve()
+        return solver.solve()

@@ -11,7 +11,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .base import ModelFormatter
-from .tool_registry import BOXPWNR_TOOLS
+from .tool_registry import AGENT_TOOLS
 
 
 class Qwen3Formatter(ModelFormatter):
@@ -51,7 +51,7 @@ class Qwen3Formatter(ModelFormatter):
                 messages,
                 tokenize=False,
                 add_generation_prompt=False,
-                tools=[t["function"] for t in BOXPWNR_TOOLS],
+                tools=[t["function"] for t in AGENT_TOOLS],
             )
 
         parts: List[str] = []
@@ -91,4 +91,4 @@ class Qwen3Formatter(ModelFormatter):
 
     def get_tool_definitions(self) -> List[Dict[str, Any]]:
         """Return tools in OpenAI function-calling format (Qwen3-native)."""
-        return list(BOXPWNR_TOOLS)
+        return list(AGENT_TOOLS)

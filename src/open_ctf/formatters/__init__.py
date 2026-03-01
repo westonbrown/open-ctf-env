@@ -1,8 +1,8 @@
-"""Model-specific message formatters and BoxPwnr tool registry.
+"""Model-specific message formatters and canonical OpenCTF tool registry.
 
 Usage::
 
-    from open_ctf.formatters import get_formatter, BOXPWNR_TOOLS
+    from open_ctf.formatters import get_formatter, AGENT_TOOLS
 
     formatter = get_formatter("Qwen/Qwen3-8B")
     text = formatter.format_messages(messages)
@@ -10,7 +10,7 @@ Usage::
 """
 
 from .base import ModelFormatter
-from .tool_registry import BOXPWNR_TOOLS, get_tool_by_name, get_tools_by_names
+from .tool_registry import AGENT_TOOLS, get_tool_by_name, get_tools_by_names
 
 
 def get_formatter(model_id: str, tokenizer=None) -> ModelFormatter:
@@ -21,7 +21,7 @@ def get_formatter(model_id: str, tokenizer=None) -> ModelFormatter:
 __all__ = [
     "ModelFormatter",
     "get_formatter",
-    "BOXPWNR_TOOLS",
+    "AGENT_TOOLS",
     "get_tool_by_name",
     "get_tools_by_names",
 ]

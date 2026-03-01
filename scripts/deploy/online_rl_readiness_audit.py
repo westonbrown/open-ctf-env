@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
 import socket
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
@@ -46,10 +48,40 @@ def _load_target_rows(path: Path) -> list[dict]:
 
 
 def _probe_target(target: str, timeout_secs: float = 1.5) -> tuple[bool, str]:
-    host = target
+    text = str(target or "").strip()
+    if not text:
+        return False, "empty target"
+    if text.startswith("file://"):
+        return True, "file_target"
+    if text.startswith(("http://", "https://")):
+        parsed = urlparse(text)
+        host = parsed.hostname
+        if not host:
+            return False, f"invalid target: {text}"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        conn_cls = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        conn = conn_cls(host=host, port=port, timeout=timeout_secs)
+        try:
+            conn.request("GET", path, headers={"User-Agent": "open-ctf-readiness/1.0"})
+            resp = conn.getresponse()
+            return True, f"http_status_{resp.status}"
+        except Exception as e:  # pragma: no cover - diagnostics path
+            return False, str(e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    host = text
     port = 80
-    if "://" in target:
-        host = target.split("://", 1)[1]
     if "/" in host:
         host = host.split("/", 1)[0]
     if ":" in host:

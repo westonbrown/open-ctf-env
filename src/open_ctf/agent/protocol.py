@@ -10,9 +10,12 @@ Any class implementing solve() satisfies CTFAgent via structural subtyping.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -42,11 +45,39 @@ class StepAgent(Protocol):
     handlers, different parsing logic, or entirely different execution
     backends without touching the env or reward code.
 
+    WARNING — Reward-critical attributes:
+        The env (``openctf_env.py``) reads the following 5 attributes via
+        ``getattr(agent, attr, default)`` to feed into CTFReward scoring.
+        If your agent does not expose them, 7 of 8 reward signals will
+        silently degrade to zero. Use ``validate_step_agent(agent)`` after
+        construction to check for missing attributes.
+
+        - ``tool_calls_history`` (List[Dict[str, str]]): List of
+          ``{"name": ..., "arguments": ...}`` dicts. Default: ``[]``.
+          Used by: format, efficiency, exploration, uniqueness, recovery.
+        - ``tool_outputs`` (List[str]): Raw tool output strings.
+          Default: ``[]``.
+          Used by: progression, cognitive, flag detection.
+        - ``all_text`` (str): Concatenated LLM + tool output text.
+          Default: ``""``.
+          Used by: cognitive (words-per-action), hallucination detection.
+        - ``episode_done`` (bool): Whether flag was successfully submitted.
+          Default: ``False``.
+          Used by: flag signal (exact match gating).
+        - ``turns`` (int): Number of steps taken so far. Default: ``0``.
+          Used by: efficiency signal.
+
     Example::
 
         class MyAgent:
             def reset(self, target="", ground_truth_flag="", max_steps=30, **kw):
                 self.target = target
+                # Initialize reward-visible attributes
+                self.tool_calls_history = []
+                self.tool_outputs = []
+                self.all_text = ""
+                self.episode_done = False
+                self.turns = 0
 
             def step(self, action: str) -> StepResult:
                 # Parse tool calls YOUR way
@@ -158,3 +189,39 @@ class CTFAgent(Protocol):
             AgentResult with success status, captured flag, and metadata.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# StepAgent validation helper
+# ---------------------------------------------------------------------------
+
+#: Attributes the env reads from StepAgent via getattr() for reward scoring.
+_REWARD_CRITICAL_ATTRS = (
+    "tool_calls_history",
+    "tool_outputs",
+    "all_text",
+    "episode_done",
+    "turns",
+)
+
+
+def validate_step_agent(agent: StepAgent) -> list[str]:
+    """Check a StepAgent for reward-critical attributes. Returns list of warnings.
+
+    Call this after constructing a BYO StepAgent to get immediate feedback
+    about missing attributes that will silently degrade reward signals.
+    """
+    warnings = []
+    for attr in _REWARD_CRITICAL_ATTRS:
+        if not hasattr(agent, attr):
+            warnings.append(f"Agent missing '{attr}' — reward signals will be degraded")
+    return warnings
+
+
+__all__ = [
+    "AgentResult",
+    "CTFAgent",
+    "StepAgent",
+    "StepResult",
+    "validate_step_agent",
+]

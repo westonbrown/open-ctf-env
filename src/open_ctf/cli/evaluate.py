@@ -45,6 +45,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         traces_dir=args.traces_dir,
         reasoning_effort=args.reasoning_effort,
         attempts=args.attempts,
+        agent=args.agent,
+        challenge_registry=getattr(args, "challenge_registry", None),
+        target_map=getattr(args, "target_map", None),
+        host=getattr(args, "host", "localhost"),
     )
 
     report = ev.run_all()
@@ -100,6 +104,21 @@ def main() -> None:
         "--agent",
         default="boxpwnr",
         help="Agent to use: 'boxpwnr' (default) or 'custom:module.ClassName'",
+    )
+    run_parser.add_argument(
+        "--challenge-registry",
+        default=None,
+        help="Challenge registry YAML for cybench runtime preflight.",
+    )
+    run_parser.add_argument(
+        "--target-map",
+        default=None,
+        help="Optional challenge target override map for cybench preflight.",
+    )
+    run_parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host used for registry target resolution in preflight.",
     )
     run_parser.set_defaults(func=cmd_run)
 

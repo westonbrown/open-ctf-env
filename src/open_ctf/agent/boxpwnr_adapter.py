@@ -75,19 +75,29 @@ class BoxPwnrAgent:
         )
 
         try:
-            runner.run(target=challenge)
+            stats = runner.run(target=challenge) or {}
             elapsed = time.monotonic() - start
-            # BoxPwnr doesn't return structured results yet — wrap as best-effort
+            if not isinstance(stats, dict):
+                stats = {}
+            status = str(stats.get("status", "")).strip().lower()
+            success = status == "success"
+            steps = int(stats.get("total_turns", 0) or 0)
+            flag = (
+                stats.get("flag")
+                or stats.get("user_flag_value")
+                or stats.get("root_flag_value")
+            )
             return AgentResult(
-                success=False,  # Cannot determine without trace parsing
-                flag=None,
-                steps=0,
+                success=success,
+                flag=str(flag) if flag else None,
+                steps=steps,
                 duration_seconds=elapsed,
                 metadata={
                     "model": self.model,
                     "platform": self.platform,
                     "challenge": challenge,
                     "target": target,
+                    "status": status or "unknown",
                 },
             )
         except Exception as exc:

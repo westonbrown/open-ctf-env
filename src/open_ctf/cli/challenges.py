@@ -4,8 +4,8 @@
 Launch, monitor, and stop Docker containers for benchmark challenges.
 
 Usage:
-    open-ctf-challenges setup --benchmark cybench
-    open-ctf-challenges setup --benchmark cybench --id eval-me
+    open-ctf-challenges setup
+    open-ctf-challenges setup --id eval-me
     open-ctf-challenges status
     open-ctf-challenges teardown
 """
@@ -29,8 +29,14 @@ def cmd_setup(args: argparse.Namespace) -> None:
     """Launch challenge containers."""
     from open_ctf.challenges.registry import ChallengeRegistry
     from open_ctf.challenges.manager import ChallengeManager
+    from open_ctf.challenges.preflight import validate_no_target_collisions
 
     registry = ChallengeRegistry(args.registry)
+    validate_no_target_collisions(
+        registry,
+        host=args.host,
+        challenge_ids=[args.id] if args.id else None,
+    )
     manager = ChallengeManager(
         registry=registry,
         bench_dir=args.bench_dir,

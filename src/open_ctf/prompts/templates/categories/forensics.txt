@@ -1,0 +1,2 @@
+# FORENSICS CHALLENGE
+This is a forensics challenge. Examine files in /root/challenge/ (pcap, logs, disk images, etc.) using appropriate tools. If the challenge has a remote service at {raw_target}, interact with it to gather additional evidence.

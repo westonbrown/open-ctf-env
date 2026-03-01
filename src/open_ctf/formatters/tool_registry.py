@@ -1,14 +1,35 @@
-"""BoxPwnr tool schemas in OpenAI function-calling format.
+"""Canonical OpenCTF tool schemas in OpenAI function-calling format.
 
-Extracted from BoxPwnr's Pydantic input models (boxpwnr/tools/tools.py).
 These schemas are used during training data generation and at inference time
 to provide tool definitions to the model.
 """
 
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 
-BOXPWNR_TOOLS: List[Dict[str, Any]] = [
+TOOL_SCHEMA_VERSION = "2026-03-01"
+
+# Tools supported by OpenCTF's default runtime executor.
+RUNTIME_TOOL_NAMES = (
+    "shell_command",
+    "python_code",
+    "read_file",
+    "grep",
+    "file_search",
+    "apply_patch",
+    "flag_found",
+    "submit_flag",
+    "web_search",
+    "exec_command",
+    "write_stdin",
+    "execute_command",
+    "list_sessions",
+    "close_session",
+)
+
+
+AGENT_TOOLS: List[Dict[str, Any]] = [
     # ─── One-shot execution ───────────────────────────────────────────
     {
         "type": "function",
@@ -54,7 +75,7 @@ BOXPWNR_TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Execute a command using subprocess.run() and return the complete output "
                 "when finished. Use this for non-interactive commands. For interactive "
-                "commands (shells, sessions, real-time tools), use tmux_* tools instead."
+                "commands, use exec_command with write_stdin for input."
             ),
             "parameters": {
                 "type": "object",
@@ -178,98 +199,6 @@ BOXPWNR_TOOLS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["session_id"],
-            },
-        },
-    },
-    # ─── Tmux tools ───────────────────────────────────────────────────
-    {
-        "type": "function",
-        "function": {
-            "name": "tmux_send_and_read",
-            "description": (
-                "Type text into the current tmux window and read the output. "
-                "Use this to execute commands or provide input to running programs. "
-                "Set press_enter=False if you want to type without executing."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": (
-                            "Text to type in the current tmux window. "
-                            "Do not wrap the text in quotes."
-                        ),
-                    },
-                    "press_enter": {
-                        "type": "boolean",
-                        "description": (
-                            "Whether to press Enter after typing. Set to True to "
-                            "execute commands (default), or False to type text "
-                            "without executing."
-                        ),
-                        "default": True,
-                    },
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tmux_wait_and_read",
-            "description": (
-                "Wait for a specified number of seconds and then read any new output. "
-                "Use this after starting a command that needs time to produce output "
-                "(e.g., long-running scans, network operations)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "seconds": {
-                        "type": "integer",
-                        "description": (
-                            "Number of seconds to wait before reading output (1-300)."
-                        ),
-                        "minimum": 1,
-                        "maximum": 300,
-                    },
-                },
-                "required": ["seconds"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tmux_read_output",
-            "description": (
-                "Read only the NEW output from the current tmux window since the "
-                "last read. Use this to check if there's any new output after "
-                "waiting, or to see what's currently displayed without sending "
-                "any input."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tmux_cancel_command",
-            "description": (
-                "Send Ctrl-C to abort the currently running command. Use this when "
-                "a command is stuck, taking too long, or when you want to interrupt "
-                "it to run something else. Returns the output after cancellation."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
             },
         },
     },
@@ -464,13 +393,26 @@ BOXPWNR_TOOLS: List[Dict[str, Any]] = [
 
 # Index by name for fast lookup.
 _TOOL_INDEX: Dict[str, Dict[str, Any]] = {
-    t["function"]["name"]: t for t in BOXPWNR_TOOLS
+    t["function"]["name"]: t for t in AGENT_TOOLS
 }
 
 
 def get_tool_by_name(name: str) -> Optional[Dict[str, Any]]:
     """Return a single tool schema by name, or None if not found."""
-    return _TOOL_INDEX.get(name)
+    tool = _TOOL_INDEX.get(name)
+    if tool is not None:
+        return tool
+    if name == "submit_flag":
+        base = _TOOL_INDEX.get("flag_found")
+        if base is None:
+            return None
+        alias = deepcopy(base)
+        alias["function"]["name"] = "submit_flag"
+        alias["function"]["description"] = (
+            "Alias for flag_found. Submit a discovered flag for verification."
+        )
+        return alias
+    return None
 
 
 def get_tools_by_names(names: List[str]) -> List[Dict[str, Any]]:
@@ -480,8 +422,19 @@ def get_tools_by_names(names: List[str]) -> List[Dict[str, Any]]:
     """
     tools = []
     for name in names:
-        tool = _TOOL_INDEX.get(name)
+        tool = get_tool_by_name(name)
         if tool is None:
             raise KeyError(f"Unknown tool: {name}")
         tools.append(tool)
     return tools
+
+
+def get_runtime_tools() -> List[Dict[str, Any]]:
+    """Return the canonical runtime tool schemas for OpenCTF env execution."""
+    return get_tools_by_names(list(RUNTIME_TOOL_NAMES))
+
+
+def get_runtime_tool_names() -> List[str]:
+    """Return ordered runtime tool names for OpenCTF env execution."""
+    return list(RUNTIME_TOOL_NAMES)
+

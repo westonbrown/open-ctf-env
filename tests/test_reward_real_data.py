@@ -19,17 +19,15 @@ from open_ctf.rewards.reward import CTFReward
 # Data loading
 # ---------------------------------------------------------------------------
 
-GRPO_PATHS = [
+ONLINE_RL_PATHS = [
     Path(__file__).parent.parent / "data" / "online_rl.jsonl",
-    Path(__file__).parent.parent / "data" / "grpo.jsonl",  # legacy name
     Path(__file__).parent.parent / "data" / "online_rl_pre_clean.jsonl",
-    Path(__file__).parent.parent / "data" / "grpo_pre_clean.jsonl",  # 1369 samples
 ]
 
 
-def load_grpo_samples(max_samples: int = 50) -> List[Dict[str, Any]]:
-    """Load real GRPO samples from the first available data file."""
-    for path in GRPO_PATHS:
+def load_online_rl_samples(max_samples: int = 50) -> List[Dict[str, Any]]:
+    """Load real online RL samples from the first available data file."""
+    for path in ONLINE_RL_PATHS:
         if path.exists():
             samples = []
             with open(path) as f:
@@ -41,11 +39,11 @@ def load_grpo_samples(max_samples: int = 50) -> List[Dict[str, Any]]:
                     if len(samples) >= max_samples:
                         break
             return samples
-    pytest.skip("No GRPO data files found")
+    pytest.skip("No online RL data files found")
 
 
 def extract_completion_from_sample(sample: Dict[str, Any]) -> List[Dict]:
-    """Extract the assistant completion messages from a GRPO sample."""
+    """Extract assistant completion messages from an online RL sample."""
     messages = sample.get("messages", [])
     # Return all messages after the system+user prompt as the completion
     completion = []
@@ -64,7 +62,7 @@ def extract_completion_from_sample(sample: Dict[str, Any]) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 class TestRealDataComponentBreakdown:
-    """Score real GRPO trajectories and verify component distributions."""
+    """Score real online RL trajectories and verify component distributions."""
 
     @pytest.fixture
     def reward(self):
@@ -72,7 +70,7 @@ class TestRealDataComponentBreakdown:
 
     @pytest.fixture
     def samples(self):
-        return load_grpo_samples(50)
+        return load_online_rl_samples(50)
 
     def test_score_distribution(self, reward, samples):
         """Verify scores span a reasonable range across real trajectories."""
@@ -96,8 +94,8 @@ class TestRealDataComponentBreakdown:
         print(f"  mean={mean_sc:.4f}  std={std_sc:.4f}  min={mn:.4f}  max={mx:.4f}")
         print(f"  range={mx-mn:.4f}")
 
-        # GRPO needs: nonzero variance, reasonable range
-        assert std_sc > 0.01, f"Score std too low for GRPO: {std_sc:.4f}"
+        # Online RL needs: nonzero variance, reasonable range
+        assert std_sc > 0.01, f"Score std too low for online RL: {std_sc:.4f}"
         assert mx - mn > 0.1, f"Score range too narrow: {mx-mn:.4f}"
 
     def test_component_breakdown(self, reward, samples):

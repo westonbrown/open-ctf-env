@@ -1,0 +1,212 @@
+# Nanbeige4.1-3B Training Configuration (DGX Spark / Cloud GPU)
+# ==============================================================
+# Dense LlamaForCausalLM (3B params) — no MoE complexities.
+# Fits comfortably on DGX Spark (119GB unified) for both SFT and GRPO.
+#
+# Key differences from GLM-4.7-Flash (training_120gb_moe.yaml):
+#   - Dense model: QLoRA 4-bit fully supported (no MoE expert tensor workaround)
+#   - batch_size > 1 safe (no MoE routing NaN with padding)
+#   - vLLM colocate mode works (LlamaForCausalLM is first-class in vLLM)
+#   - ~8 GB BF16 inference, ~15-20 GB LoRA training, ~6-10 GB QLoRA
+#
+# Architecture: LlamaForCausalLM
+# Vocab: 166,144 (large, Chinese + English)
+# Context: 262K max_position_embeddings (128K validated)
+# Tool calling: Hermes format (<tool_call> JSON </tool_call>)
+# Reasoning: <think> / </think> tags
+# Chat template: ChatML (<|im_start|> / <|im_end|>)
+
+model:
+  name: "Nanbeige/Nanbeige4.1-3B"
+  # 32K context: 95% of sft_quality.jsonl fits fully (vs 55% at 8K).
+  # 8K truncated 46.6% of samples, losing flag_found and exploitation
+  # sequences — the most important signal for tool-calling SFT.
+  # Memory: 32K × 166K vocab × 4B = ~20.7 GB logits (fits 120GB GB10).
+  max_seq_length: 32768
+  # QLoRA 4-bit works perfectly for dense Llama models.
+  # ~3-4 GB model weights in 4-bit (vs ~8 GB BF16).
+  load_in_4bit: true
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  # Standard Llama target modules (same as GLM config).
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+sft:
+  # 5 epochs: research shows trajectory SFT needs 5-7 epochs for stable
+  # tool-calling behavior. 2 epochs caused catastrophic forgetting of base
+  # model capabilities (SFT v4 degradation: 419-turn grep loops).
+  # 339 samples × 5 passes = 1695 / (batch=1 × accum=8) = 212 optimizer steps.
+  epochs: 5
+  # GC required: disabling OOMs (attention softmax needs 10 GB per alloc).
+  gradient_checkpointing: true
+  # batch_size=1 at 32K: logits+grad = 1 × 32K × 166K × 4B × 2 = ~43 GB.
+  # batch_size=2 would need ~86 GB for logits alone — too tight on GB10.
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  # Effective batch: 1 * 8 = 8 (same as before)
+  # Learning rate: 5e-5 prevents catastrophic forgetting.
+  # With LoRA alpha/r = 128/64 = 2.0x effective scaling, the actual
+  # update magnitude is 2x the base LR. At 2e-4 this was 4e-4 effective,
+  # which overwrote base model tool-calling capabilities in SFT v4.
+  learning_rate: 5.0e-5
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  # Packing disabled: without flash_attn (GB10 sm_121a), packing causes
+  # cross-contamination between samples. Slower but correct.
+  packing: false
+  # GB10: flash_attn not compiled for sm_121a, use sdpa/eager
+  flash_attn: false
+  # tf32 matmul: ~5-10% speedup for float32 operations (optimizer, loss).
+  # Negligible precision impact. GB10 sm_121a supports TF32.
+  tf32: true
+  # Memory budget for SFT on DGX Spark (119 GB unified, GC enabled):
+  #   Model (NF4): ~3-4 GB (BF16 fallback: ~6 GB)
+  #   LoRA adapters: ~0.5 GB
+  #   Optimizer (8-bit or torch AdamW): ~1 GB
+  #   Logits (1 × 32K × 166K × 4B): ~21 GB
+  #   Logits gradient (same size): ~21 GB
+  #   Activations (GC, ~sqrt(32) checkpoint layers): ~10-15 GB
+  #   Framework/OS: ~5 GB
+  #   Total: ~62-69 GB -> ~50 GB headroom
+  #   CRITICAL: dataloader_num_workers=0 (fork overhead OOMs unified memory)
+
+online_rl:
+  epochs: 1
+  # All 40 CyBench challenges: very_easy through master.
+  # 25 docker + 15 static = 40 samples total.
+  difficulty_max: "master"
+  drop_static_challenges: false
+  # Dense model: batch_size > 1 possible but keep 1 for GRPO stability.
+  batch_size: 1
+  # batch_size(1) * grad_accum(8) must be divisible by num_gen(8): 8 % 8 = 0 (valid)
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  # v6: small KL penalty (was 0.0) to prevent catastrophic policy update
+  # from outlier rewards (step 7 flag capture scored 3.78, caused grad spike).
+  beta: 0.001
+  loss_type: dapo
+  num_generations: 4
+  advantage_estimator: rloo
+  # GB10 166K-vocab memory math (v4→v5 OOM fixes):
+  #   fwd_logprobs: 4 seqs × seq_len × 166K × 4B. At 11K avg → 29 GB (OOMs).
+  #   Fix: cap prompt to 4K, completion to 2K → max total 6K.
+  #   4 × 6K × 166K × 4B ≈ 16 GB → fits with headroom.
+  #   policy_train processes 1 seq at a time (batch=1), so peak is ~4 GB logits.
+  max_completion_length: 2048
+  max_prompt_length: 4096
+  vllm_max_model_len: 6144
+  # 15 tool iterations × ~200 tok/iter ≈ 3000 tok (fits in 2K+4K budget).
+  max_tool_calling_iterations: 15
+  # v8: increased from 0.1 to allow stronger gradient signal for flag capture.
+  # v7 lesson: 0.1 clipping was too aggressive, flag reward signal couldn't
+  # propagate through LoRA weights (grad norm consistently at clip ceiling).
+  max_grad_norm: 0.5
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+  # v5: 1.3 penalty caused degenerate garbage at temperature 1.0.
+  # Root cause: aggressive penalty + high temp forces diverse nonsense tokens.
+  # SFT model generates valid Hermes tool calls at temp 0.7 / no penalty.
+  # v6: 1.05 provides mild anti-repetition without destroying coherence.
+  # max_completion_length=2048 already caps output length (OOM prevention).
+  repetition_penalty: 1.05
+  # Nanbeige4.1-3B natively supports <think>/<think> (token IDs 166103/166104).
+  # The tokenizer template auto-strips thinking from history (keeps only on
+  # last turn after the final user query), which is optimal for multi-turn
+  # context management. No "enable_thinking" toggle needed — the model
+  # generates thinking blocks by default when the SFT model learned them.
+  # keep_all_think: false is the default (strip from history, keep on last).
+  chat_template_kwargs:
+    keep_all_think: false
+  # SkyRL zero-variance filter: skip prompt groups where all generations
+  # in the group receive the same reward (zero advantage signal).
+  # Avoids wasting gradient updates on uninformative batches.
+  zero_variance_filter: true
+  # SkyRL dynamic sampling (DAPO filter): when a prompt group has zero
+  # variance, resample up to max_sample_batches times before giving up.
+  # "filter" type discards zero-variance groups; "resample" type retries.
+  dynamic_sampling:
+    type: "filter"
+    max_sample_batches: 10
+  # SkyRL step-wise trajectories: assign per-step rewards instead of
+  # only terminal reward. Enables credit assignment at each tool-call
+  # step (format compliance +0.02/-0.02 + phase progression +0.03).
+  # Terminal CTFReward (8-signal, typical range 0.0-2.0) remains dominant.
+  step_wise_trajectories: true
+  agent_class: open_ctf.agent.default_agent.DefaultStepAgent
+  # Early-stop runaway trajectories when the model repeatedly emits text
+  # without valid tool calls. Critical for 3B model which can get stuck
+  # in reasoning loops without producing actions.
+  agent_kwargs:
+    max_consecutive_no_tool_calls: 3
+    # Generic framework runtime bridge, BoxPwnr defaults.
+    runtime_cmd: "python src/open_ctf/agent/framework_runtime_bridge.py"
+    runtime_timeout_seconds: 20
+    runtime_passthrough: false
+    runtime_fallback_to_parser: false
+    runtime_env:
+      OPEN_CTF_AGENT_FRAMEWORK: "boxpwnr_langgraph"
+      OPEN_CTF_AGENT_MODE: "tool_calls"
+  # External vLLM server mode: colocate OOMs GB10 unified memory.
+  # vLLM runs as separate process on same GPU, trainer uses remaining memory.
+  use_vllm: true
+  vllm_mode: server
+  vllm_server_url: "http://localhost:8001"
+  allow_remote_lora: true
+  gpu_memory_utilization: 0.15
+  # Flash attention disabled for GB10 stability (sm_121a kernel issues).
+  flash_attn: false
+  use_sample_packing: false
+  # Memory budget for GRPO on DGX Spark (119 GB unified), server mode:
+  #   vLLM server (BF16, 0.15 util): ~18 GB
+  #   FSDP policy model (BF16): ~12 GB
+  #   FSDP ref model (frozen): ~6 GB
+  #   fwd_logprobs (4 × 6K × 166K × 4B): ~16 GB peak
+  #   policy_train (1 × 6K × 166K × 4B): ~4 GB per micro-batch
+  #   Training activations (batch=1, grad ckpt): ~8 GB
+  #   Ray overhead: ~5 GB
+  #   Total peak: ~69 GB → ~50 GB headroom
+
+reward:
+  # v8 reward weights: flag-dominant design (v7 lesson: 0% flag accuracy).
+  # Key changes from v7:
+  #   - flag_weight: 0.20 → 0.40 (model got +0.44 without any flag capture)
+  #   - hallucination_penalty: 0.10 → 0.20 (stronger deterrent)
+  #   - noise_range: 0.05 → 0.01 (was drowning 0.25 flag gap in RLOO)
+  #   - Process weights reduced proportionally to make room for flag signal
+  flag_weight: 0.40
+  efficiency_weight: 0.15
+  progression_weight: 0.08
+  exploration_weight: 0.05
+  uniqueness_weight: 0.05
+  format_weight: 0.10
+  recovery_weight: 0.09
+  cognitive_weight: 0.08
+  hallucination_penalty: 0.20
+  noise_range: 0.01
+  exploration_gamma: 0.95
+  use_gdpo: false
+
+output:
+  # ~212 optimizer steps (339 samples × 5 epochs ÷ batch1 ÷ accum8, no packing).
+  save_steps: 50
+  logging_steps: 1
+  report_to: tensorboard
+
+online_rl_logging:
+  # Trajectory logging: saves per-generation JSONL for post-run analysis.
+  enable_trajectory_logging: true

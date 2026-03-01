@@ -13,7 +13,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .base import ModelFormatter
-from .tool_registry import BOXPWNR_TOOLS
+from .tool_registry import AGENT_TOOLS
 
 
 class GLM4Formatter(ModelFormatter):
@@ -44,7 +44,7 @@ class GLM4Formatter(ModelFormatter):
                 messages,
                 tokenize=False,
                 add_generation_prompt=False,
-                tools=[t["function"] for t in BOXPWNR_TOOLS],
+                tools=[t["function"] for t in AGENT_TOOLS],
             )
 
         parts: List[str] = []
@@ -86,4 +86,4 @@ class GLM4Formatter(ModelFormatter):
 
         GLM-4 accepts the standard schema when tools are passed via API.
         """
-        return list(BOXPWNR_TOOLS)
+        return list(AGENT_TOOLS)

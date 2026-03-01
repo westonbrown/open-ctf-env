@@ -1,0 +1,136 @@
+# Open CTF Training Configuration
+# ==================================================
+# Used by: open-ctf-train (src/open_ctf/cli/train.py)
+#
+# Default model: Nanbeige4.1-3B (3B dense LlamaForCausalLM)
+# For GLM-4.7-Flash (30B MoE): use training_120gb_moe.yaml or training_140gb_moe.yaml.
+# For Nanbeige on DGX Spark (GB10): use training_120gb_dense.yaml for tuned memory budgets.
+
+model:
+  name: "Nanbeige/Nanbeige4.1-3B"
+  # 65K context: covers 100% of sft_v5.jsonl (285 samples, max ~61K est tokens).
+  # Median is ~4.4K; with packing, short samples are packed together so actual
+  # VRAM per step is driven by the longest sequence in the pack.
+  # Memory at 65K (worst case, single sample):
+  #   65K × 166K vocab × 2B (bf16) = ~20 GB logits → fits H200/B200 comfortably.
+  max_seq_length: 65536
+  # QLoRA 4-bit works for dense Llama models (no MoE expert tensor workarounds needed).
+  load_in_4bit: true
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+sft:
+  # 5 epochs: trajectory SFT needs 5-7 epochs for stable tool-calling.
+  # 2 epochs caused catastrophic forgetting in SFT v4 (grep loop behavior).
+  epochs: 5
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  # 5e-5: with LoRA alpha/r=128/64 (2.0x scaling), effective LR is 1e-4.
+  # 2e-4 base (4e-4 effective) caused catastrophic forgetting of base
+  # model capabilities in SFT v4.
+  learning_rate: 5.0e-5
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+
+online_rl:
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-6
+  warmup_ratio: 0.10
+  beta: 0.0
+  loss_type: dapo
+  num_generations: 8
+  max_completion_length: 32768
+  max_grad_norm: 0.1
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  scale_rewards: false
+  # RLOO advantage estimator: stable default across all production configs.
+  # Code-level default in _build_skyrl_config is rloo_n when this field is omitted.
+  advantage_estimator: rloo
+  # vLLM for fast generation (3-6x faster than HF generate).
+  # LlamaForCausalLM is first-class in vLLM — no special parsers needed.
+  use_vllm: true
+  vllm_mode: server
+  gpu_memory_utilization: 0.4
+  # Online training: max tool-calling iterations per generation.
+  max_tool_calling_iterations: 15
+  # Default step agent with resilient mode for online RL.
+  agent_class: open_ctf.agent.default_agent.DefaultStepAgent
+  # Optional hybrid BYO-agent runtime hook (default disabled).
+  # When runtime_cmd is set, DefaultStepAgent sends JSON to the command on stdin.
+  # The command can return tool_calls for local execution, or set
+  # runtime_passthrough=true to own observations/done fully.
+  #
+  # Example:
+  # agent_kwargs:
+  #   runtime_cmd: "python /workspace/open-ctf-env/src/open_ctf/agent/framework_runtime_bridge.py"
+  #   runtime_timeout_seconds: 30
+  #   runtime_workdir: "/workspace/open-ctf-env"
+  #   runtime_passthrough: false
+  #   runtime_fallback_to_parser: true
+  #   runtime_env:
+  #     OPEN_CTF_AGENT_FRAMEWORK: "boxpwnr_langgraph"
+  #     OPEN_CTF_AGENT_MODE: "native"
+  #     OPEN_CTF_AGENT_CMD: "python /workspace/open-ctf-env/examples/adapters/langgraph_native_runtime_adapter.py"
+  agent_kwargs:
+    max_consecutive_no_tool_calls: 3
+    # Generic framework runtime bridge (defaults to BoxPwnr tool-call mode).
+    runtime_cmd: "python src/open_ctf/agent/framework_runtime_bridge.py"
+    runtime_timeout_seconds: 20
+    runtime_passthrough: false
+    runtime_fallback_to_parser: false
+    runtime_env:
+      OPEN_CTF_AGENT_FRAMEWORK: "boxpwnr_langgraph"
+      OPEN_CTF_AGENT_MODE: "tool_calls"
+  # Data/registry integrity guards (recommended for production):
+  fail_on_flag_mismatch: true
+  fail_on_missing_registry_flag: true
+  require_all_registry_challenges: false
+
+gepa:
+  # GEPA prompt evolution (Stage 3, no weight updates).
+  # Uses DSPy to evolve the system prompt by reflecting on execution traces.
+  # Both agent and reflection LMs default to the same model — no cloud APIs needed.
+  # Point model_id at a local vLLM server (e.g. openai/my-model with OPENAI_API_BASE).
+  seed_prompt: null           # Override default CTF agent prompt (null = use built-in SEED_PROMPT)
+  reflection_model: null      # Reflection LM (null = same as agent model). Can be a stronger local model.
+  max_iters: 20               # Max tool-calling iterations per challenge evaluation
+  reflection_minibatch_size: 3  # Samples per GEPA reflection batch
+  seed: 42
+  budget: light               # GEPA budget preset: light / medium / heavy
+  num_threads: 1              # Parallel challenge evaluations (1 = sequential)
+
+reward:
+  # CTFReward weights (must sum to 1.0).
+  # Uncomment and adjust to override defaults from reward.py.
+  # flag_weight: 0.20
+  # efficiency_weight: 0.25
+  # progression_weight: 0.15
+  # format_weight: 0.20
+  # exploration_weight: 0.10
+  # uniqueness_weight: 0.10
+
+output:
+  save_steps: 25
+  logging_steps: 1
+  report_to: tensorboard
+
+online_rl_logging:
+  # Trajectory logging: saves per-generation JSONL for post-run analysis.
+  enable_trajectory_logging: true

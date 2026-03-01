@@ -36,11 +36,9 @@ Usage:
 """
 
 import logging
-import os
 import pickle
 import signal
 import socket
-import sys
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -105,13 +103,26 @@ def _import_vllm():
     except ImportError:
         ns["create_server_socket"] = None
 
-    # CLI arg parser
-    try:
-        from vllm.utils.argparse_utils import FlexibleArgumentParser
-        ns["FlexibleArgumentParser"] = FlexibleArgumentParser
-    except ImportError:
+    # CLI arg parser (path changed across vLLM releases).
+    flexible_parser = None
+    for module_path in (
+        "vllm.utils.argparse_utils",        # older path
+        "vllm.entrypoints.utils",           # vLLM 0.11+
+        "vllm.entrypoints.openai.cli_args", # some builds re-export here
+        "vllm.utils",                       # fallback re-export
+    ):
+        try:
+            module = __import__(module_path, fromlist=["FlexibleArgumentParser"])
+            candidate = getattr(module, "FlexibleArgumentParser", None)
+            if candidate is not None:
+                flexible_parser = candidate
+                break
+        except Exception:
+            continue
+    if flexible_parser is None:
         from argparse import ArgumentParser
-        ns["FlexibleArgumentParser"] = ArgumentParser
+        flexible_parser = ArgumentParser
+    ns["FlexibleArgumentParser"] = flexible_parser
 
     try:
         from vllm.entrypoints.openai.cli_args import (
@@ -154,6 +165,111 @@ def _create_server_socket(addr):
 
 
 # ---------------------------------------------------------------------------
+# Tool call parsing for /v1/chat/completions
+# ---------------------------------------------------------------------------
+
+
+def _parse_tool_calls_for_chat(raw_text, content_text, parser_mode, uuid_module):
+    """Parse tool calls from generated text and return OpenAI-format tool_calls list.
+
+    Uses ``open_ctf.parsing.parse_tool_calls`` for multi-format support
+    (Hermes JSON, Qwen3.5 Coder XML, GLM-4 XML, bare JSON, Python-style).
+
+    Parameters
+    ----------
+    raw_text : str
+        Full generated text (before <think> stripping).
+    content_text : str
+        Text with <think> blocks already stripped.
+    parser_mode : str
+        One of "auto", "hermes", "qwen3_coder", "none".
+    uuid_module : module
+        The ``uuid`` module (passed in to avoid import at module level).
+
+    Returns
+    -------
+    list[dict]
+        OpenAI-format tool_calls: [{"id": ..., "type": "function",
+        "function": {"name": ..., "arguments": json_string}}]
+    """
+    import json as _json
+    import re as _re
+
+    if parser_mode == "none":
+        return []
+
+    parsed = []
+
+    if parser_mode == "auto":
+        # Use the multi-format parser from open_ctf.parsing
+        try:
+            from open_ctf.parsing import parse_tool_calls
+            parsed = parse_tool_calls(raw_text)
+        except ImportError:
+            logger.warning(
+                "open_ctf.parsing not available; falling back to Hermes-only regex"
+            )
+            parser_mode = "hermes"
+
+    if parser_mode == "hermes":
+        tc_pattern = _re.compile(
+            r"<tool_call>\s*(\{.*?\})\s*</tool_call>", _re.DOTALL,
+        )
+        for m in tc_pattern.finditer(content_text):
+            try:
+                d = _json.loads(m.group(1))
+                parsed.append({
+                    "name": d.get("name", ""),
+                    "arguments": d.get("arguments", {}),
+                })
+            except _json.JSONDecodeError:
+                continue
+
+    elif parser_mode == "qwen3_coder":
+        qwen_pattern = _re.compile(
+            r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>",
+            _re.DOTALL,
+        )
+        param_pattern = _re.compile(
+            r"<parameter=([^>]+)>(.*?)</parameter>", _re.DOTALL,
+        )
+        for m in qwen_pattern.finditer(content_text):
+            name = m.group(1).strip()
+            args = {}
+            for pm in param_pattern.finditer(m.group(2)):
+                key = pm.group(1).strip()
+                val = pm.group(2).strip()
+                try:
+                    val = _json.loads(val)
+                except (ValueError, _json.JSONDecodeError):
+                    pass
+                args[key] = val
+            parsed.append({"name": name, "arguments": args})
+
+    # Convert to OpenAI format
+    tool_calls = []
+    for tc in parsed:
+        args = tc.get("arguments", {})
+        if isinstance(args, dict):
+            args_str = _json.dumps(args)
+        elif isinstance(args, str):
+            args_str = args
+        else:
+            args_str = _json.dumps(args)
+
+        tool_calls.append({
+            "id": f"call_{uuid_module.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {
+                "name": tc.get("name", ""),
+                "arguments": args_str,
+            },
+        })
+
+    return tool_calls
+
+
+# ---------------------------------------------------------------------------
 # SkyRL-compatible server
 # ---------------------------------------------------------------------------
 
@@ -166,6 +282,8 @@ class SkyRLVllmServer:
         self._ns = vllm_ns
         self._host = getattr(args, "host", "0.0.0.0") or "0.0.0.0"
         self._port = getattr(args, "port", 8001)
+        # Tool call parser mode: "auto" (all formats), "hermes", "qwen3_coder", "none"
+        self._tool_call_parser = getattr(args, "tool_call_parser", None) or "auto"
 
     async def run_server(self):
         import uvicorn
@@ -230,6 +348,7 @@ class SkyRLVllmServer:
     def _add_completions_endpoint(self, app, engine):
         """Add /v1/completions and /v1/models endpoints using the engine directly."""
         model_name = getattr(self.server_args, "model", "unknown")
+        tokenizer = engine.get_tokenizer()
 
         @app.get("/v1/models")
         async def _list_models():
@@ -322,7 +441,6 @@ class SkyRLVllmServer:
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             choices = []
-            tokenizer = engine.get_tokenizer()
             choice_idx = 0
             for result in results:
                 if isinstance(result, Exception):
@@ -371,6 +489,231 @@ class SkyRLVllmServer:
 
         logger.info("Added /v1/completions and /v1/models endpoints.")
 
+        # --- /v1/chat/completions (OpenAI-compatible) ---
+        @app.post("/v1/chat/completions")
+        async def _chat_completions(request: Request):
+            """OpenAI-compatible chat completions for BoxPwnr / LangChain.
+
+            Applies the tokenizer chat template, generates, and returns the
+            result.  If the model emits Hermes-style ``<tool_call>`` blocks
+            they are parsed and returned as structured ``tool_calls``.
+            """
+            import asyncio
+            import json as _json
+            import re as _re
+            import uuid
+
+            from vllm import SamplingParams
+
+            data = await request.json()
+            messages = data.get("messages", [])
+            max_tokens = data.get("max_tokens", 4096)
+            temperature = data.get("temperature", 0.7)
+            top_p = data.get("top_p", 0.95)
+            stop = data.get("stop")
+            tools = data.get("tools")
+
+            # Build tool description block for system prompt (Hermes format)
+            tool_text = ""
+            if tools:
+                tool_defs = []
+                for t in tools:
+                    fn = t.get("function", t)
+                    tool_defs.append(_json.dumps({
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name"),
+                            "description": fn.get("description", ""),
+                            "parameters": fn.get("parameters", {}),
+                        },
+                    }))
+                tool_text = (
+                    "\n\nYou are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. "
+                    "You may call one or more functions. Don't make assumptions about what values to plug into functions.\n"
+                    "<tools>\n" + "\n".join(tool_defs) + "\n</tools>\n\n"
+                    "For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+                    '<tool_call>\n{"name": "<function-name>", "arguments": <args-json-object>}\n</tool_call>\n'
+                )
+
+            # Inject tools into the first system message (or prepend one)
+            chat_messages = list(messages)
+            if tool_text:
+                if chat_messages and chat_messages[0].get("role") == "system":
+                    chat_messages[0] = dict(chat_messages[0])
+                    chat_messages[0]["content"] = tool_text + chat_messages[0]["content"]
+                else:
+                    chat_messages.insert(0, {"role": "system", "content": tool_text})
+
+            # Determine effective max context from engine config
+            _max_model_len = getattr(
+                getattr(engine, "engine", engine),
+                "max_model_len",
+                None,
+            )
+            if _max_model_len is None:
+                try:
+                    _max_model_len = engine.engine_config.model_config.max_model_len
+                except Exception:
+                    _max_model_len = self.server_args.max_model_len or 32768
+
+            # Truncate messages from the middle if too long.
+            # Keep system (first) and last 2 user/assistant turns; drop middle.
+            def _truncate_messages(msgs, tok, limit):
+                """Drop middle messages until the prompt fits in *limit* tokens.
+
+                Keeps: system message (pos 0), first user message (pos 1),
+                and the last 2 messages.  Drops from position 2 inward.
+                """
+                # Keep first 2 messages (system + first user) and last 2
+                keep_head = 2
+                keep_tail = 2
+                while len(msgs) > keep_head + keep_tail:
+                    try:
+                        p = tok.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                        )
+                        n = len(tok.encode(p, add_special_tokens=False))
+                    except Exception:
+                        n = limit + 1
+                    if n <= limit:
+                        return msgs, n
+                    # Drop the message just after the preserved head
+                    msgs = msgs[:keep_head] + msgs[keep_head + 1:]
+                # Final check
+                try:
+                    p = tok.apply_chat_template(
+                        msgs, tokenize=False, add_generation_prompt=True,
+                    )
+                    return msgs, len(tok.encode(p, add_special_tokens=False))
+                except Exception:
+                    return msgs, limit
+
+            # Budget: leave room for max_tokens output
+            input_budget = _max_model_len - max_tokens
+            if input_budget < 256:
+                # max_tokens is too large for context; cap it
+                max_tokens = max(_max_model_len - 256, 256)
+                input_budget = _max_model_len - max_tokens
+
+            chat_messages, prompt_tokens = _truncate_messages(
+                chat_messages, tokenizer, input_budget,
+            )
+
+            if prompt_tokens > input_budget:
+                # Still too long even after truncation — reduce max_tokens
+                max_tokens = max(_max_model_len - prompt_tokens, 128)
+                logger.warning(
+                    "Prompt still %d tokens after truncation; "
+                    "capping max_tokens to %d (max_model_len=%d)",
+                    prompt_tokens, max_tokens, _max_model_len,
+                )
+
+            # Apply chat template
+            try:
+                prompt = tokenizer.apply_chat_template(
+                    chat_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception as e:
+                logger.error("Chat template error: %s", e)
+                return JSONResponse(
+                    {"error": f"Chat template failed: {e}"},
+                    status_code=400,
+                )
+
+            # Final safety: count actual tokens and cap max_tokens
+            prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            actual_prompt_len = len(prompt_token_ids)
+            if actual_prompt_len + max_tokens > _max_model_len:
+                max_tokens = max(_max_model_len - actual_prompt_len, 128)
+                logger.warning(
+                    "Final cap: prompt=%d + max_tokens=%d = %d (limit=%d)",
+                    actual_prompt_len, max_tokens,
+                    actual_prompt_len + max_tokens, _max_model_len,
+                )
+
+            sp_kwargs = {
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+            }
+            if stop:
+                sp_kwargs["stop"] = stop
+            params = SamplingParams(**sp_kwargs)
+
+            request_id = f"chat-{uuid.uuid4().hex[:12]}"
+            final_output = None
+            # Use token IDs directly to avoid text re-tokenization
+            async for output in engine.generate(
+                prompt={"prompt_token_ids": prompt_token_ids},
+                sampling_params=params,
+                request_id=request_id,
+            ):
+                final_output = output
+
+            if final_output is None:
+                return JSONResponse(
+                    {"error": "No output generated"},
+                    status_code=500,
+                )
+
+            text = ""
+            finish_reason = "stop"
+            for completion in final_output.outputs:
+                try:
+                    text = tokenizer.decode(
+                        list(completion.token_ids),
+                        skip_special_tokens=True,
+                    )
+                except Exception:
+                    text = str(list(completion.token_ids))
+                finish_reason = completion.finish_reason or "stop"
+                break  # take first completion
+
+            # Strip <think>...</think> blocks from content
+            content_text = _re.sub(
+                r"<think>.*?</think>", "", text, flags=_re.DOTALL,
+            ).strip()
+
+            # Parse tool calls using the multi-format parser
+            tool_calls_parsed = _parse_tool_calls_for_chat(
+                text, content_text, self._tool_call_parser, uuid,
+            )
+
+            # Build response message
+            message = {"role": "assistant"}
+            if tool_calls_parsed:
+                # Remove all <tool_call>...</tool_call> blocks from content
+                clean_content = _re.sub(
+                    r"<tool_call>.*?</tool_call>", "", content_text, flags=_re.DOTALL,
+                ).strip()
+                message["content"] = clean_content or None
+                message["tool_calls"] = tool_calls_parsed
+                finish_reason = "tool_calls"
+            else:
+                message["content"] = content_text
+
+            return {
+                "id": request_id,
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "model": model_name,
+                "usage": {
+                    "prompt_tokens": actual_prompt_len,
+                    "completion_tokens": len(final_output.outputs[0].token_ids) if final_output.outputs else 0,
+                    "total_tokens": actual_prompt_len + (len(final_output.outputs[0].token_ids) if final_output.outputs else 0),
+                },
+            }
+
+        logger.info("Added /v1/chat/completions endpoint.")
+
     def _add_skyrl_endpoints(self, app, engine):
         """Add SkyRL control-plane endpoints to the FastAPI app."""
         host = self._host if self._host != "0.0.0.0" else "127.0.0.1"
@@ -414,13 +757,21 @@ class SkyRLVllmServer:
                     args=(pickled,),
                 )
                 return {"status": "ok"}
-            except Exception as e:
-                logger.warning(
-                    "init_weight_update_communicator skipped (%s). "
-                    "LoRA sync uses file-based path instead.",
-                    e,
+            except ImportError:
+                # LoRA file-based sync doesn't need NCCL — safe to skip.
+                logger.info(
+                    "init_weight_update_communicator: skyrl_train.weight_sync "
+                    "not available; LoRA sync uses file-based path instead.",
                 )
-                return {"status": "ok", "note": "skipped_nccl"}
+                return {"status": "ok", "note": "skipped_nccl_import_unavailable"}
+            except Exception as e:
+                logger.error(
+                    "init_weight_update_communicator FAILED: %s", e, exc_info=True,
+                )
+                return JSONResponse(
+                    {"status": "error", "error": str(e)},
+                    status_code=500,
+                )
 
         # Alias: vllm_server_actor uses /init_weight_transfer
         @app.post("/init_weight_transfer")
@@ -440,9 +791,18 @@ class SkyRLVllmServer:
                     args=(pickled,),
                 )
                 return {"status": "ok"}
+            except ImportError:
+                logger.info(
+                    "update_weights: skyrl_train.weight_sync not available; "
+                    "LoRA sync uses file-based path instead.",
+                )
+                return {"status": "ok", "note": "skipped_import_unavailable"}
             except Exception as e:
-                logger.warning("update_weights skipped (%s).", e)
-                return {"status": "ok", "note": "skipped"}
+                logger.error("update_weights FAILED: %s", e, exc_info=True)
+                return JSONResponse(
+                    {"status": "error", "error": str(e)},
+                    status_code=500,
+                )
 
         @app.post("/finalize_weight_update")
         async def _finalize_weight_update(request: Request):

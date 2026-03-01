@@ -49,10 +49,10 @@ def main() -> None:
         help="Output JSONL for SFT formatted trajectories.",
     )
     parser.add_argument(
-        "--grpo-out",
+        "--online-rl-out",
         type=str,
-        default="data/synthetic_grpo.jsonl",
-        help="Output JSONL for GRPO metric-ready trajectories.",
+        default="data/synthetic_online_rl.jsonl",
+        help="Output JSONL for online RL metric-ready trajectories.",
     )
 
     args = parser.parse_args()
@@ -82,12 +82,9 @@ def main() -> None:
     logger.info(f"Generating {args.num_traces} raw traces from teacher...")
     raw_traces = generator.batch_generate_traces(max_trajectories=args.num_traces)
     
-    logger.info("Injecting Hindsight Reasoning (Chain of Thought Scaffolding)...")
-    enhanced_traces = generator.enhance_with_reasoning(raw_traces)
-    
     logger.info("Exporting to training formats...")
-    generator.export_sft(enhanced_traces, args.sft_out)
-    generator.export_grpo(enhanced_traces, args.grpo_out)
+    generator.export_jsonl(raw_traces, args.sft_out)
+    generator.export_jsonl(raw_traces, args.online_rl_out)
     
     logger.info(f"Generation successful. Output traces span {args.num_traces} completed objectives.")
     

@@ -1,4 +1,4 @@
-"""Tests for ToolExecutor -- direct subprocess tool execution.
+"""Tests for SubprocessExecutor -- direct subprocess tool execution.
 
 Validates:
 - reset() returns expected dict shape
@@ -13,15 +13,15 @@ Validates:
 
 import pytest
 
-from open_ctf.envs.tool_executor import ToolExecutor, ALL_TOOLS
+from open_ctf.envs.tool_executor import SubprocessExecutor, ALL_TOOLS
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_executor(**kwargs) -> ToolExecutor:
-    """Create a ToolExecutor with sensible test defaults."""
+def _make_executor(**kwargs) -> SubprocessExecutor:
+    """Create a SubprocessExecutor with sensible test defaults."""
     defaults = {
         "target": "http://test-target:8080",
         "ground_truth": "FLAG{test123}",
@@ -29,7 +29,7 @@ def _make_executor(**kwargs) -> ToolExecutor:
         "command_timeout": 5,
     }
     defaults.update(kwargs)
-    return ToolExecutor(**defaults)
+    return SubprocessExecutor(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +100,18 @@ class TestShellCommand:
         result = exe.step("execute_command", {"command": "echo aliased"})
         assert result["stdout"].strip() == "aliased"
         assert result["exit_code"] == 0
+
+    def test_default_workdir_when_not_provided(self, tmp_path):
+        exe = _make_executor(default_workdir=str(tmp_path))
+        exe.reset()
+        result = exe.step("shell_command", {"command": "pwd"})
+        assert result["stdout"].strip() == str(tmp_path)
+
+    def test_noninteractive_env_sets_unzipopt(self):
+        exe = _make_executor()
+        exe.reset()
+        result = exe.step("shell_command", {"command": "echo ${UNZIPOPT}"})
+        assert result["stdout"].strip() == "-o"
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +264,27 @@ class TestFileOps:
         assert "line2" in result["stdout"]
         assert result["exit_code"] == 0
 
+    def test_read_file_accepts_file_alias(self, tmp_path):
+        test_file = tmp_path / "alias.txt"
+        test_file.write_text("alias_ok\n")
+
+        exe = _make_executor()
+        exe.reset()
+        result = exe.step("read_file", {"file": str(test_file)})
+        assert "alias_ok" in result["stdout"]
+        assert result["exit_code"] == 0
+
+    def test_read_file_accepts_filename_alias(self, tmp_path):
+        """Models often use {"filename": "..."} — verify the alias works."""
+        test_file = tmp_path / "fn_alias.txt"
+        test_file.write_text("filename_ok\n")
+
+        exe = _make_executor()
+        exe.reset()
+        result = exe.step("read_file", {"filename": str(test_file)})
+        assert "filename_ok" in result["stdout"]
+        assert result["exit_code"] == 0
+
     def test_grep(self, tmp_path):
         test_file = tmp_path / "search.txt"
         test_file.write_text("flag_here\nno_match\nflag_also\n")
@@ -271,6 +304,46 @@ class TestFileOps:
         result = exe.step("file_search", {"pattern": "*.py", "path": str(tmp_path)})
         assert "target.py" in result["stdout"]
         assert result["exit_code"] == 0
+
+
+class TestApplyPatch:
+    def test_apply_patch_updates_file_contents(self, tmp_path):
+        target = tmp_path / "notes.txt"
+        target.write_text("alpha\nbeta\n", encoding="utf-8")
+
+        exe = _make_executor(default_workdir=str(tmp_path))
+        exe.reset()
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: notes.txt\n"
+            "@@\n"
+            "-beta\n"
+            "+gamma\n"
+            "*** End Patch\n"
+        )
+        result = exe.step("apply_patch", {"patch": patch})
+        assert result["exit_code"] == 0
+        assert "Updated file: notes.txt" in result["stdout"]
+        assert target.read_text(encoding="utf-8") == "alpha\ngamma\n"
+
+    def test_apply_patch_rejects_workspace_escape(self, tmp_path):
+        outside = tmp_path.parent / "outside.txt"
+        outside.write_text("x\n", encoding="utf-8")
+
+        exe = _make_executor(default_workdir=str(tmp_path))
+        exe.reset()
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: ../outside.txt\n"
+            "@@\n"
+            "-x\n"
+            "+y\n"
+            "*** End Patch\n"
+        )
+        result = exe.step("apply_patch", {"patch": patch})
+        assert result["exit_code"] == 1
+        assert "escapes workspace" in (result["stderr"] or "")
+        assert outside.read_text(encoding="utf-8") == "x\n"
 
 
 # ---------------------------------------------------------------------------

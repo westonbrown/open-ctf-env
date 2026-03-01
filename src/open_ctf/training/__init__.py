@@ -14,7 +14,6 @@ __all__ = [
     "train_sft",
     "train_sft_trl",
     "train_online_rl",
-    "train_grpo",
     "run_gepa",
     "check_wandb_available",
 ]
@@ -43,8 +42,8 @@ def check_wandb_available(report_to: str) -> str:
 
 
 def _import_online_rl():
-    from .online_rl import train_online_rl, train_grpo
-    return train_online_rl, train_grpo
+    from .online_rl import train_online_rl
+    return train_online_rl
 
 
 def __getattr__(name):
@@ -55,11 +54,8 @@ def __getattr__(name):
         from .sft import train_sft_trl
         return train_sft_trl
     if name == "train_online_rl":
-        train_online_rl, _ = _import_online_rl()
+        train_online_rl = _import_online_rl()
         return train_online_rl
-    if name == "train_grpo":
-        _, train_grpo = _import_online_rl()
-        return train_grpo
     if name == "run_gepa":
         from .gepa import run_gepa
         return run_gepa

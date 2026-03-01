@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import sys
+from pathlib import Path
 
 from open_ctf.agent.runner import AgentRunner
 
@@ -18,6 +19,9 @@ from open_ctf.agent.runner import AgentRunner
 def main():
     parser = argparse.ArgumentParser(
         description="Run BoxPwnr agent against CTF challenges"
+    )
+    default_registry = (
+        Path(__file__).resolve().parents[3] / "configs" / "challenges" / "cybench.yaml"
     )
 
     parser.add_argument(
@@ -29,6 +33,21 @@ def main():
     parser.add_argument(
         "--target", "-t",
         help="Target identifier (e.g. XBEN-003-24 for xbow)",
+    )
+    parser.add_argument(
+        "--challenge-registry",
+        default=str(default_registry),
+        help=f"Path to challenge registry YAML (default: {default_registry})",
+    )
+    parser.add_argument(
+        "--target-map",
+        default=None,
+        help="Optional JSON/YAML challenge target override map.",
+    )
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host used for registry target resolution checks (default: localhost).",
     )
     parser.add_argument(
         "--model", "-m",
@@ -128,6 +147,26 @@ def main():
         parser.error("--target is required (use --check to verify setup)")
 
     try:
+        if args.platform == "cybench":
+            from open_ctf.challenges.preflight import (
+                resolve_challenge_id_or_raise,
+                validate_runtime_preflight,
+            )
+            from open_ctf.challenges.registry import ChallengeRegistry
+
+            registry = ChallengeRegistry(args.challenge_registry)
+            if args.target_map:
+                registry.load_target_overrides(args.target_map, strict=False)
+            resolved_id = resolve_challenge_id_or_raise(registry, args.target)
+            validate_runtime_preflight(
+                registry,
+                host=args.host,
+                challenge_ids=[resolved_id],
+                require_reachable=True,
+                strict_container_check=True,
+            )
+            args.target = resolved_id
+
         runner.run(target=args.target)
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

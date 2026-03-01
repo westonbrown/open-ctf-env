@@ -190,17 +190,17 @@ open-ctf-train rl \
     --model outputs/sft-qwen35-merged \
     --data data/online_rl_cybench40.jsonl \
     --output outputs/online_rl-qwen35 \
-    --config src/open_ctf/configs/training_qwen35_27b.yaml \
+    --config configs/training/training_qwen35_27b.yaml \
     --challenge-registry configs/challenges/cybench.yaml
 ```
 
-`open-ctf-train rl` now runs `open-ctf-validate --mode grpo-preflight` automatically and requires `<data>.manifest.json` by default. Use `--allow-missing-manifest` only for ad-hoc debugging.
+`open-ctf-train rl` now runs `open-ctf-validate --mode online-rl-preflight` automatically and requires `<data>.manifest.json` by default. Use `--allow-missing-manifest` only for ad-hoc debugging.
 
 For remote challenge infrastructure (for example DGX containers tunneled to RunPod), generate a live challenge target map on the challenge host and pass it to GRPO:
 
 ```bash
 # On the host running challenge containers (DGX)
-PYTHONPATH=src python3 scripts/generate_live_target_map.py \
+PYTHONPATH=src python3 src/open_ctf/cli/generate_target_map.py \
     --registry configs/challenges/cybench.yaml \
     --benchmark-root /workspace/cybench \
     --port-offset 10200 \
@@ -212,18 +212,18 @@ open-ctf-train rl \
     --model outputs/sft-qwen35-merged \
     --data data/online_rl_cybench40.jsonl \
     --output outputs/online_rl-qwen35 \
-    --config src/open_ctf/configs/training_qwen35_27b.yaml \
+    --config configs/training/training_qwen35_27b.yaml \
     --challenge-registry configs/challenges/cybench.yaml
 ```
 
 ### Configuration
 
-The GRPO launch profiles in this repo are the `src/open_ctf/configs/training*.yaml` files:
+The GRPO launch profiles in this repo are the `configs/training/training*.yaml` files:
 
 | Model | Config | Placement | Notes |
 |-------|--------|-----------|-------|
-| **Qwen3.5-27B (current RunPod/B200 baseline)** | `src/open_ctf/configs/training_qwen35_27b.yaml` | `run_engines_locally: true`, `colocate_all: false` | Trainer and vLLM on separate GPUs |
-| **Nanbeige4.1-3B (legacy baseline)** | `src/open_ctf/configs/training.yaml` | `vllm_mode: colocate` | Single-GPU fallback profile |
+| **Qwen3.5-27B (current RunPod/B200 baseline)** | `configs/training/training_qwen35_27b.yaml` | `run_engines_locally: true`, `colocate_all: false` | Trainer and vLLM on separate GPUs |
+| **Nanbeige4.1-3B (legacy baseline)** | `configs/training/training.yaml` | `vllm_mode: colocate` | Single-GPU fallback profile |
 
 Example generated SkyRL topology (from `training_qwen35_27b.yaml`):
 
@@ -250,15 +250,15 @@ The CTF reward scores completions on **8 signals + 1 penalty**:
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
-| **Flag Capture** | 0.20 | Exact match (1.0) or pattern match (0.1) |
-| **Efficiency** | 0.20 | `min(optimal / actual, 1.0)` |
-| **Progression** | 0.12 | RECON → ENUM → EXPLOIT phase ordering |
-| **Exploration** | 0.08 | Novel tool usage weighted toward early trajectory |
-| **Uniqueness** | 0.08 | Command diversity (detects stuck loops) |
-| **Format** | 0.15 | Valid tool call structure and schema compliance |
-| **Recovery** | 0.07 | Recovery after failed commands |
-| **Cognitive** | 0.10 | Coherent reasoning/execution progression |
-| **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag (decayed by similarity) |
+| **Flag Capture** | 0.40 | Exact match (1.0) or pattern match (0.1) |
+| **Efficiency** | 0.15 | `min(optimal / actual, 1.0)` |
+| **Format** | 0.10 | Valid tool call structure and schema compliance |
+| **Recovery** | 0.09 | Recovery after failed commands |
+| **Progression** | 0.08 | RECON → ENUM → EXPLOIT phase ordering |
+| **Cognitive** | 0.08 | Coherent reasoning/execution progression |
+| **Exploration** | 0.05 | Novel tool usage weighted toward early trajectory |
+| **Uniqueness** | 0.05 | Command diversity (detects stuck loops) |
+| **Hallucination** | -0.20 | Penalty for `flag_found` calls with wrong flag (decayed by similarity) |
 
 All process signals are ungated -- they provide gradient signal regardless of flag capture.
 
@@ -410,7 +410,7 @@ open-ctf-train merge --adapter outputs/sft --base-model Nanbeige/Nanbeige4.1-3B 
 
 # 4. GRPO
 open-ctf-train rl --model outputs/sft-merged --data data/online_rl.jsonl --output outputs/online_rl \
-    --config src/open_ctf/configs/training.yaml
+    --config configs/training/training.yaml
 
 # 5. GEPA (optional — same model for agent + reflection, no cloud APIs)
 open-ctf-train gepa --model openai/ctf-agent --data data/online_rl.jsonl --output outputs/gepa

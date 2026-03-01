@@ -1,7 +1,7 @@
-"""Split converted BoxPwnr traces into SFT and GRPO datasets.
+"""Split converted BoxPwnr traces into SFT and online RL datasets.
 
 SFT gets only successful traces (clean demonstrations).
-GRPO gets ALL traces (success + failure) for contrastive learning,
+Online RL gets ALL traces (success + failure) for contrastive learning,
 with ground_truth_flag cross-referenced from successful traces
 and optimal_steps computed as min successful turns per challenge.
 """
@@ -33,23 +33,26 @@ def _challenge_key(meta: dict[str, Any]) -> str:
 
 
 class DatasetSplitter:
-    """Splits converted JSONL traces into SFT and GRPO training sets."""
+    """Splits converted JSONL traces into SFT and online RL training sets."""
 
-    def __init__(self, max_grpo_tokens: int = 32768):
-        self.max_grpo_tokens = max_grpo_tokens
+    def __init__(
+        self,
+        max_online_rl_tokens: int = 32768,
+    ):
+        self.max_online_rl_tokens = int(max_online_rl_tokens)
 
     def split(
         self,
         input_path: str,
         sft_output: str,
-        grpo_output: str,
+        online_rl_output: str,
     ) -> dict[str, Any]:
-        """Split input JSONL into SFT and GRPO sets.
+        """Split input JSONL into SFT and online RL sets.
 
         Args:
             input_path: Path to JSONL file from the converter.
             sft_output: Path for SFT output JSONL.
-            grpo_output: Path for GRPO output JSONL.
+            online_rl_output: Path for online RL output JSONL.
 
         Returns:
             Summary statistics dict.
@@ -83,33 +86,33 @@ class DatasetSplitter:
         sft_traces = [
             t for t in traces if t.get("metadata", {}).get("success", False)
         ]
-        grpo_traces = list(traces)  # all traces
+        online_rl_traces = list(traces)  # all traces
 
-        # Token filtering for GRPO
-        grpo_filtered_count = 0
-        grpo_kept: list[dict] = []
-        for trace in grpo_traces:
+        # Token filtering for online RL
+        online_rl_filtered_count = 0
+        online_rl_kept: list[dict] = []
+        for trace in online_rl_traces:
             est = self._estimate_tokens(trace["messages"])
-            if est > self.max_grpo_tokens:
-                grpo_filtered_count += 1
+            if est > self.max_online_rl_tokens:
+                online_rl_filtered_count += 1
                 logger.debug(
-                    "Filtered GRPO trace (%d est tokens): %s",
+                    "Filtered online RL trace (%d est tokens): %s",
                     est,
                     _challenge_key(trace.get("metadata", {})),
                 )
             else:
-                grpo_kept.append(trace)
+                online_rl_kept.append(trace)
 
-        # Count GRPO traces still missing ground_truth_flag
-        grpo_missing_flag = sum(
-            1 for t in grpo_kept if not t.get("ground_truth_flag")
+        # Count online RL traces still missing ground_truth_flag
+        online_rl_missing_flag = sum(
+            1 for t in online_rl_kept if not t.get("ground_truth_flag")
         )
 
         # Collect stats
         tool_counter: Counter[str] = Counter()
         platform_counter: Counter[str] = Counter()
         sft_turn_sum = 0
-        grpo_turn_sum = 0
+        online_rl_turn_sum = 0
 
         for trace in traces:
             meta = trace.get("metadata", {})
@@ -122,29 +125,29 @@ class DatasetSplitter:
 
         for t in sft_traces:
             sft_turn_sum += self._count_turns(t["messages"])
-        for t in grpo_kept:
-            grpo_turn_sum += self._count_turns(t["messages"])
+        for t in online_rl_kept:
+            online_rl_turn_sum += self._count_turns(t["messages"])
 
         # Write outputs
         Path(sft_output).parent.mkdir(parents=True, exist_ok=True)
-        Path(grpo_output).parent.mkdir(parents=True, exist_ok=True)
+        Path(online_rl_output).parent.mkdir(parents=True, exist_ok=True)
 
         self._write_jsonl(sft_output, sft_traces)
-        self._write_jsonl(grpo_output, grpo_kept)
+        self._write_jsonl(online_rl_output, online_rl_kept)
 
         stats = {
             "total_input": total_input,
             "sft_count": len(sft_traces),
-            "grpo_count": len(grpo_kept),
-            "grpo_filtered": grpo_filtered_count,
-            "grpo_missing_flag": grpo_missing_flag,
+            "online_rl_count": len(online_rl_kept),
+            "online_rl_filtered": online_rl_filtered_count,
+            "online_rl_missing_flag": online_rl_missing_flag,
             "tool_distribution": dict(tool_counter.most_common()),
             "platform_distribution": dict(platform_counter.most_common()),
             "avg_turns_sft": (
                 round(sft_turn_sum / len(sft_traces), 1) if sft_traces else 0
             ),
-            "avg_turns_grpo": (
-                round(grpo_turn_sum / len(grpo_kept), 1) if grpo_kept else 0
+            "avg_turns_online_rl": (
+                round(online_rl_turn_sum / len(online_rl_kept), 1) if online_rl_kept else 0
             ),
         }
 

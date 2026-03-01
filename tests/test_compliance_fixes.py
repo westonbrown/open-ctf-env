@@ -13,7 +13,8 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 
-from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv, parse_tool_calls
+from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+from open_ctf.parsing import parse_tool_calls
 from open_ctf.rewards.reward import CTFReward
 from open_ctf.training.online_rl.step_reward import per_step_reward
 from open_ctf.training.online_rl.runtime import _build_skyrl_config
@@ -342,11 +343,11 @@ class TestPerStepRewardRange:
     """
 
     def test_empty_tool_calls_returns_zero(self):
-        assert per_step_reward([], 1, 10) == 0.0
+        assert per_step_reward([], 1) == 0.0
 
     def test_single_tool_returns_zero(self):
         tool_calls = [_shell("nmap target")]
-        assert per_step_reward(tool_calls, 1, 10) == 0.0
+        assert per_step_reward(tool_calls, 1) == 0.0
 
     def test_diverse_tools_returns_zero(self):
         diverse = [
@@ -357,12 +358,12 @@ class TestPerStepRewardRange:
             _shell("curl target"),
             _tc("flag_found", {"content": "FLAG{x}"}),
         ]
-        assert per_step_reward(diverse, 5, 10) == 0.0
+        assert per_step_reward(diverse, 5) == 0.0
 
     def test_all_steps_return_zero(self):
         tool_calls = [_shell("ls")]
         for step in range(1, 20):
-            assert per_step_reward(tool_calls, step, 20) == 0.0
+            assert per_step_reward(tool_calls, step) == 0.0
 
     def test_max_diversity_returns_zero(self):
         """Even with maximum diversity, intermediate reward is 0.0."""
@@ -375,7 +376,7 @@ class TestPerStepRewardRange:
             _shell("nmap target"),
             _tc("apply_patch", {"patch": "..."}),
         ]
-        assert per_step_reward(max_diverse, 7, 15) == 0.0
+        assert per_step_reward(max_diverse, 7) == 0.0
 
 
 # ===========================================================================
@@ -449,7 +450,7 @@ class TestRLOONConfig:
                 "dropout": 0.0,
                 "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
             },
-            "grpo": {
+            "online_rl": {
                 "learning_rate": 5e-6,
                 "num_generations": 8,
                 "max_completion_length": 4096,
@@ -469,14 +470,14 @@ class TestRLOONConfig:
 
     def test_explicit_rloo_n_from_config(self, base_config):
         """Explicit rloo_n in config should pass through."""
-        base_config["grpo"]["advantage_estimator"] = "rloo_n"
+        base_config["online_rl"]["advantage_estimator"] = "rloo_n"
         result = _build_skyrl_config("/model", "/out", base_config, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
         assert algo["advantage_estimator"] == "rloo_n"
 
     def test_explicit_grpo_from_config(self, base_config):
         """Explicit grpo in config should override default."""
-        base_config["grpo"]["advantage_estimator"] = "grpo"
+        base_config["online_rl"]["advantage_estimator"] = "grpo"
         result = _build_skyrl_config("/model", "/out", base_config, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
         assert algo["advantage_estimator"] == "grpo"
@@ -488,7 +489,7 @@ class TestRLOONConfig:
 
     def test_kl_disabled_when_beta_zero(self, base_config):
         """KL loss should be disabled when beta=0.0."""
-        base_config["grpo"]["beta"] = 0.0
+        base_config["online_rl"]["beta"] = 0.0
         result = _build_skyrl_config("/model", "/out", base_config, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
         assert algo["use_kl_loss"] is False
@@ -496,7 +497,7 @@ class TestRLOONConfig:
 
     def test_kl_enabled_when_beta_positive(self, base_config):
         """KL loss should be enabled when beta > 0."""
-        base_config["grpo"]["beta"] = 0.001
+        base_config["online_rl"]["beta"] = 0.001
         result = _build_skyrl_config("/model", "/out", base_config, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
         assert algo["use_kl_loss"] is True

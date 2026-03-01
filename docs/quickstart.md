@@ -107,7 +107,7 @@ open-ctf-train rl \
     --model outputs/sft-merged \
     --data data/online_rl.jsonl \
     --output outputs/online_rl \
-    --config src/open_ctf/configs/training.yaml
+    --config configs/training/training.yaml
 
 # Stage 3: GEPA prompt optimization (no weight updates)
 open-ctf-train gepa \
@@ -118,7 +118,7 @@ open-ctf-train gepa \
     --challenge-registry configs/challenges/cybench.yaml
 ```
 
-Note: `open-ctf-train rl` runs a preflight validation gate and, by default, requires `<data>.manifest.json` produced by `scripts/generate_online_rl_from_registry.py`.
+Note: `open-ctf-train rl` runs a preflight validation gate and, by default, requires `<data>.manifest.json` produced by `src/open_ctf/cli/generate_online_rl.py`.
 
 ### Export for Deployment
 

@@ -1,6 +1,7 @@
 """Tests for ChallengeManager — mocked Docker subprocess calls."""
 
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -108,6 +109,16 @@ class TestChallengeManager:
         ]
         assert manager.health_check("eval-me") is False
 
+    @patch("socket.create_connection")
+    @patch("subprocess.run")
+    def test_health_check_tcp_fallback_returns_true(self, mock_run, mock_socket, manager):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="0.0.0.0:32805->1337/tcp\n", stderr=""),  # docker ps
+            MagicMock(returncode=1, stdout="", stderr="curl failed"),  # curl
+        ]
+        mock_socket.return_value = nullcontext(object())
+        assert manager.health_check("eval-me") is True
+
     @patch("subprocess.run")
     def test_get_running(self, mock_run, manager):
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
@@ -162,6 +173,41 @@ class TestChallengeManager:
         mock_run.side_effect = _run
         with pytest.raises(RuntimeError, match="docker compose up failed"):
             manager.setup("eval-me")
+
+    @patch("subprocess.run")
+    def test_teardown_uses_stop_script_for_start_docker_mode(self, mock_run, tmp_path):
+        registry_data = {
+            "challenges": [
+                {
+                    "id": "startup-only",
+                    "name": "startup-only",
+                    "category": "misc",
+                    "difficulty": "easy",
+                    "infra_type": "docker",
+                    "port": 39999,
+                }
+            ]
+        }
+        registry_path = tmp_path / "registry.yaml"
+        with open(registry_path, "w") as f:
+            yaml.dump(registry_data, f)
+
+        challenge_dir = tmp_path / "benchmark" / "startup-only"
+        challenge_dir.mkdir(parents=True)
+        (challenge_dir / "start_docker.sh").write_text("#!/bin/bash\necho start\n")
+        (challenge_dir / "stop_docker.sh").write_text("#!/bin/bash\necho stop\n")
+
+        registry = ChallengeRegistry(str(registry_path))
+        mgr = ChallengeManager(registry=registry, bench_dir=str(tmp_path))
+        mgr._startup_mode["startup-only"] = "start_docker.sh"
+        mgr._running["startup-only"] = "http://localhost:39999"
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        mgr.teardown("startup-only")
+
+        call_strings = [str(c) for c in mock_run.call_args_list]
+        assert any("stop_docker.sh" in s for s in call_strings)
+        assert "startup-only" not in mgr.get_running()
 
     @patch("subprocess.run")
     def test_setup_resolves_nested_path_with_token_matching(self, mock_run, tmp_path):

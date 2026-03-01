@@ -7,6 +7,8 @@ Validates:
 - OpenCTFTextEnv delegates to custom agent when agent_class is specified
 """
 
+from pathlib import Path
+
 import pytest
 
 from open_ctf.agent.protocol import StepAgent, StepResult
@@ -142,6 +144,71 @@ class TestDefaultStepAgent:
         agent.close()
         assert agent._executor is None
 
+    def test_root_challenge_paths_are_rewritten_to_active_workdir(self, tmp_path):
+        """Commands hardcoding /root/challenge should run in per-episode workspace."""
+        (tmp_path / "artifact.txt").write_text("ok\n", encoding="utf-8")
+        agent = DefaultStepAgent()
+        agent.reset(
+            target=f"file://{tmp_path}/",
+            max_steps=10,
+            challenge_workdir=str(tmp_path),
+        )
+
+        action = (
+            '<tool_call>{"name":"shell_command","arguments":'
+            '{"command":"ls -1 /root/challenge"}}</tool_call>'
+        )
+        result = agent.step(action)
+        assert not result.done
+        assert "artifact.txt" in result.observations[0]["content"]
+        assert str(tmp_path) in agent.tool_calls_history[0]["arguments"]
+
+    def test_command_xml_parse_hint_uses_command_xml_format(self):
+        """Parser recovery hint must match command_xml profile (no JSON tool_call)."""
+        agent = DefaultStepAgent(tool_call_format="command_xml")
+        agent.reset(target="http://localhost:8080", max_steps=10)
+
+        result = agent.step("<COMMAND maxtime=30>enumerate target</COMMANDX>")
+        assert not result.done
+        assert len(result.observations) == 1
+        hint = result.observations[0]["content"]
+        assert "<COMMAND" in hint
+        assert "<tool_call>" not in hint
+
+    def test_fallback_shell_recovery_accepts_explicit_function_form(self):
+        """Fallback shell recovery should work for explicit function-style emission."""
+        agent = DefaultStepAgent()
+        agent.reset(target="http://localhost:8080", max_steps=10)
+        result = agent.step('shell_command(command="echo fallback_ok")')
+        assert not result.done
+        assert len(result.observations) == 1
+        assert "fallback_ok" in result.observations[0]["content"]
+
+    def test_fallback_shell_recovery_rejects_plain_prose(self):
+        """Fallback shell recovery should not execute commands extracted from prose."""
+        agent = DefaultStepAgent()
+        agent.reset(target="http://localhost:8080", max_steps=10)
+        result = agent.step("I should maybe run curl -s http://localhost:8080, then continue.")
+        assert not result.done
+        assert len(result.observations) == 1
+        assert "No tool call detected" in result.observations[0]["content"]
+
+    def test_ground_truth_in_tool_output_does_not_mark_episode_done(self):
+        """Only explicit tool completion should end the episode."""
+        agent = DefaultStepAgent()
+        agent.reset(
+            target="http://localhost:8080",
+            max_steps=10,
+            ground_truth_flag="FLAG{do_not_autocomplete}",
+        )
+        action = (
+            '<tool_call>{"name":"shell_command","arguments":'
+            '{"command":"echo FLAG{do_not_autocomplete}"}}</tool_call>'
+        )
+        result = agent.step(action)
+        assert not result.done
+        assert agent.episode_done is False
+
 
 # ---------------------------------------------------------------------------
 # OpenCTFTextEnv delegation
@@ -232,3 +299,51 @@ class TestEnvDelegation:
         assert result["done"] is False
         assert len(result["observations"]) == 1
         assert "test123" in result["observations"][0]["content"]
+
+    def test_env_passes_tool_call_format_into_agent(self):
+        """Env/agent parser hints should align with env tool_call_format."""
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+
+        env = OpenCTFTextEnv(
+            extras={"target": "http://localhost:8080", "tool_call_format": "command_xml"},
+        )
+        assert getattr(env._agent, "_tool_call_format", "") == "command_xml"
+
+    def test_static_env_uses_isolated_workspace_and_rewrites_prompt(self, tmp_path):
+        """Static episodes should stage files in a unique workspace per env."""
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+
+        source = tmp_path / "registry" / "sample_static"
+        payload = source / "release"
+        payload.mkdir(parents=True)
+        (payload / "readme.txt").write_text("hello\n", encoding="utf-8")
+
+        env = OpenCTFTextEnv(
+            extras={
+                "infra_type": "static",
+                "challenge_id": "sample-static",
+                "path_hint": str(source),
+                "ground_truth_flag": "FLAG{test}",
+                "max_turns": 5,
+            }
+        )
+        prompt = [
+            {
+                "role": "user",
+                "content": "Inspect /root/challenge/ and file:///root/challenge/.",
+            }
+        ]
+        workspace = ""
+        try:
+            prompt_out, _ = env.init(prompt)
+            workspace = env._challenge_workdir
+            assert workspace != "/root/challenge"
+            assert env._target.startswith("file://")
+            assert Path(workspace, "readme.txt").exists()
+            assert "/root/challenge" not in str(prompt_out[0]["content"])
+        finally:
+            workspace = workspace or env._challenge_workdir
+            env.close()
+
+        assert workspace
+        assert not Path(workspace).exists()

@@ -1,0 +1,155 @@
+# RunPod H200 SXM Training Configuration (v2 — Optimized)
+# ========================================================
+# Online GRPO with vLLM server mode for GLM-4.7-Flash.
+#
+# Key optimizations over v1:
+#   - BF16 weights on both sides (enables vLLM weight sync for on-policy GRPO)
+#   - FP8 KV cache on vLLM (doubles effective KV budget at zero quality cost)
+#   - gpu_memory_utilization 0.85 (maximize KV cache headroom)
+#   - num_generations 16 (C(16,2)=120 pairs vs C(8,2)=28 — 4.3x more signal)
+#   - max_completion_length 32768 (full-length completions)
+#
+# GRPO (2x H200, 282 GB total):
+#   GPU 0 — vLLM server:
+#     BF16 model: ~60 GB
+#     FP8 KV cache (16 gen * 32K tok): ~30-40 GB (=60-80 GB BF16 equiv)
+#     Allocated: 0.85 * 141 = ~120 GB
+#     Headroom: ~20 GB
+#
+#   GPU 1 — Trainer:
+#     BF16 model: ~60 GB
+#     LoRA + optimizer + grads: ~1.5 GB
+#     Activations (checkpointed): ~10-20 GB
+#     Framework/OS: ~8 GB
+#     Total: ~80-90 GB
+#     Headroom: ~50-60 GB
+#
+#   Launch:
+#     # Terminal 1: vLLM server on GPU 0
+#     CUDA_VISIBLE_DEVICES=0 trl vllm-serve \
+#       --model /workspace/sft_merged \
+#       --dtype bfloat16 --max_model_len 32768 \
+#       --gpu_memory_utilization 0.85 \
+#       --kv_cache_dtype fp8_e4m3fn
+#
+#     # Terminal 2: Training on GPU 1
+#     CUDA_VISIBLE_DEVICES=1 python /workspace/launch_grpo_bf16.py
+#
+# Cost: 2 * $3.59/hr * 5-8 hr = ~$36-58
+
+model:
+  name: "unsloth/GLM-4.7-Flash"
+  # 32K captures 85% of SFT traces.
+  max_seq_length: 32768
+  # BF16 (no quantization): model ~60 GB. Required for online GRPO weight sync —
+  # TRL's vLLM server mode sends params via NCCL which requires matching shapes
+  # between trainer (BF16+LoRA) and vLLM server (BF16). NF4 quantized tensors
+  # have different packed shapes that cause assertion failures in load_weights().
+  load_in_4bit: false
+  load_in_8bit: false
+
+lora:
+  r: 64
+  # alpha=2r: standard ratio for stronger LoRA signal through the bottleneck.
+  alpha: 128
+  dropout: 0
+  # Attention + shared expert layers. Routed MoE expert 3D tensors are NOT
+  # LoRA'd (PEFT only matches nn.Module, not fused 3D expert tensors).
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+sft:
+  # 5 epochs: OpenThoughts research shows short SFT (1-3 epochs) can underfit
+  # with <1K samples, causing unstable RL downstream. 5 is the sweet spot.
+  epochs: 5
+  # batch_size=1 required for GLM-4.7-Flash MoE (NaN gradients with padding).
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: true
+  # Memory budget for SFT on 1x H200 (141 GB VRAM):
+  #   Model (NF4): ~17 GB
+  #   LoRA adapters: ~1 GB
+  #   Optimizer (8-bit AdamW): ~2 GB
+  #   Gradient activations (checkpointed, 32K): ~30-40 GB
+  #   Framework/OS: ~8 GB
+  #   Total: ~58-68 GB -> ~73-83 GB headroom
+
+online_rl:
+  epochs: 1
+  batch_size: 1
+  # batch_size(1) * grad_accum(8) % num_gen(8) = 0 (valid).
+  # Effective batch = 1 * 8 / 8 = 1 prompt per optimizer step.
+  # 659 samples / 8 = 82 optimizer steps per epoch.
+  gradient_accumulation_steps: 8
+  # 1e-6: Standard GRPO rate for MoE models. Expert activation volatility
+  # amplifies gradient noise; lower LR prevents catastrophic forgetting.
+  # Reference: DeepSeekMath GRPO, ToolRL, DeepSWE all use 1e-6.
+  learning_rate: 1.0e-6
+  warmup_ratio: 0.10
+  # beta=0.0: DAPO formulation. No KL penalty — replaced by epsilon clipping.
+  beta: 0.0
+  loss_type: dapo
+  # Advantage estimator: rloo_n (REINFORCE Leave-One-Out, normalized).
+  # Alternatives: grpo, rloo, reinforce++, gae.
+  advantage_estimator: rloo_n
+  # 8 generations -> C(8,2) = 28 pairwise comparisons per prompt.
+  # FP8 KV cache + gpu_mem_util 0.85 provides ~60 GB KV budget.
+  num_generations: 8
+  # 32K completions: full-length traces. FP8 KV cache makes this affordable.
+  # Online mode generates incrementally (tool call iterations), so individual
+  # turns are much shorter than full traces.
+  max_completion_length: 32768
+  # max_prompt_length: TRL defaults to 512 which silently truncates system prompts.
+  # Ghost/BoxPwnr system prompts with tool schemas are 2000+ tokens.
+  # Set to 8192 to ensure full prompts are preserved.
+  max_prompt_length: 8192
+  # 15 tool iterations: enough for complex multi-step CTF (recon + enum + exploit).
+  # Each iteration = generate -> parse tool calls -> execute -> regenerate.
+  max_tool_calling_iterations: 15
+  max_grad_norm: 0.1
+  # DAPO epsilon clipping: bounds per-token importance ratio to [1-eps, 1+eps_high].
+  # 0.28 is the standard DAPO value (wider than PPO's 0.2 for more exploration).
+  epsilon_high: 0.28
+  weight_decay: 0.1
+  # DAPO: no reward normalization needed (group-relative baseline centers rewards).
+  scale_rewards: false
+  # Default online-RL agent runtime via generic bridge.
+  agent_class: open_ctf.agent.default_agent.DefaultStepAgent
+  agent_kwargs:
+    max_consecutive_no_tool_calls: 3
+    runtime_cmd: "python src/open_ctf/agent/framework_runtime_bridge.py"
+    runtime_timeout_seconds: 20
+    runtime_passthrough: false
+    runtime_fallback_to_parser: false
+    runtime_env:
+      OPEN_CTF_AGENT_FRAMEWORK: "boxpwnr_langgraph"
+      OPEN_CTF_AGENT_MODE: "tool_calls"
+  # vLLM server mode: generation offloaded to GPU 0's vLLM process.
+  # Avoids weight sync and mixed-dtype bugs from colocate mode on MoE.
+  # vLLM 0.16.0 supports GLM-4.7-Flash natively (PR #34124).
+  use_vllm: true
+  vllm_mode: "server"
+  # vLLM server GPU memory utilization on GPU 0.
+  # 0.85: model BF16 ~60 GB + FP8 KV cache ~60 GB = ~120 GB out of 141 GB.
+  # FP8 KV cache doubles effective KV budget. 16 gen * 32K tokens fits.
+  gpu_memory_utilization: 0.85
+  # FP8 KV cache: halves KV memory with negligible quality impact.
+  # Enables 16 generations at 32K tokens on a single H200.
+  vllm_kv_cache_dtype: "fp8_e4m3fn"
+
+output:
+  save_steps: 25
+  logging_steps: 1
+  # W&B logging for RunPod runs.
+  report_to: wandb

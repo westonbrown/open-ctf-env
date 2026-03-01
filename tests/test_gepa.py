@@ -129,7 +129,7 @@ class TestConfigLoading:
 
         config_path = (
             Path(__file__).resolve().parent.parent
-            / "src" / "open_ctf" / "configs" / "training.yaml"
+            / "configs" / "training" / "training.yaml"
         )
         with open(config_path) as f:
             config = yaml.safe_load(f)
@@ -148,7 +148,7 @@ class TestConfigLoading:
 
         config_path = (
             Path(__file__).resolve().parent.parent
-            / "src" / "open_ctf" / "configs" / "training.yaml"
+            / "configs" / "training" / "training.yaml"
         )
         with open(config_path) as f:
             config = yaml.safe_load(f)
@@ -161,7 +161,7 @@ class TestConfigLoading:
 
         config_path = (
             Path(__file__).resolve().parent.parent
-            / "src" / "open_ctf" / "configs" / "training.yaml"
+            / "configs" / "training" / "training.yaml"
         )
         with open(config_path) as f:
             config = yaml.safe_load(f)
@@ -906,7 +906,7 @@ class TestGEPACLIFlags:
             args.model = "openai/gpt-4"
             args.data = "/data.jsonl"
             args.output = "/output"
-            args.config = Path(__file__).resolve().parent.parent / "src" / "open_ctf" / "configs" / "training.yaml"
+            args.config = Path(__file__).resolve().parent.parent / "configs" / "training" / "training.yaml"
             args.reflection_model = None
             args.budget = "medium"
             args.val_data = None

@@ -70,3 +70,57 @@ class TestCTFAgentProtocol:
         assert agent.model == "ollama/test"
         assert agent.platform == "local"
         assert agent.strategy == "chat"
+
+    def test_boxpwnr_adapter_propagates_success_from_runner(self, monkeypatch):
+        from open_ctf.agent.boxpwnr_adapter import BoxPwnrAgent
+        import open_ctf.agent.runner as runner_mod
+
+        class StubRunner:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, target):
+                return {
+                    "status": "success",
+                    "total_turns": 7,
+                    "flag": "FLAG{ok}",
+                }
+
+        monkeypatch.setattr(runner_mod, "AgentRunner", StubRunner)
+        agent = BoxPwnrAgent(model="test-model", platform="cybench")
+        result = agent.solve(
+            challenge="demo",
+            target="http://localhost:32805",
+            max_steps=20,
+            timeout=120,
+        )
+        assert result.success is True
+        assert result.steps == 7
+        assert result.flag == "FLAG{ok}"
+
+    def test_boxpwnr_adapter_non_success_status_is_failure(self, monkeypatch):
+        from open_ctf.agent.boxpwnr_adapter import BoxPwnrAgent
+        import open_ctf.agent.runner as runner_mod
+
+        class StubRunner:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, target):
+                return {
+                    "status": "failed",
+                    "total_turns": 4,
+                    "user_flag_value": "FLAG{wrong}",
+                }
+
+        monkeypatch.setattr(runner_mod, "AgentRunner", StubRunner)
+        agent = BoxPwnrAgent(model="test-model", platform="cybench")
+        result = agent.solve(
+            challenge="demo",
+            target="http://localhost:32805",
+            max_steps=20,
+            timeout=120,
+        )
+        assert result.success is False
+        assert result.steps == 4
+        assert result.flag == "FLAG{wrong}"

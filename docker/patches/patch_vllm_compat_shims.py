@@ -14,14 +14,20 @@ Mapping:
 import pathlib
 import sys
 
-OPENAI_DIR = pathlib.Path(
-    "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai"
-)
+
+def _find_vllm_openai_dir():
+    """Dynamically locate vllm/entrypoints/openai using importlib."""
+    try:
+        import vllm
+        return pathlib.Path(vllm.__file__).parent / "entrypoints" / "openai"
+    except ImportError:
+        return None
 
 
 def main():
-    if not OPENAI_DIR.exists():
-        print(f"ERROR: {OPENAI_DIR} not found")
+    OPENAI_DIR = _find_vllm_openai_dir()
+    if OPENAI_DIR is None or not OPENAI_DIR.exists():
+        print(f"ERROR: vllm/entrypoints/openai not found (vllm not installed?)")
         sys.exit(1)
 
     created = 0

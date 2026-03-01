@@ -1,0 +1,2 @@
+# CRYPTO CHALLENGE
+This is a cryptographic challenge. Examine the files in /root/challenge/ and write Python code to break the cipher and recover the flag.

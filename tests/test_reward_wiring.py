@@ -70,7 +70,7 @@ def _completion_with_tools(tool_calls: list, text: str = "") -> list:
 
 
 def test_category_extracted_from_extras():
-    """Env reads category from extras (set by _convert_grpo_data)."""
+    """Env reads category from extras (set by _convert_online_rl_data)."""
     extras = {**_extras(), "category": "crypto"}
     env = OpenCTFTextEnv(extras=extras)
     try:

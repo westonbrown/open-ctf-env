@@ -32,14 +32,12 @@ def main() -> None:
         help="Output path for SFT dataset (default: data/sft.jsonl)",
     )
     parser.add_argument(
-        "--online-rl-output", "--grpo-output",
-        dest="online_rl_output",
+        "--online-rl-output",
         default="data/online_rl.jsonl",
         help="Output path for online RL dataset (default: data/online_rl.jsonl)",
     )
     parser.add_argument(
-        "--max-online-rl-tokens", "--max-grpo-tokens",
-        dest="max_online_rl_tokens",
+        "--max-online-rl-tokens",
         type=int,
         default=32768,
         help="Max estimated tokens per online RL trace (default: 32768)",
@@ -60,18 +58,18 @@ def main() -> None:
         print(f"Error: input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    splitter = DatasetSplitter(max_grpo_tokens=args.max_online_rl_tokens)
+    splitter = DatasetSplitter(max_online_rl_tokens=args.max_online_rl_tokens)
     stats = splitter.split(args.input, args.sft_output, args.online_rl_output)
 
     # Print summary
     print("\n=== Dataset Split Summary ===\n")
     print(f"  Input traces:              {stats['total_input']}")
     print(f"  SFT output:                {stats['sft_count']}")
-    print(f"  GRPO output:               {stats['grpo_count']}")
-    print(f"  GRPO filtered (too long):  {stats['grpo_filtered']}")
-    print(f"  GRPO missing flag:         {stats['grpo_missing_flag']}")
+    print(f"  Online RL output:          {stats['online_rl_count']}")
+    print(f"  Online RL filtered:        {stats['online_rl_filtered']}")
+    print(f"  Online RL missing flag:    {stats['online_rl_missing_flag']}")
     print(f"  Avg turns (SFT):           {stats['avg_turns_sft']}")
-    print(f"  Avg turns (GRPO):          {stats['avg_turns_grpo']}")
+    print(f"  Avg turns (Online RL):     {stats['avg_turns_online_rl']}")
 
     print("\n  Tool distribution:")
     for tool, count in stats["tool_distribution"].items():

@@ -18,7 +18,6 @@ optional and gracefully degrades if ``tensorboard`` is not installed.
 
 import json
 import logging
-import math
 import os
 import threading
 from datetime import datetime, timezone
@@ -250,8 +249,20 @@ class TrajectoryLogger:
         current_run = 1
         prev_key = ""
         for tc in tool_calls:
+            if not isinstance(tc, dict):
+                prev_key = ""
+                current_run = 1
+                continue
             name = str(tc.get("name", ""))
             args = tc.get("args", {})
+            if isinstance(args, str):
+                try:
+                    parsed_args = json.loads(args)
+                    args = parsed_args if isinstance(parsed_args, dict) else {}
+                except Exception:
+                    args = {}
+            elif not isinstance(args, dict):
+                args = {}
             # Fingerprint: tool name + first 80 chars of command/code arg.
             cmd = str(args.get("command", args.get("code", "")))[:80]
             key = f"{name}:{cmd}"

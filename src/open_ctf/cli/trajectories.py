@@ -1,4 +1,4 @@
-"""Trajectory browser — generates a self-contained HTML report from GRPO logs.
+"""Trajectory browser — generates a self-contained HTML report from online RL logs.
 
 Reads ``{output_dir}/trajectories/`` JSONL files produced by TrajectoryLogger
 and renders a browsable HTML page with:
@@ -8,8 +8,8 @@ and renders a browsable HTML page with:
 
 Usage::
 
-    open-ctf-trajectories /path/to/grpo/output
-    open-ctf-trajectories /path/to/grpo/output --port 8765  # live server
+    open-ctf-trajectories /path/to/online_rl/output
+    open-ctf-trajectories /path/to/online_rl/output --port 8765  # live server
 """
 
 import argparse
@@ -375,12 +375,12 @@ if (STEPS.length > 0) {{
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Browse GRPO training trajectories",
+        description="Browse online RL training trajectories",
         prog="open-ctf-trajectories",
     )
     parser.add_argument(
         "output_dir",
-        help="GRPO output directory (contains trajectories/ and challenge_scoreboard.json)",
+        help="Online RL output directory (contains trajectories/ and challenge_scoreboard.json)",
     )
     parser.add_argument(
         "-o", "--html-output",
@@ -400,7 +400,7 @@ def main() -> None:
     if not os.path.isdir(trajectories_dir):
         print(
             f"Error: {trajectories_dir} not found. "
-            "Run GRPO training with enable_trajectory_logging: true first.",
+            "Run online RL training with enable_trajectory_logging: true first.",
             file=sys.stderr,
         )
         sys.exit(1)

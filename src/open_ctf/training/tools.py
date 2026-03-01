@@ -95,8 +95,8 @@ def init_env(
         max_steps: Maximum steps per episode.
     """
     global _executor
-    from open_ctf.envs.tool_executor import ToolExecutor
-    _executor = ToolExecutor(
+    from open_ctf.envs.tool_executor import SubprocessExecutor
+    _executor = SubprocessExecutor(
         target=target,
         ground_truth=ground_truth,
         max_steps=max_steps,

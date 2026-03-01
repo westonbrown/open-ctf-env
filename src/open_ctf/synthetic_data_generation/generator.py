@@ -5,14 +5,13 @@ Generator orchestrator for offline synthetic trajectory mapping.
 import os
 import json
 import logging
-from typing import Dict, List, Any, Callable
-from copy import deepcopy
+from typing import Dict, List, Any
 
 from litellm import completion
 
 from .manifest import WorldManifest
 from .executor import SimulatedEnvironmentExecutor
-from ..formatters.tool_registry import BOXPWNR_TOOLS
+from ..formatters.tool_registry import AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +62,7 @@ class LiteLLMAgentAdapter(BaseAgentAdapter):
                 response = completion(
                     model=self.model_name,
                     messages=messages,
-                    tools=BOXPWNR_TOOLS,
+                    tools=AGENT_TOOLS,
                     temperature=0.7,
                 )
             except Exception as e:
@@ -114,27 +113,6 @@ class LiteLLMAgentAdapter(BaseAgentAdapter):
         }
 
 
-class BoxPwnrAgentAdapter(BaseAgentAdapter):
-    """
-    Adapter that hooks the full BoxPwnr ChatCompletionTools strategy 
-    into our offline synthetic executor.
-    """
-    def __init__(self, model_name: str, **kwargs):
-        self.model_name = model_name
-        self.kwargs = kwargs
-
-    def run_episode(self, executor: SimulatedEnvironmentExecutor, manifest: WorldManifest, max_turns: int) -> Dict[str, Any]:
-        # Here, users load their exact BoxPwnr `Solver` instance.
-        # solver = Solver(llm_strategy=ChatCompletionTools(...), executor=executor)
-        # solver.solve()
-        # trace_data = load_saved_trace()
-        # return trace_data
-        raise NotImplementedError(
-            "BoxPwnrAgentAdapter.run_episode is a scaffold. Provide a concrete "
-            "BoxPwnr solver integration before using this adapter."
-        )
-
-
 class SyntheticGenerator:
     """
     Coordinates Generation of synthetic trajectories across mocked environments.
@@ -158,23 +136,8 @@ class SyntheticGenerator:
             
         return generated_traces
 
-    def enhance_with_reasoning(self, traces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        enhanced = []
-        for t in traces:
-            if not t.get("metadata", {}).get("success", False):
-                continue
-            trace_copy = deepcopy(t)
-            # Retrospective logic goes here
-            enhanced.append(trace_copy)
-        return enhanced
-        
-    def export_sft(self, traces: List[Dict[str, Any]], filepath: str) -> None:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for t in traces:
-                f.write(json.dumps(t) + "\n")
-
-    def export_grpo(self, traces: List[Dict[str, Any]], filepath: str) -> None:
+    def export_jsonl(self, traces: List[Dict[str, Any]], filepath: str) -> None:
+        """Export traces to JSONL format (usable for both SFT and online RL)."""
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             for t in traces:

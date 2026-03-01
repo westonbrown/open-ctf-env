@@ -598,9 +598,8 @@ class TestGRPOGradientSignal:
 class TestOnlineModeEdgeCases:
     """Test scenarios specific to online GRPO with tools= mode."""
 
-    def test_metadata_success_overrides_text(self, reward):
-        """Platform confirmation should be authoritative."""
-        # Text has wrong flag but platform says success
+    def test_metadata_success_no_longer_overrides_text(self, reward):
+        """metadata_success bypass removed; both should score equally."""
         comp = [{"role": "assistant", "content": "I don't know the flag"}]
         score_success = reward(
             [comp],
@@ -612,7 +611,8 @@ class TestOnlineModeEdgeCases:
             ground_truth_flag=["FLAG{real}"],
             metadata=[{"success": False}],
         )[0]
-        assert score_success > score_fail + 0.1
+        # metadata_success is now ignored, so both should be the same
+        assert abs(score_success - score_fail) < 0.01
 
     def test_tool_calls_as_dicts(self, reward):
         """In online mode, TRL passes arguments as dicts, not JSON strings."""

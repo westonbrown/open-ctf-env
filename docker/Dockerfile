@@ -63,9 +63,10 @@ CMD ["open-ctf-train", "sft", "--backend", "trl", "--help"]
 # ============================================================
 FROM base AS grpo
 
-# skyrl-train is currently source-installed from GitHub (not published on PyPI).
+# skyrl-train is source-installed from GitHub (not published on PyPI).
+# Pinned to the commit our 19 patches are validated against.
 RUN pip install --no-cache-dir \
-    "git+https://github.com/SkyRL-Team/SkyRL-Train.git" \
+    "git+https://github.com/SkyRL-Team/SkyRL-Train.git@19b5746a9ad973715ad9b171158f3564b9e3bc85" \
     -e ".[grpo]" \
     "skyrl-gym>=0.1.0" \
     "ray[default]>=2.40.0" \
@@ -77,4 +78,4 @@ RUN bash /workspace/open-ctf-env/docker/patches/apply_all_patches.sh
 ENV BNB_CUDA_VERSION=130 \
     TORCHINDUCTOR_MAX_AUTOTUNE_PRUNE_CHOICES_BASED_ON_SHARED_MEM=1
 
-CMD ["open-ctf-train", "grpo", "--help"]
+CMD ["open-ctf-train", "rl", "--help"]

@@ -4,11 +4,13 @@ import io
 import logging
 import os
 import re
+import socket
 import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 from .registry import ChallengeRegistry
 
@@ -45,6 +47,7 @@ class ChallengeManager:
         self.host = host
         self.network = network
         self._running: Dict[str, str] = {}  # challenge_id -> target_url
+        self._startup_mode: Dict[str, str] = {}  # challenge_id -> compose|start_docker.sh
         self._candidate_dirs_cache: Optional[List[Path]] = None
         self._benchmark_root_cache: Optional[Path] = None
         self._docker_preflight_ok = False
@@ -494,6 +497,7 @@ class ChallengeManager:
                 logger.warning("init_script.sh failed for %s: %s", challenge_id, result.stderr)
 
         self._ensure_shared_network_exists()
+        startup_mode = "compose"
 
         # Start with docker compose
         compose_file = self._find_first(challenge_dir, ["docker-compose.yaml", "docker-compose.yml"])
@@ -517,6 +521,7 @@ class ChallengeManager:
             # Try start_docker.sh fallback
             start_script = self._find_first(challenge_dir, ["start_docker.sh"])
             if start_script:
+                startup_mode = "start_docker.sh"
                 logger.info("Running start_docker.sh for %s", challenge_id)
                 result = subprocess.run(
                     ["bash", str(start_script)],
@@ -537,6 +542,7 @@ class ChallengeManager:
         target_url = self.registry.get_target_url(info.id, host=self.host)
         if target_url:
             self._running[info.id] = target_url
+            self._startup_mode[info.id] = startup_mode
             return target_url
 
         if info.port is None:
@@ -546,6 +552,7 @@ class ChallengeManager:
             )
         fallback_url = f"http://{self.host}:{info.port}"
         self._running[info.id] = fallback_url
+        self._startup_mode[info.id] = startup_mode
         return fallback_url
 
     def teardown(self, challenge_id: str) -> None:
@@ -559,6 +566,8 @@ class ChallengeManager:
             return
 
         challenge_dir = self._challenge_dir(challenge_id)
+        startup_mode = self._startup_mode.get(info.id, "")
+        stopped = False
 
         compose_file = self._find_first(challenge_dir, ["docker-compose.yaml", "docker-compose.yml"])
         if compose_file:
@@ -571,10 +580,38 @@ class ChallengeManager:
                     text=True,
                     timeout=60,
                 )
+                stopped = True
             except FileNotFoundError:
                 logger.warning("docker command not found while tearing down %s", challenge_id)
 
+        if not stopped and startup_mode == "start_docker.sh":
+            stop_script = self._find_first(challenge_dir, ["stop_docker.sh"])
+            if stop_script:
+                logger.info("Running stop_docker.sh for %s", challenge_id)
+                result = subprocess.run(
+                    ["bash", str(stop_script)],
+                    cwd=str(stop_script.parent),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if result.returncode != 0:
+                    logger.warning(
+                        "stop_docker.sh failed for %s: %s",
+                        challenge_id,
+                        self._truncate_stderr(result.stderr),
+                    )
+                else:
+                    stopped = True
+            else:
+                logger.warning(
+                    "Challenge %s started via start_docker.sh but no stop_docker.sh found. "
+                    "Skipping explicit teardown.",
+                    challenge_id,
+                )
+
         self._running.pop(info.id, None)
+        self._startup_mode.pop(info.id, None)
 
     def setup_all(self, ids: Optional[List[str]] = None) -> Dict[str, str]:
         """Launch multiple challenges. Returns {challenge_id: target_url}.
@@ -638,16 +675,35 @@ class ChallengeManager:
             except Exception:
                 return False
 
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower() if parsed.scheme else "http"
+        host = parsed.hostname or self.host
+        port = parsed.port or info.port
+
+        if scheme == "file":
+            path = parsed.path or ""
+            return bool(path and Path(path).exists())
+
         try:
-            result = subprocess.run(
-                ["curl", "-sf", "--max-time", str(timeout), "-o", "/dev/null", "-w", "%{http_code}", url],
-                capture_output=True,
-                text=True,
-                timeout=timeout + 5,
-            )
-            status = result.stdout.strip()
-            return status.startswith(("2", "3", "4"))  # Any HTTP response = service is up
+            if scheme in {"http", "https"}:
+                result = subprocess.run(
+                    ["curl", "-sf", "--max-time", str(timeout), "-o", "/dev/null", "-w", "%{http_code}", url],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout + 5,
+                )
+                status = result.stdout.strip()
+                if status.startswith(("2", "3", "4")):
+                    return True
         except (subprocess.TimeoutExpired, Exception):
+            pass
+
+        if not host or not port:
+            return False
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True
+        except (OSError, ValueError):
             return False
 
     def get_running(self) -> List[str]:

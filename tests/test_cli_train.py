@@ -2,7 +2,7 @@
 
 Validates:
 - sft subcommand parses correctly
-- grpo subcommand parses correctly
+- rl subcommand parses correctly
 - merge subcommand parses correctly
 - gepa subcommand parses correctly
 """
@@ -42,11 +42,11 @@ def _parse_args(argv):
         sft_p.add_argument("--output", required=True)
         sft_p.add_argument("--resume", default=None)
 
-        grpo_p = subparsers.add_parser("grpo")
-        grpo_p.add_argument("--model", required=True)
-        grpo_p.add_argument("--data", required=True)
-        grpo_p.add_argument("--output", required=True)
-        grpo_p.add_argument("--resume", default=None)
+        rl_p = subparsers.add_parser("rl")
+        rl_p.add_argument("--model", required=True)
+        rl_p.add_argument("--data", required=True)
+        rl_p.add_argument("--output", required=True)
+        rl_p.add_argument("--resume", default=None)
 
         gepa_p = subparsers.add_parser("gepa")
         gepa_p.add_argument("--model", required=True)
@@ -114,34 +114,34 @@ class TestSFTParser:
 
 
 # ---------------------------------------------------------------------------
-# GRPO subcommand
+# RL subcommand
 # ---------------------------------------------------------------------------
 
 
-class TestGRPOParser:
-    def test_grpo_basic(self):
+class TestRLParser:
+    def test_rl_basic(self):
         args = _parse_args([
-            "grpo", "--model", "/merged", "--data", "/grpo.jsonl", "--output", "/out",
+            "rl", "--model", "/merged", "--data", "/online_rl.jsonl", "--output", "/out",
         ])
-        assert args.command == "grpo"
+        assert args.command == "rl"
         assert args.model == "/merged"
-        assert args.data == "/grpo.jsonl"
+        assert args.data == "/online_rl.jsonl"
         assert args.output == "/out"
 
-    def test_grpo_with_resume(self):
+    def test_rl_with_resume(self):
         args = _parse_args([
-            "grpo", "--model", "/merged", "--data", "/grpo.jsonl",
+            "rl", "--model", "/merged", "--data", "/online_rl.jsonl",
             "--output", "/out", "--resume", "/ckpt",
         ])
         assert args.resume == "/ckpt"
 
-    def test_grpo_missing_model_raises(self):
+    def test_rl_missing_model_raises(self):
         with pytest.raises(SystemExit):
-            _parse_args(["grpo", "--data", "/grpo.jsonl", "--output", "/out"])
+            _parse_args(["rl", "--data", "/online_rl.jsonl", "--output", "/out"])
 
-    def test_grpo_missing_data_raises(self):
+    def test_rl_missing_data_raises(self):
         with pytest.raises(SystemExit):
-            _parse_args(["grpo", "--model", "/m", "--output", "/out"])
+            _parse_args(["rl", "--model", "/m", "--output", "/out"])
 
 
 # ---------------------------------------------------------------------------

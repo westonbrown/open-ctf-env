@@ -1,7 +1,7 @@
 """Smoke tests for SkyRL GRPO orchestrator.
 
 Validates:
-- _convert_grpo_data correctly converts GRPO JSONL to SkyRL format
+- _convert_online_rl_data correctly converts GRPO JSONL to SkyRL format
 - _build_skyrl_config produces valid SkyRL config dict
 - Config has correct nesting (data.train_data, trainer.policy.model.path, etc.)
 """
@@ -15,10 +15,12 @@ import yaml
 
 from open_ctf.challenges.registry import ChallengeRegistry
 from open_ctf.training.online_rl.runtime import (
-    _convert_grpo_data,
+    _convert_online_rl_data,
     _build_skyrl_config,
     _is_qwen3_5_config,
+    _has_step_wise_resp_index_guard,
     _validate_qwen3_5_runtime_dependencies,
+    _validate_step_wise_resp_index_guard,
     _resolve_reward_config,
     _should_force_legacy_inference,
     _resolve_vllm_ready_model_path,
@@ -71,7 +73,7 @@ def _write_grpo_jsonl(path, samples=None):
 
 
 # ---------------------------------------------------------------------------
-# _convert_grpo_data
+# _convert_online_rl_data
 # ---------------------------------------------------------------------------
 
 
@@ -85,7 +87,7 @@ class TestConvertGRPOData:
         _write_grpo_jsonl(src)
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         assert os.path.exists(result)
         assert result.endswith("skyrl_online_rl_data.jsonl")
 
@@ -94,7 +96,7 @@ class TestConvertGRPOData:
         _write_grpo_jsonl(src)
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         import jsonlines
         with jsonlines.open(result) as reader:
             rows = list(reader)
@@ -105,7 +107,7 @@ class TestConvertGRPOData:
         _write_grpo_jsonl(src)
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         import jsonlines
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
@@ -123,7 +125,7 @@ class TestConvertGRPOData:
         _write_grpo_jsonl(src)
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         import jsonlines
         with jsonlines.open(result) as reader:
             for row in reader:
@@ -134,7 +136,7 @@ class TestConvertGRPOData:
         _write_grpo_jsonl(src)
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         import jsonlines
         with jsonlines.open(result) as reader:
             for row in reader:
@@ -145,7 +147,7 @@ class TestConvertGRPOData:
         _write_grpo_jsonl(src)
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         import jsonlines
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
@@ -156,7 +158,7 @@ class TestConvertGRPOData:
         _write_grpo_jsonl(src)
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         import jsonlines
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
@@ -179,7 +181,7 @@ class TestConvertGRPOData:
             })
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         import jsonlines as jl2
         with jl2.open(result) as reader:
             row = next(iter(reader))
@@ -226,7 +228,7 @@ class TestConvertGRPOData:
         registry = ChallengeRegistry(str(registry_path))
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src),
             output_dir,
             registry=registry,
@@ -303,7 +305,7 @@ class TestConvertGRPOData:
         registry = ChallengeRegistry(str(registry_path))
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src),
             output_dir,
             registry=registry,
@@ -351,7 +353,7 @@ class TestConvertGRPOData:
         registry = ChallengeRegistry(str(registry_path))
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src),
             output_dir,
             registry=registry,
@@ -397,7 +399,7 @@ class TestConvertGRPOData:
         registry = ChallengeRegistry(str(registry_path))
         output_dir = str(tmp_path / "out")
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src),
             output_dir,
             registry=registry,
@@ -443,7 +445,7 @@ class TestConvertGRPOData:
         registry = ChallengeRegistry(str(registry_path))
 
         with pytest.raises(ValueError, match="mismatches registry"):
-            _convert_grpo_data(
+            _convert_online_rl_data(
                 str(src),
                 str(tmp_path / "out"),
                 registry=registry,
@@ -482,7 +484,7 @@ class TestConvertGRPOData:
         )
         registry = ChallengeRegistry(str(registry_path))
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src),
             str(tmp_path / "out"),
             registry=registry,
@@ -525,7 +527,7 @@ class TestConvertGRPOData:
         registry = ChallengeRegistry(str(registry_path))
 
         with pytest.raises(ValueError, match="missing ground_truth_flag"):
-            _convert_grpo_data(
+            _convert_online_rl_data(
                 str(src),
                 str(tmp_path / "out"),
                 registry=registry,
@@ -574,7 +576,7 @@ class TestConvertGRPOData:
         registry = ChallengeRegistry(str(registry_path))
 
         with pytest.raises(ValueError, match="missing registry challenges"):
-            _convert_grpo_data(
+            _convert_online_rl_data(
                 str(src),
                 str(tmp_path / "out"),
                 registry=registry,
@@ -598,7 +600,7 @@ class TestBuildSkyrlConfig:
                 "dropout": 0.0,
                 "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
             },
-            "grpo": {
+            "online_rl": {
                 "learning_rate": 5e-6,
                 "num_generations": 4,
                 "max_completion_length": 4096,
@@ -655,27 +657,47 @@ class TestBuildSkyrlConfig:
         result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
         assert result["generator"]["max_turns"] == 15
 
+    def test_policy_loss_type_prefers_explicit_over_legacy_alias(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["online_rl"]["policy_loss_type"] = "starpo"
+        cfg["online_rl"]["loss_type"] = "dapo"
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["trainer"]["algorithm"]["policy_loss_type"] == "starpo"
+
+    def test_policy_loss_type_maps_legacy_dapo_alias(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["online_rl"].pop("policy_loss_type", None)
+        cfg["online_rl"]["loss_type"] = "dapo"
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["trainer"]["algorithm"]["policy_loss_type"] == "regular"
+
+    def test_generator_tool_call_format_propagates_from_config(self, config):
+        cfg = json.loads(json.dumps(config))
+        cfg["online_rl"]["tool_call_format"] = "qwen3_coder"
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        assert result["generator"]["tool_call_format"] == "qwen3_coder"
+
     def test_generator_max_turns_invalid_falls_back(self, config):
         cfg = json.loads(json.dumps(config))
-        cfg["grpo"]["max_tool_calling_iterations"] = 0
+        cfg["online_rl"]["max_tool_calling_iterations"] = 0
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         assert result["generator"]["max_turns"] == 15
 
     def test_vllm_model_len_respects_prompt_plus_completion(self, config):
         cfg = json.loads(json.dumps(config))
         cfg["model"]["max_seq_length"] = 131072
-        cfg["grpo"]["max_prompt_length"] = 6000
-        cfg["grpo"]["max_completion_length"] = 3000
+        cfg["online_rl"]["max_prompt_length"] = 6000
+        cfg["online_rl"]["max_completion_length"] = 3000
         # Intentionally too small; builder should bump to prompt+completion.
-        cfg["grpo"]["vllm_max_model_len"] = 7000
+        cfg["online_rl"]["vllm_max_model_len"] = 7000
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         assert result["generator"]["engine_init_kwargs"]["max_model_len"] == 9000
 
     def test_inference_parallel_sizes_propagate(self, config):
         cfg = json.loads(json.dumps(config))
-        cfg["grpo"]["inference_engine_tensor_parallel_size"] = 2
-        cfg["grpo"]["inference_engine_pipeline_parallel_size"] = 1
-        cfg["grpo"]["inference_engine_data_parallel_size"] = 3
+        cfg["online_rl"]["inference_engine_tensor_parallel_size"] = 2
+        cfg["online_rl"]["inference_engine_pipeline_parallel_size"] = 1
+        cfg["online_rl"]["inference_engine_data_parallel_size"] = 3
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         gen = result["generator"]
         assert gen["inference_engine_tensor_parallel_size"] == 2
@@ -684,13 +706,13 @@ class TestBuildSkyrlConfig:
 
     def test_max_env_workers_is_configurable(self, config):
         cfg = json.loads(json.dumps(config))
-        cfg["grpo"]["max_env_workers"] = 40
+        cfg["online_rl"]["max_env_workers"] = 40
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         assert result["environment"]["skyrl_gym"]["max_env_workers"] == 40
 
     def test_generator_server_mode_without_url_uses_local_non_colocate(self, config):
         cfg = json.loads(json.dumps(config))
-        cfg["grpo"]["vllm_mode"] = "server"
+        cfg["online_rl"]["vllm_mode"] = "server"
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         assert result["trainer"]["placement"]["colocate_all"] is False
         assert result["generator"]["run_engines_locally"] is True
@@ -698,7 +720,7 @@ class TestBuildSkyrlConfig:
 
     def test_generator_remote_vllm_with_lora_falls_back_to_local(self, config):
         cfg = json.loads(json.dumps(config))
-        cfg["grpo"]["vllm_server_url"] = "http://127.0.0.1:9000"
+        cfg["online_rl"]["vllm_server_url"] = "http://127.0.0.1:9000"
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         assert result["trainer"]["placement"]["colocate_all"] is False
         assert result["generator"]["run_engines_locally"] is True
@@ -708,17 +730,57 @@ class TestBuildSkyrlConfig:
 
     def test_custom_chat_template_forces_logprobs_none(self, config):
         cfg = json.loads(json.dumps(config))
-        cfg["grpo"]["chat_template"] = "qwen3_without_thinking"
-        cfg["grpo"]["logprobs"] = 0
-        cfg["grpo"]["eval_logprobs"] = 0
+        cfg["online_rl"]["chat_template"] = "qwen3_without_thinking"
+        cfg["online_rl"]["logprobs"] = 0
+        cfg["online_rl"]["eval_logprobs"] = 0
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         assert result["generator"]["sampling_params"]["logprobs"] is None
         assert result["generator"]["eval_sampling_params"]["logprobs"] is None
 
+    def test_native_tool_schemas_injected_by_default(self, config):
+        """Without custom chat_template, tools should be in chat_template_kwargs."""
+        cfg = json.loads(json.dumps(config))
+        cfg["online_rl"].pop("chat_template", None)
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        kwargs = result["generator"]["chat_template_kwargs"]
+        assert "tools" in kwargs, "Native tools should be in chat_template_kwargs"
+        assert isinstance(kwargs["tools"], list)
+        assert len(kwargs["tools"]) > 0
+        # First tool should be shell_command
+        assert kwargs["tools"][0]["function"]["name"] == "shell_command"
+        # native_tool_schemas flag should be in generator for env propagation
+        assert result["generator"]["native_tool_schemas"] is True
+
+    def test_native_tool_schemas_enabled_with_custom_template(self, config):
+        """With custom chat_template, tools should STILL be auto-injected.
+
+        native_tool_schemas now defaults to True regardless of whether a
+        custom chat_template is set (e.g. qwen3_without_thinking for Qwen3.5).
+        Models with native tool support need schemas injected via the
+        tokenizer even when using a custom template variant.
+        """
+        cfg = json.loads(json.dumps(config))
+        cfg["online_rl"]["chat_template"] = "qwen3_without_thinking"
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        kwargs = result["generator"]["chat_template_kwargs"]
+        assert "tools" in kwargs, (
+            "Custom chat_template should NOT disable native tool schema injection"
+        )
+        assert result["generator"]["native_tool_schemas"] is True
+
+    def test_native_tool_schemas_explicit_override(self, config):
+        """Explicit native_tool_schemas=false should skip injection."""
+        cfg = json.loads(json.dumps(config))
+        cfg["online_rl"]["native_tool_schemas"] = False
+        result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
+        kwargs = result["generator"]["chat_template_kwargs"]
+        assert "tools" not in kwargs
+        assert result["generator"]["native_tool_schemas"] is False
+
     def test_generator_remote_vllm_without_lora_uses_broadcast_sync(self, config):
         cfg = json.loads(json.dumps(config))
         cfg["lora"]["r"] = 0
-        cfg["grpo"]["vllm_server_url"] = "https://127.0.0.1:9000/"
+        cfg["online_rl"]["vllm_server_url"] = "https://127.0.0.1:9000/"
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         assert result["trainer"]["placement"]["colocate_all"] is False
         assert result["generator"]["run_engines_locally"] is False
@@ -749,7 +811,7 @@ class TestBuildSkyrlConfig:
         cfg = {
             "model": {"max_seq_length": 4096},
             "lora": {"r": 32, "alpha": 64, "dropout": 0.0},
-            "grpo": {"batch_size": 1, "epochs": 1, "num_generations": 2},
+            "online_rl": {"batch_size": 1, "epochs": 1, "num_generations": 2},
             "output": {"save_steps": 50},
         }
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
@@ -764,8 +826,8 @@ class TestBuildSkyrlConfig:
 
     def test_algorithm_clip_range_uses_grpo_config(self, config):
         cfg = json.loads(json.dumps(config))
-        cfg["grpo"]["epsilon_low"] = 0.15
-        cfg["grpo"]["epsilon_high"] = 0.28
+        cfg["online_rl"]["epsilon_low"] = 0.15
+        cfg["online_rl"]["epsilon_high"] = 0.28
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
         assert algo["eps_clip_low"] == 0.15
@@ -773,8 +835,8 @@ class TestBuildSkyrlConfig:
 
     def test_algorithm_clip_high_defaults_to_low_when_unspecified(self, config):
         cfg = json.loads(json.dumps(config))
-        cfg["grpo"]["epsilon_low"] = 0.12
-        cfg["grpo"].pop("epsilon_high", None)
+        cfg["online_rl"]["epsilon_low"] = 0.12
+        cfg["online_rl"].pop("epsilon_high", None)
         result = _build_skyrl_config("/path/to/model", "/out", cfg, "/data.jsonl")
         algo = result["trainer"]["algorithm"]
         assert algo["eps_clip_low"] == 0.12
@@ -799,11 +861,28 @@ class TestBuildSkyrlConfig:
         config = {
             "model": {"max_seq_length": 4096},
             "lora": {"r": 32, "alpha": 64, "dropout": 0.0, "target_modules": ["q_proj"]},
-            "grpo": {"batch_size": 1, "epochs": 1, "num_generations": 2},
+            "online_rl": {"batch_size": 1, "epochs": 1, "num_generations": 2},
             "output": {"save_steps": 50},
         }
         result = _build_skyrl_config("/model", "/out", config, "/data.jsonl")
         assert result["environment"]["env_class"] == "openctf"
+
+    def test_ref_fsdp_wrap_policy_uses_transformer_layer_class(self, monkeypatch, config):
+        import transformers
+
+        class DummyCfg:
+            architectures = ["LlamaForCausalLM"]
+
+        class DummyAutoConfig:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                return DummyCfg()
+
+        monkeypatch.setattr(transformers, "AutoConfig", DummyAutoConfig)
+
+        result = _build_skyrl_config("/path/to/model", "/out", config, "/data.jsonl")
+        ref_wrap = result["trainer"]["ref"]["fsdp_config"]["wrap_policy"]
+        assert ref_wrap["transformer_layer_cls_to_wrap"] == ["LlamaDecoderLayer"]
 
 
 class TestInferenceBackendSelection:
@@ -918,7 +997,7 @@ class TestTargetExtraction:
                 "metadata": {"challenge_id": "eval-me", "task_type": "ctf"},
             })
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["target"] == "http://localhost:32801"
@@ -937,7 +1016,7 @@ class TestTargetExtraction:
                 "metadata": {"challenge_id": "Dynastic", "task_type": "ctf"},
             })
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["target"] is None
@@ -956,7 +1035,7 @@ class TestTargetExtraction:
                 "metadata": {"challenge": "eval-me", "task_type": "ctf"},
             })
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["challenge_id"] == "eval-me"
@@ -975,7 +1054,7 @@ class TestTargetExtraction:
                 "metadata": {"target": "http://localhost:9999", "task_type": "ctf"},
             })
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["target"] == "http://localhost:9999"
@@ -995,7 +1074,7 @@ class TestConvertGRPODataEdgeCases:
                 "metadata": {"optimal_steps": 3},
             })
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         # Should have a prompt and env_class even without flag
@@ -1016,14 +1095,14 @@ class TestConvertGRPODataEdgeCases:
                 "metadata": {},
             })
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir)
+        result = _convert_online_rl_data(str(src), output_dir)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["ground_truth_flag"] == "FLAG{empty_meta}"
 
 
 class TestRegistryIntegration:
-    """Test _convert_grpo_data with ChallengeRegistry integration."""
+    """Test _convert_online_rl_data with ChallengeRegistry integration."""
 
     def _make_registry(self, tmp_path):
         """Create a simple test registry."""
@@ -1073,7 +1152,7 @@ class TestRegistryIntegration:
             })
 
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir, registry=registry)
+        result = _convert_online_rl_data(str(src), output_dir, registry=registry)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["target"] == "http://localhost:32805"
@@ -1095,7 +1174,7 @@ class TestRegistryIntegration:
             })
 
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir, registry=registry)
+        result = _convert_online_rl_data(str(src), output_dir, registry=registry)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["target"] == "http://localhost:9999"  # Message URL wins
@@ -1117,7 +1196,7 @@ class TestRegistryIntegration:
             })
 
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src),
             output_dir,
             registry=registry,
@@ -1127,8 +1206,114 @@ class TestRegistryIntegration:
             row = next(iter(reader))
         assert row["target"] == "http://localhost:32805"
 
-    def test_static_challenge_gets_none_from_registry(self, tmp_path):
-        """Static challenges should get target=None even with registry."""
+    def test_converter_strips_legacy_non_neutral_prompt_sections(self, tmp_path):
+        """Legacy quickstart/recon injected sections must be removed."""
+        registry = self._make_registry(tmp_path)
+
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {
+                        "role": "user",
+                        "content": (
+                            "**Connection**: http://localhost:9999\n"
+                            "# WEB RECON CHECKLIST\n"
+                            "- Keep reasoning brief.\n"
+                            "# WEB EXPLOIT PLAYBOOK\n"
+                            "- Use /api/options then /api/monitor.\n"
+                            "# CHALLENGE QUICKSTART (HIGH PRIORITY)\n"
+                            "- Run exact one-liner exploit.\n"
+                            "# TOOL USAGE\n"
+                            "- Continue normal execution."
+                        ),
+                    },
+                ],
+                "ground_truth_flag": "FLAG{override}",
+                "metadata": {"challenge_id": "eval-me"},
+            })
+
+        output_dir = str(tmp_path / "out")
+        result = _convert_online_rl_data(
+            str(src),
+            output_dir,
+            registry=registry,
+            prefer_registry_target=True,
+        )
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+
+        user_prompt = row["prompt"][1]["content"]
+        assert row["target"] == "http://localhost:32805"
+        assert "http://localhost:32805" in user_prompt
+        assert "# WEB RECON CHECKLIST" not in user_prompt
+        assert "# WEB EXPLOIT PLAYBOOK" not in user_prompt
+        assert "# CHALLENGE QUICKSTART (HIGH PRIORITY)" not in user_prompt
+        assert "/api/options" not in user_prompt
+        assert "/api/monitor" not in user_prompt
+        assert "# TOOL USAGE" in user_prompt
+
+    def test_target_host_override_applies_to_raw_host_port_target(self, tmp_path):
+        """Host override should rewrite raw host:port targets (crypto/pwn)."""
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Connect to localhost:32824 and solve."},
+                ],
+                "ground_truth_flag": "FLAG{crypto}",
+                "metadata": {
+                    "challenge_id": "crypto-raw",
+                    "category": "crypto",
+                    "target": "localhost:32824",
+                },
+            })
+
+        output_dir = str(tmp_path / "out")
+        result = _convert_online_rl_data(
+            str(src),
+            output_dir,
+            target_host_override="172.17.0.1",
+        )
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] == "172.17.0.1:32824"
+
+    def test_target_port_offset_applies_to_raw_host_port_target(self, tmp_path):
+        """Port offset should rewrite raw host:port targets (crypto/pwn)."""
+        src = tmp_path / "grpo.jsonl"
+        import jsonlines
+        with jsonlines.open(str(src), "w") as w:
+            w.write({
+                "messages": [
+                    {"role": "system", "content": "Agent."},
+                    {"role": "user", "content": "Connect to localhost:32824 and solve."},
+                ],
+                "ground_truth_flag": "FLAG{crypto}",
+                "metadata": {
+                    "challenge_id": "crypto-raw",
+                    "category": "crypto",
+                    "target": "localhost:32824",
+                },
+            })
+
+        output_dir = str(tmp_path / "out")
+        result = _convert_online_rl_data(
+            str(src),
+            output_dir,
+            target_host_override="172.17.0.1",
+            target_port_offset=100,
+        )
+        with jsonlines.open(result) as reader:
+            row = next(iter(reader))
+        assert row["target"] == "172.17.0.1:32924"
+
+    def test_static_challenge_gets_file_target_from_registry(self, tmp_path):
+        """Static challenges should get file:///root/challenge/ target (not localhost)."""
         registry = self._make_registry(tmp_path)
 
         src = tmp_path / "grpo.jsonl"
@@ -1144,10 +1329,10 @@ class TestRegistryIntegration:
             })
 
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir, registry=registry)
+        result = _convert_online_rl_data(str(src), output_dir, registry=registry)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
-        assert row["target"] is None  # Static = no URL
+        assert row["target"] == "file:///root/challenge/"  # Static = local workspace, not network
 
     def test_unknown_challenge_in_registry_returns_none(self, tmp_path):
         """Challenge not in registry should not crash, target stays None."""
@@ -1166,7 +1351,7 @@ class TestRegistryIntegration:
             })
 
         output_dir = str(tmp_path / "out")
-        result = _convert_grpo_data(str(src), output_dir, registry=registry)
+        result = _convert_online_rl_data(str(src), output_dir, registry=registry)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["target"] is None
@@ -1187,7 +1372,7 @@ class TestRegistryIntegration:
                 "metadata": {"challenge_id": "eval-me"},
             })
 
-        result = _convert_grpo_data(str(src), str(tmp_path / "out"), registry=registry)
+        result = _convert_online_rl_data(str(src), str(tmp_path / "out"), registry=registry)
         with jsonlines.open(result) as reader:
             row = next(iter(reader))
         assert row["target"] == "http://localhost:43012"
@@ -1228,7 +1413,7 @@ class TestRegistryIntegration:
                 })
 
         with pytest.raises(ValueError, match="Target URL collisions detected"):
-            _convert_grpo_data(
+            _convert_online_rl_data(
                 str(src),
                 str(tmp_path / "out"),
                 registry=registry,
@@ -1296,13 +1481,58 @@ class TestRuntimeGuards:
             _resolve_reward_config({"reward": "bad"})
 
 
+class TestStepWiseIndexGuardValidation:
+    def test_has_guard_detects_bounded_assignment(self):
+        source = """
+if 0 <= resp_end_idx < len(per_token_reward):
+    per_token_reward[resp_end_idx] = float(reward)
+"""
+        assert _has_step_wise_resp_index_guard(source) is True
+
+    def test_has_guard_rejects_bare_assignment(self):
+        source = "per_token_reward[resp_end_idx] = float(reward)"
+        assert _has_step_wise_resp_index_guard(source) is False
+
+    def test_validate_guard_raises_when_missing(self, monkeypatch, tmp_path):
+        source = tmp_path / "skyrl_gym_generator.py"
+        source.write_text("per_token_reward[resp_end_idx] = float(reward)\n")
+
+        class _Spec:
+            origin = str(source)
+
+        monkeypatch.setattr("importlib.util.find_spec", lambda *_args, **_kwargs: _Spec())
+
+        with pytest.raises(RuntimeError, match="step-wise reward index guard"):
+            _validate_step_wise_resp_index_guard(
+                {"require_step_wise_index_guard": True},
+                step_wise_trajectories=True,
+            )
+
+    def test_validate_guard_allows_override(self, monkeypatch, tmp_path):
+        source = tmp_path / "skyrl_gym_generator.py"
+        source.write_text("per_token_reward[resp_end_idx] = float(reward)\n")
+
+        class _Spec:
+            origin = str(source)
+
+        monkeypatch.setattr("importlib.util.find_spec", lambda *_args, **_kwargs: _Spec())
+
+        _validate_step_wise_resp_index_guard(
+            {"require_step_wise_index_guard": False},
+            step_wise_trajectories=True,
+        )
+
+    def test_validate_guard_skips_when_step_wise_disabled(self):
+        _validate_step_wise_resp_index_guard({}, step_wise_trajectories=False)
+
+
 # ---------------------------------------------------------------------------
 # Difficulty Curriculum Filtering
 # ---------------------------------------------------------------------------
 
 
 class TestDifficultyCurriculum:
-    """Tests for difficulty-based sample filtering in _convert_grpo_data."""
+    """Tests for difficulty-based sample filtering in _convert_online_rl_data."""
 
     @staticmethod
     def _write_registry(path: Path, challenges: list[dict]) -> ChallengeRegistry:
@@ -1343,7 +1573,7 @@ class TestDifficultyCurriculum:
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src, self._make_samples(all_ids))
 
-        result = _convert_grpo_data(str(src), str(tmp_path / "out"), registry=registry)
+        result = _convert_online_rl_data(str(src), str(tmp_path / "out"), registry=registry)
         import jsonlines
         with jsonlines.open(result) as reader:
             rows = list(reader)
@@ -1356,7 +1586,7 @@ class TestDifficultyCurriculum:
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src, self._make_samples(all_ids))
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src), str(tmp_path / "out"),
             registry=registry,
             difficulty_max="medium",
@@ -1375,7 +1605,7 @@ class TestDifficultyCurriculum:
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src, self._make_samples(all_ids))
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src), str(tmp_path / "out"),
             registry=registry,
             difficulty_min="hard",
@@ -1394,7 +1624,7 @@ class TestDifficultyCurriculum:
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src, self._make_samples(all_ids))
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src), str(tmp_path / "out"),
             registry=registry,
             difficulty_min="easy",
@@ -1412,7 +1642,7 @@ class TestDifficultyCurriculum:
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src)
         with pytest.raises(ValueError, match="Invalid difficulty_min"):
-            _convert_grpo_data(
+            _convert_online_rl_data(
                 str(src), str(tmp_path / "out"),
                 difficulty_min="impossible",
             )
@@ -1422,7 +1652,7 @@ class TestDifficultyCurriculum:
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src)
         with pytest.raises(ValueError, match="Invalid difficulty_max"):
-            _convert_grpo_data(
+            _convert_online_rl_data(
                 str(src), str(tmp_path / "out"),
                 difficulty_max="impossible",
             )
@@ -1432,7 +1662,7 @@ class TestDifficultyCurriculum:
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src)
         with pytest.raises(ValueError, match="is harder than"):
-            _convert_grpo_data(
+            _convert_online_rl_data(
                 str(src), str(tmp_path / "out"),
                 difficulty_min="hard",
                 difficulty_max="easy",
@@ -1443,7 +1673,7 @@ class TestDifficultyCurriculum:
         src = tmp_path / "grpo.jsonl"
         _write_grpo_jsonl(src)  # 2 default samples, no registry
 
-        result = _convert_grpo_data(
+        result = _convert_online_rl_data(
             str(src), str(tmp_path / "out"),
             difficulty_max="easy",
         )
@@ -1460,3 +1690,137 @@ class TestDifficultyCurriculum:
         assert _DIFFICULTY_RANK["medium"] < _DIFFICULTY_RANK["hard"]
         assert _DIFFICULTY_RANK["hard"] < _DIFFICULTY_RANK["expert"]
         assert _DIFFICULTY_RANK["expert"] < _DIFFICULTY_RANK["master"]
+
+
+def test_run_skyrl_training_env_kwargs_include_tool_call_format():
+    """Guard runtime wiring: generator.tool_call_format must reach env kwargs."""
+    import inspect
+    import open_ctf.training.online_rl.runtime as runtime_mod
+
+    source = inspect.getsource(runtime_mod._run_skyrl_training)
+    assert 'env_kwargs["tool_call_format"] = tool_call_format' in source
+
+
+class TestNativeToolSchemaIntegration:
+    """End-to-end tests for the native tool schema integration pathway.
+
+    Validates every layer: config → runtime → env_kwargs → env init → skip/inject.
+    """
+
+    def test_env_kwargs_propagates_native_flag(self):
+        """_build_openctf_env_kwargs reads native_tool_schemas from generator config."""
+        import inspect
+        import open_ctf.training.online_rl.runtime as runtime_mod
+        source = inspect.getsource(runtime_mod._run_skyrl_training)
+        assert '"native_tool_schemas"' in source, (
+            "_build_openctf_env_kwargs must include native_tool_schemas"
+        )
+
+    def test_env_reads_native_flag_from_kwargs(self):
+        """OpenCTFTextEnv reads native_tool_schemas from kwargs."""
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+
+        env_on = OpenCTFTextEnv(target="http://localhost", native_tool_schemas=True)
+        assert env_on._native_tool_schemas is True
+
+        env_off = OpenCTFTextEnv(target="http://localhost", native_tool_schemas=False)
+        assert env_off._native_tool_schemas is False
+
+        env_default = OpenCTFTextEnv(target="http://localhost")
+        assert env_default._native_tool_schemas is False
+
+    def test_env_reads_native_flag_from_extras(self):
+        """OpenCTFTextEnv reads native_tool_schemas from extras dict."""
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+
+        env = OpenCTFTextEnv(
+            target="http://localhost",
+            extras={"native_tool_schemas": True},
+        )
+        assert env._native_tool_schemas is True
+
+    def test_native_skips_injection_in_init(self):
+        """When native_tool_schemas=True, init() does NOT inject text tools."""
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+
+        env = OpenCTFTextEnv(target="http://localhost", native_tool_schemas=True)
+        prompt = [{"role": "system", "content": "You are a CTF agent."}]
+        result = env.init(prompt)
+        injected = result[0] if isinstance(result, tuple) else result
+        sys_content = injected[0]["content"]
+        assert "# Available Tools" not in sys_content
+        assert "shell_command" not in sys_content
+
+    def test_default_injects_text_tools_in_init(self):
+        """Default (native=False) should inject text tool schemas."""
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
+
+        env = OpenCTFTextEnv(target="http://localhost")
+        prompt = [{"role": "system", "content": "You are a CTF agent."}]
+        result = env.init(prompt)
+        injected = result[0] if isinstance(result, tuple) else result
+        sys_content = injected[0]["content"]
+        assert "# Available Tools" in sys_content
+        assert "shell_command" in sys_content
+
+    def test_config_builds_tools_in_chat_template_kwargs(self):
+        """_build_skyrl_config adds tools to chat_template_kwargs by default."""
+        config = {
+            "model": {"max_seq_length": 4096},
+            "lora": {"r": 32, "alpha": 64, "dropout": 0.0, "target_modules": ["q_proj"]},
+            "online_rl": {"batch_size": 1, "epochs": 1, "num_generations": 2},
+            "output": {"save_steps": 50},
+        }
+        result = _build_skyrl_config("/model", "/out", config, "/data.jsonl")
+        kwargs = result["generator"]["chat_template_kwargs"]
+        tools = kwargs.get("tools", [])
+        assert len(tools) > 0, "Tools should be injected into chat_template_kwargs"
+        tool_names = [t["function"]["name"] for t in tools]
+        assert "shell_command" in tool_names
+        assert "read_file" in tool_names
+        assert "flag_found" in tool_names
+        assert result["generator"]["native_tool_schemas"] is True
+
+    def test_tool_schemas_match_registry(self):
+        """Tools in chat_template_kwargs must match tool_registry source of truth."""
+        from open_ctf.formatters.tool_registry import get_runtime_tools
+
+        config = {
+            "model": {"max_seq_length": 4096},
+            "lora": {"r": 32, "alpha": 64, "dropout": 0.0, "target_modules": ["q_proj"]},
+            "online_rl": {"batch_size": 1, "epochs": 1, "num_generations": 2},
+            "output": {"save_steps": 50},
+        }
+        result = _build_skyrl_config("/model", "/out", config, "/data.jsonl")
+        injected_tools = result["generator"]["chat_template_kwargs"]["tools"]
+        registry_tools = get_runtime_tools()
+        assert len(injected_tools) == len(registry_tools)
+        for injected, registry in zip(injected_tools, registry_tools):
+            assert injected["function"]["name"] == registry["function"]["name"]
+
+    def test_filename_alias_in_tool_executor(self, tmp_path):
+        """ToolExecutor read_file accepts 'filename' alias (common model output)."""
+        from open_ctf.envs.tool_executor import SubprocessExecutor
+
+        test_file = tmp_path / "test_fn.txt"
+        test_file.write_text("content_via_filename\n")
+
+        exe = SubprocessExecutor(max_steps=10, default_workdir=str(tmp_path))
+        exe.reset()
+        result = exe.step("read_file", {"filename": str(test_file)})
+        assert "content_via_filename" in result["stdout"]
+        assert result["exit_code"] == 0
+
+    def test_all_read_file_aliases_work(self, tmp_path):
+        """Every alias (file_path, path, file, filename) resolves correctly."""
+        from open_ctf.envs.tool_executor import SubprocessExecutor
+
+        for alias in ["file_path", "path", "file", "filename"]:
+            test_file = tmp_path / f"test_{alias}.txt"
+            test_file.write_text(f"ok_{alias}\n")
+
+            exe = SubprocessExecutor(max_steps=10, default_workdir=str(tmp_path))
+            exe.reset()
+            result = exe.step("read_file", {alias: str(test_file)})
+            assert f"ok_{alias}" in result["stdout"], f"Alias '{alias}' failed"
+            assert result["exit_code"] == 0

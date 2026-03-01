@@ -1,4 +1,4 @@
-"""Tests for scripts/preprocess_sft_data.py."""
+"""Tests for open_ctf.data.preprocessor (formerly scripts/preprocess_sft_data.py)."""
 
 from __future__ import annotations
 
@@ -6,10 +6,7 @@ import json
 import pytest
 from pathlib import Path
 
-# Import the preprocessing functions
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from preprocess_sft_data import preprocess_sample, _fix_html_escapes, _fix_orphan_think
+from open_ctf.data.preprocessor import preprocess_sample, _fix_html_escapes, _fix_orphan_think
 
 
 # ---------------------------------------------------------------------------

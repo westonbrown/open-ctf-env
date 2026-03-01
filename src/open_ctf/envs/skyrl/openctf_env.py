@@ -1,8 +1,8 @@
 """SkyRL-Gym BaseTextEnv subclass bridging SkyRL to execution environments.
 
 Each SkyRL agent loop gets its own env instance with a pluggable StepAgent
-for tool parsing + execution. The default agent (DefaultStepAgent) preserves
-the original behavior.
+for tool parsing + execution. The default agent (DefaultStepAgent) includes
+resilient retry/feedback semantics via ``resilient_mode=True``.
 
 Architecture:
     SkyRL SkyRLGymGenerator -> agent_loop()
@@ -14,238 +14,28 @@ The env receives raw LLM text output, delegates tool parsing + execution
 to the StepAgent, and computes rewards from agent state.
 """
 
-import ast
 import importlib
 import json
 import logging
 import os
 import re
 import shutil
+import tempfile
 from typing import Any, Dict, List, Optional
+
+from open_ctf.agent.rollout_status import RolloutStatus, normalize_rollout_status
+from open_ctf.parsing.tool_calls import parse_tool_calls  # noqa: F401 — re-exported for backward compat
 
 logger = logging.getLogger(__name__)
 
 # Type aliases matching SkyRL's ConversationType
 ConversationType = List[Dict[str, Any]]
 
-# ---------------------------------------------------------------------------
-# Tool call parsing patterns (model-agnostic)
-# ---------------------------------------------------------------------------
-
-# Hermes/Qwen3/Nanbeige: <tool_call>{"name": ..., "arguments": ...}</tool_call>
-_HERMES_PATTERN = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL
-)
-
-# GLM-4 MoE XML: <tool_call>func_name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
-_GLM4_TC_PATTERN = re.compile(
-    r"<tool_call>(\S+?)((?:<arg_key>.*?</arg_key><arg_value>.*?</arg_value>)*)\s*</tool_call>",
-    re.DOTALL,
-)
-_GLM4_ARG_PATTERN = re.compile(
-    r"<arg_key>(.*?)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL,
-)
-
-# Qwen3.5 Coder XML: <tool_call><function=func_name><parameter=k>v</parameter>...</function></tool_call>
-_QWEN35_CODER_PATTERN = re.compile(
-    r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>", re.DOTALL,
-)
-_QWEN35_PARAM_PATTERN = re.compile(
-    r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL,
-)
-
-# Bare JSON fallback: {"name": "...", "arguments": {...}}
-# Supports one level of nested braces in arguments (e.g. {"headers": {"X-UserId": "10052"}})
-_BARE_JSON_PATTERN = re.compile(
-    r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})\s*\}',
-    re.DOTALL,
-)
-
-# Thinking block pattern: <think>...</think> (Qwen3.5, Qwen3, DeepSeek-R1, etc.)
+# Pattern for stripping <think>...</think> reasoning blocks from LLM output.
+# Qwen3.5 and similar models emit these during chain-of-thought; they must be
+# removed before tool-call parsing to avoid confusing the parser with tool
+# references inside the reasoning block.
 _THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
-
-# Python-style function call fallback (e.g. shell_command(command="ls -la"))
-_PY_CALL_LINE_PATTERN = re.compile(r"^\s*([A-Za-z_]\w*)\((.*)\)\s*$")
-_TOOL_ARG_ORDER: Dict[str, List[str]] = {
-    "shell_command": ["command", "timeout"],
-    "execute_command": ["command", "timeout"],
-    "python_code": ["code", "timeout"],
-    "read_file": ["file_path", "line_numbers"],
-    "grep": ["pattern", "path", "include"],
-    "file_search": ["pattern", "path"],
-    "apply_patch": ["patch"],
-    "flag_found": ["content"],
-    "submit_flag": ["content"],
-    "web_search": ["query"],
-    "exec_command": ["cmd", "workdir", "yield_time"],
-    "write_stdin": ["session_id", "chars", "yield_time"],
-    "list_sessions": [],
-    "close_session": ["session_id"],
-}
-_KNOWN_TOOL_NAMES = set(_TOOL_ARG_ORDER.keys())
-
-
-def _coerce_scalar(raw: str) -> Any:
-    """Best-effort parse of scalar argument text."""
-    text = raw.strip()
-    if not text:
-        return ""
-    try:
-        return ast.literal_eval(text)
-    except Exception:
-        pass
-    try:
-        return json.loads(text)
-    except Exception:
-        return text
-
-
-def _parse_python_style_calls(text: str) -> List[Dict[str, Any]]:
-    """Parse python-style tool calls from assistant text.
-
-    Supports lines like:
-      shell_command(command="ls -la")
-      read_file("/root/challenge/index.php")
-      flag_found(content="HTB{...}")
-    """
-    calls: List[Dict[str, Any]] = []
-    cleaned = text.replace("```python", "").replace("```json", "").replace("```", "")
-    for raw_line in cleaned.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        line = line.lstrip("-*").strip()
-        m = _PY_CALL_LINE_PATTERN.match(line)
-        if not m:
-            continue
-        name = m.group(1).strip()
-        if name not in _TOOL_ARG_ORDER:
-            continue
-        args_src = m.group(2).strip()
-        args: Dict[str, Any] = {}
-
-        # Parse kwargs/positional args robustly with AST first.
-        call_src = f"{name}({args_src})"
-        try:
-            parsed = ast.parse(call_src, mode="eval")
-            expr = parsed.body
-            if isinstance(expr, ast.Call):
-                positional = []
-                for node in expr.args:
-                    seg = ast.get_source_segment(call_src, node) or ""
-                    positional.append(_coerce_scalar(seg))
-                ordered = _TOOL_ARG_ORDER.get(name, [])
-                for idx, value in enumerate(positional):
-                    key = ordered[idx] if idx < len(ordered) else f"arg{idx}"
-                    args[key] = value
-                for kw in expr.keywords:
-                    if kw.arg is None:
-                        continue
-                    seg = ast.get_source_segment(call_src, kw.value) or ""
-                    args[kw.arg] = _coerce_scalar(seg)
-        except Exception:
-            # Fallback for malformed-but-common style: read_file(/path/file)
-            if args_src:
-                ordered = _TOOL_ARG_ORDER.get(name, [])
-                key = ordered[0] if ordered else "arg0"
-                args[key] = _coerce_scalar(args_src)
-
-        calls.append({"name": name, "arguments": args})
-
-    return calls
-
-
-def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """Extract tool calls from LLM output text.
-
-    Strips ``<think>...</think>`` blocks first to prevent regex confusion
-    when thinking content contains tool-call-like patterns. The original
-    text is not modified — only the copy used for parsing is cleaned.
-
-    Supports Hermes JSON, Qwen3.5 Coder XML, GLM4 XML, and bare JSON formats.
-    Returns list of {"name": str, "arguments": dict} dicts.
-    """
-    # Strip thinking blocks before parsing (model generates <think>...</think>
-    # by default in Qwen3.5/Qwen3 thinking mode). Thinking content may contain
-    # JSON, XML, or tool-call-like patterns that confuse the parsers.
-    text = _THINK_PATTERN.sub("", text)
-
-    tool_calls = []
-
-    # 1. Hermes/Qwen3/Nanbeige JSON format
-    for m in _HERMES_PATTERN.finditer(text):
-        try:
-            d = json.loads(m.group(1))
-            name = d.get("name", "")
-            args = d.get("arguments", {})
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-            if name in _KNOWN_TOOL_NAMES:
-                tool_calls.append({"name": name, "arguments": args})
-        except json.JSONDecodeError:
-            continue
-
-    if tool_calls:
-        return tool_calls
-
-    # 2. Qwen3.5 Coder XML format
-    for m in _QWEN35_CODER_PATTERN.finditer(text):
-        name = m.group(1).strip()
-        args = {}
-        for pm in _QWEN35_PARAM_PATTERN.finditer(m.group(2)):
-            key = pm.group(1).strip()
-            val = pm.group(2).strip()
-            try:
-                val = json.loads(val)
-            except (ValueError, json.JSONDecodeError):
-                pass
-            args[key] = val
-        if name in _KNOWN_TOOL_NAMES:
-            tool_calls.append({"name": name, "arguments": args})
-
-    if tool_calls:
-        return tool_calls
-
-    # 3. GLM-4 MoE XML format
-    for m in _GLM4_TC_PATTERN.finditer(text):
-        name = m.group(1).strip()
-        args = {}
-        for am in _GLM4_ARG_PATTERN.finditer(m.group(2)):
-            key = am.group(1).strip()
-            val = am.group(2).strip()
-            try:
-                val = json.loads(val)
-            except (ValueError, json.JSONDecodeError):
-                pass
-            args[key] = val
-        if name in _KNOWN_TOOL_NAMES:
-            tool_calls.append({"name": name, "arguments": args})
-
-    if tool_calls:
-        return tool_calls
-
-    # 4. Bare JSON fallback
-    for m in _BARE_JSON_PATTERN.finditer(text):
-        name = m.group(1)
-        try:
-            args = json.loads(m.group(2))
-        except json.JSONDecodeError:
-            args = {}
-        if name in _KNOWN_TOOL_NAMES:
-            tool_calls.append({"name": name, "arguments": args})
-
-    if tool_calls:
-        return tool_calls
-
-    # 5. Python-style fallback (common in BoxPwnr-authored prompts)
-    tool_calls = _parse_python_style_calls(text)
-    if tool_calls:
-        return tool_calls
-
-    return tool_calls
 
 
 # ---------------------------------------------------------------------------
@@ -327,9 +117,36 @@ class OpenCTFTextEnv(_Base):
 
         extras = extras or {}
 
-        self.max_turns = extras.get("max_turns") or kwargs.get("max_turns", 15)
+        raw_max_turns = extras.get("max_turns") or kwargs.get("max_turns", 15)
+        # Clamp max_turns to max_tool_calling_iterations if provided.
+        # This ensures the env's done=True fires at or before SkyRL's
+        # generator stops calling env.step(), so terminal CTFReward is
+        # always computed within the agent_loop rather than only in close().
+        max_tool_iters = (
+            extras.get("max_tool_calling_iterations")
+            or kwargs.get("max_tool_calling_iterations")
+        )
+        if max_tool_iters is not None:
+            max_tool_iters = int(max_tool_iters)
+            if int(raw_max_turns) > max_tool_iters:
+                logger.warning(
+                    "Clamping max_turns from %s to max_tool_calling_iterations=%d "
+                    "(env max_turns must not exceed generator iteration limit)",
+                    raw_max_turns,
+                    max_tool_iters,
+                )
+            self.max_turns = min(int(raw_max_turns), max_tool_iters)
+        else:
+            self.max_turns = int(raw_max_turns)
         self._base_max_turns = int(self.max_turns)
         self.turns = 0
+
+        logger.info(
+            "OpenCTFTextEnv max_turns=%d (raw=%s, max_tool_calling_iterations=%s)",
+            self.max_turns,
+            raw_max_turns,
+            max_tool_iters,
+        )
 
         # Optional progressive horizon schedule:
         #   {"rounds": [12, 24, 40, 60], "step_interval": 80}
@@ -340,12 +157,23 @@ class OpenCTFTextEnv(_Base):
         )
 
         # Tool schemas — SkyRL uses these for prompt injection.
-        from open_ctf.envs.skyrl.tool_groups import OPENCTF_TOOLS
-        self.tools = OPENCTF_TOOLS
+        from open_ctf.formatters.tool_registry import AGENT_TOOLS
+        self.tools = AGENT_TOOLS
         self.tool_groups = []
 
-        self._episode_id: Optional[str] = None
-        self._done = False
+        # Context-budget safety net: if max_input_length is provided,
+        # the env will proactively set done=True when estimated context
+        # tokens reach 85% of the budget.  This ensures terminal CTFReward
+        # fires BEFORE SkyRL's agent_loop breaks due to length overflow
+        # (which calls close() instead of step(), losing the reward).
+        self._max_input_length: int = int(
+            extras.get("max_input_length")
+            or kwargs.get("max_input_length", 0)
+        )
+        # Rough chars-per-token ratio for context estimation.
+        self._chars_per_token: float = 3.5
+        # Budget threshold: trigger done at this fraction of max_input_length.
+        self._context_budget_threshold: float = 0.85
 
         # Step-wise trajectory rewards: when enabled, per-step rewards
         # include small format-compliance and phase-progression signals
@@ -353,6 +181,15 @@ class OpenCTFTextEnv(_Base):
         self._step_wise: bool = bool(
             extras.get("step_wise_trajectories")
             or kwargs.get("step_wise_trajectories", False)
+        )
+
+        # Native tool schemas: when True, tool schemas are injected via
+        # chat_template_kwargs["tools"] → apply_chat_template(tools=...)
+        # so the tokenizer formats them per the model's native template.
+        # Skip _inject_tool_schemas() text injection to avoid duplication.
+        self._native_tool_schemas: bool = bool(
+            extras.get("native_tool_schemas")
+            or kwargs.get("native_tool_schemas", False)
         )
 
         # Track tool call count before each step for per-step reward.
@@ -367,6 +204,14 @@ class OpenCTFTextEnv(_Base):
             or kwargs.get("tool_call_format", "hermes")
         )
 
+        # Strip <think>...</think> reasoning blocks from LLM output before
+        # passing to the agent for tool-call parsing. Qwen3.5 emits these
+        # blocks during chain-of-thought; leaving them in can confuse the
+        # parser when the model mentions tool names inside its reasoning.
+        # Default True — set strip_think: false in env_kwargs to disable.
+        _raw_strip_think = extras.get("strip_think") if extras.get("strip_think") is not None else kwargs.get("strip_think", True)
+        self._strip_think: bool = bool(_raw_strip_think)
+
         # Reconstruct reward function from serializable config dict.
         # If reward_config is missing/empty, use CTFReward defaults instead of
         # silently falling back to binary terminal reward.
@@ -379,6 +224,12 @@ class OpenCTFTextEnv(_Base):
                 type(reward_config).__name__,
             )
             reward_config = {}
+        weight_keys = [k for k in reward_config if k.endswith("_weight")]
+        logger.info(
+            "Reward config received (%d keys, %d weight keys): %s",
+            len(reward_config), len(weight_keys),
+            {k: v for k, v in reward_config.items() if k.endswith("_weight")},
+        )
         try:
             from open_ctf.training.online_rl.step_reward import create_reward_fn
             self._reward_fn = create_reward_fn({"reward": reward_config})
@@ -399,6 +250,19 @@ class OpenCTFTextEnv(_Base):
             extras.get("path_hint")
             or kwargs.get("path_hint")
         )
+        self._workspace_root: str = str(
+            extras.get("workspace_root")
+            or kwargs.get("workspace_root")
+            or os.environ.get("OPEN_CTF_WORKSPACE_ROOT", os.environ.get("OPENCTF_WORKSPACE_ROOT", "/tmp/openctf-workspaces"))
+        )
+        raw_workdir = (
+            extras.get("challenge_workdir")
+            or kwargs.get("challenge_workdir")
+            or os.getenv("CHALLENGE_WORKDIR")
+            or "/root/challenge"
+        )
+        self._challenge_workdir: str = str(raw_workdir).strip() or "/root/challenge"
+        self._ephemeral_workspace: bool = False
 
         # Target URL for the challenge
         raw_target = extras.get("target", kwargs.get("target", ""))
@@ -413,6 +277,7 @@ class OpenCTFTextEnv(_Base):
             or extras.get("trajectory_output_dir")
         )
         self._trajectory_logger = None
+        self._episode_trajectory_logged = False
         if self._trajectory_output_dir:
             try:
                 from open_ctf.training.online_rl.trajectory_logger import TrajectoryLogger
@@ -435,7 +300,7 @@ class OpenCTFTextEnv(_Base):
         self._difficulty: Optional[str] = extras.get("difficulty")
         # Prompt messages for logging (set in init())
         self._prompt_messages: Optional[list] = None
-        self._last_rollout_status: str = "ok"
+        self._last_rollout_status: str = RolloutStatus.OK.value
         self._status_counts: Dict[str, int] = {}
         self._timing_totals: Dict[str, float] = {
             "parse_s": 0.0,
@@ -443,10 +308,18 @@ class OpenCTFTextEnv(_Base):
             "total_s": 0.0,
         }
         # Rollout quality filter: statuses that should not contribute reward.
+        # PARSER_ERROR removed from defaults — zeroing reward for episodes
+        # where the *last* step had a parse failure kills learning signal
+        # even when earlier steps made good tool calls.  Parser errors are
+        # already penalized via format_weight in CTFReward.
         hard_mask_statuses = (
             extras.get("hard_mask_statuses")
             or kwargs.get("hard_mask_statuses")
-            or ["infra_unreachable", "target_mismatch", "parser_error", "tool_timeout"]
+            or [
+                RolloutStatus.INFRA_UNREACHABLE.value,
+                RolloutStatus.TARGET_MISMATCH.value,
+                RolloutStatus.TOOL_TIMEOUT.value,
+            ]
         )
         self._hard_mask_statuses = {str(s).strip() for s in hard_mask_statuses if str(s).strip()}
         # Optional warmup mode: clamp non-positive rollout rewards to 0 during
@@ -482,6 +355,7 @@ class OpenCTFTextEnv(_Base):
 
         # Resolve and create the pluggable StepAgent.
         # agent_class is a dotted path string (Ray-safe serialization).
+        # Default runtime agent is DefaultStepAgent (resilient_mode=True).
         agent_class_path = kwargs.get("agent_class") or extras.get("agent_class")
         agent_cls = _resolve_class(agent_class_path)
         if agent_cls is None:
@@ -494,8 +368,16 @@ class OpenCTFTextEnv(_Base):
             agent_kwargs["executor_type"] = extras.get(
                 "executor_type", kwargs.get("executor_type", "subprocess")
             )
+        # Keep parser feedback and runtime prompt format aligned.
+        agent_kwargs.setdefault("tool_call_format", self._tool_call_format)
 
         self._agent = agent_cls(**agent_kwargs)
+
+        # Validate reward-critical attributes and warn early for BYO agents.
+        from open_ctf.agent.protocol import validate_step_agent
+        agent_warnings = validate_step_agent(self._agent)
+        for w in agent_warnings:
+            logger.warning("StepAgent validation: %s", w)
 
         # Let agent override tool schemas if it provides them
         agent_tools = getattr(self._agent, "tools", None)
@@ -528,34 +410,66 @@ class OpenCTFTextEnv(_Base):
         """
         # Progressive horizon: clamp max turns by stage if schedule is enabled.
         self.max_turns = self._resolve_max_turns_for_step(self._global_step)
+        self._setup_workspace()
         # For static challenges, stage challenge assets into /root/challenge.
+        # For docker challenges, clean the workspace to prevent cross-episode
+        # contamination (stale files from prior episodes mislead the model).
         if self._infra_type == "static":
             self._prepare_static_workspace()
+        else:
+            self._clean_workspace()
         # Avoid empty target fallback to localhost for static rows.
         if not self._target:
             if self._infra_type == "static":
-                self._target = "file:///root/challenge/"
+                self._target = self._file_target_for_workdir(self._challenge_workdir)
             else:
                 self._target = os.getenv("CHALLENGE_TARGET", "http://localhost:8080")
+        prompt = self._rewrite_prompt_workspace(prompt)
         self._agent.reset(
             target=self._target,
             ground_truth_flag=self._ground_truth_flag or "",
             max_steps=self.max_turns,
+            tool_call_format=self._tool_call_format,
+            challenge_workdir=self._challenge_workdir,
+            prompt_messages=prompt,
+            challenge_id=self._challenge_id,
+            category=self._category,
+            difficulty=self._difficulty,
+            infra_type=self._infra_type,
+            objective=(
+                str(prompt[-1].get("content", "")).strip()
+                if prompt and isinstance(prompt[-1], dict)
+                else ""
+            ),
         )
 
-        self._episode_id = None  # no longer tracked via server
         self.turns = 0
-        self._done = False
         self._prev_tool_call_count = 0
-        self._last_rollout_status = "ok"
+        self._last_rollout_status = RolloutStatus.OK.value
         self._status_counts = {}
         self._timing_totals = {"parse_s": 0.0, "execute_s": 0.0, "total_s": 0.0}
+        self._episode_trajectory_logged = False
+
+        # If the BYO agent controls its own prompts (RL proxy mode), fetch it here
+        if hasattr(self._agent, "get_initial_prompt"):
+            proxy_prompt = self._agent.get_initial_prompt()
+            if proxy_prompt is not None:
+                prompt = proxy_prompt
 
         # Inject tool schemas into the system message so the model knows
-        # what tools are available during GRPO rollouts. SkyRL's generator
-        # may pass tools= to apply_chat_template for structured tool calling,
-        # but for text-based parsing the model needs schemas in the prompt.
-        prompt = self._inject_tool_schemas(prompt)
+        # what tools are available during GRPO rollouts.
+        #
+        # When native_tool_schemas=True, tools are passed via
+        # chat_template_kwargs["tools"] → apply_chat_template(tools=...)
+        # and the tokenizer formats them per the model's pretrained format.
+        # Skip text injection to avoid duplicate/conflicting schemas.
+        if self._native_tool_schemas:
+            logger.info(
+                "Native tool schemas active — skipping _inject_tool_schemas() "
+                "(tools= will be formatted by tokenizer chat template)."
+            )
+        else:
+            prompt = self._inject_tool_schemas(prompt)
 
         # Capture prompt for trajectory logging (shallow copy to avoid mutation).
         self._prompt_messages = list(prompt)
@@ -564,7 +478,84 @@ class OpenCTFTextEnv(_Base):
             "OpenCTFTextEnv initialized: challenge=%s",
             self._challenge_id,
         )
-        return prompt, {"episode_id": self._episode_id}
+        return prompt, {}
+
+    @staticmethod
+    def _file_target_for_workdir(workdir: str) -> str:
+        path = (workdir or "/root/challenge").rstrip("/")
+        if not path:
+            path = "/root/challenge"
+        return f"file://{path}/"
+
+    def _setup_workspace(self) -> None:
+        """Select or create the per-episode workspace path."""
+        if self._infra_type != "static":
+            self._ephemeral_workspace = False
+            self._challenge_workdir = (
+                str(os.getenv("CHALLENGE_WORKDIR", self._challenge_workdir or "/root/challenge")).strip()
+                or "/root/challenge"
+            )
+            return
+
+        self._cleanup_ephemeral_workspace()
+        os.makedirs(self._workspace_root, exist_ok=True)
+        challenge_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(self._challenge_id or "challenge")).strip("_")
+        if not challenge_slug:
+            challenge_slug = "challenge"
+        self._challenge_workdir = tempfile.mkdtemp(
+            prefix=f"{challenge_slug}_",
+            dir=self._workspace_root,
+        )
+        self._ephemeral_workspace = True
+        self._target = self._file_target_for_workdir(self._challenge_workdir)
+
+    def _cleanup_ephemeral_workspace(self) -> None:
+        """Delete prior per-episode static workspace if it is ephemeral."""
+        if not self._ephemeral_workspace:
+            return
+        target_dir = str(self._challenge_workdir or "").strip()
+        if not target_dir:
+            return
+        try:
+            root_abs = os.path.abspath(self._workspace_root)
+            target_abs = os.path.abspath(target_dir)
+            if (
+                target_abs.startswith(root_abs + os.sep)
+                and os.path.isdir(target_abs)
+            ):
+                shutil.rmtree(target_abs, ignore_errors=True)
+        except Exception as exc:
+            logger.debug("Failed to cleanup workspace %s: %s", target_dir, exc)
+        finally:
+            self._ephemeral_workspace = False
+
+    def _rewrite_prompt_workspace(self, prompt: ConversationType) -> ConversationType:
+        """Rewrite hardcoded /root/challenge references to the active workspace."""
+        workdir = str(self._challenge_workdir or "").strip()
+        if not workdir:
+            return prompt
+        normalized = workdir.rstrip("/")
+        if not normalized:
+            return prompt
+        file_target = self._file_target_for_workdir(normalized)
+        rewrites = (
+            ("file:///root/challenge/", file_target),
+            ("/root/challenge/", f"{normalized}/"),
+            ("/root/challenge", normalized),
+        )
+        out: ConversationType = []
+        for msg in prompt:
+            if not isinstance(msg, dict):
+                out.append(msg)
+                continue
+            updated = dict(msg)
+            content = updated.get("content")
+            if isinstance(content, str):
+                for old, new in rewrites:
+                    content = content.replace(old, new)
+                updated["content"] = content
+            out.append(updated)
+        return out
 
     def _resolve_max_turns_for_step(self, global_step: int) -> int:
         """Return effective max turns for current training step."""
@@ -603,7 +594,7 @@ class OpenCTFTextEnv(_Base):
             return hint
 
         roots: List[str] = []
-        env_roots = os.getenv("OPENCTF_BENCHMARK_ROOTS", "")
+        env_roots = os.environ.get("OPEN_CTF_BENCHMARK_ROOTS", os.environ.get("OPENCTF_BENCHMARK_ROOTS", ""))
         if env_roots:
             roots.extend([p.strip() for p in env_roots.split(":") if p.strip()])
         roots.extend(
@@ -626,11 +617,36 @@ class OpenCTFTextEnv(_Base):
                 return path
         return None
 
+    def _clean_workspace(self) -> None:
+        """Remove stale files from /root/challenge between docker episodes.
+
+        Without cleanup, files written by previous episodes (hallucinated code,
+        curl artifacts, fake flags) persist and mislead the model into exploring
+        the filesystem instead of making HTTP requests to the challenge service.
+        """
+        target_dir = self._challenge_workdir
+        if not os.path.exists(target_dir):
+            return
+        for name in os.listdir(target_dir):
+            path = os.path.join(target_dir, name)
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            except (FileNotFoundError, PermissionError):
+                continue
+        logger.debug(
+            "Cleaned workspace %s for docker challenge=%s",
+            target_dir,
+            self._challenge_id,
+        )
+
     def _prepare_static_workspace(self) -> None:
         """Stage static challenge files into /root/challenge for tool access."""
         src = self._resolve_static_source_path()
-        target_dir = "/root/challenge"
-        self._target = "file:///root/challenge/"
+        target_dir = self._challenge_workdir
+        self._target = self._file_target_for_workdir(target_dir)
         if not src:
             logger.warning(
                 "Static challenge path not found for challenge=%s path_hint=%r",
@@ -720,6 +736,11 @@ class OpenCTFTextEnv(_Base):
                 "<parameter=param>value</parameter>"
                 "</function></tool_call>"
             ),
+            "command_xml": (
+                "Use strict command XML and output EXACTLY one action tag per turn: "
+                "either <COMMAND maxtime=30>command</COMMAND> or <FLAG>flag_value</FLAG>. "
+                "Do not output <tool_call>, JSON, <think>, explanations, or multiple tags."
+            ),
         }
         fmt_instruction = _FORMAT_INSTRUCTIONS.get(
             self._tool_call_format, _FORMAT_INSTRUCTIONS["hermes"]
@@ -788,6 +809,22 @@ class OpenCTFTextEnv(_Base):
         """
         self.turns += 1
 
+        # Strip <think>...</think> reasoning blocks before tool parsing.
+        # Qwen3.5 and similar models emit chain-of-thought inside these
+        # tags; passing them through can confuse the tool-call parser
+        # (e.g. tool names mentioned in reasoning get mis-parsed).
+        if self._strip_think:
+            clean_action = _THINK_PATTERN.sub("", action).strip()
+            if clean_action != action:
+                logger.debug(
+                    "Stripped <think> blocks from action "
+                    "(original=%d chars, cleaned=%d chars)",
+                    len(action),
+                    len(clean_action),
+                )
+        else:
+            clean_action = action
+
         # Snapshot tool call count before agent processes this step,
         # so we can compute how many new tool calls this step produced
         # (needed for step-wise trajectory rewards).
@@ -795,9 +832,9 @@ class OpenCTFTextEnv(_Base):
             getattr(self._agent, "tool_calls_history", [])
         )
 
-        result = self._agent.step(action)
+        result = self._agent.step(clean_action)
         info = dict(result.info or {})
-        rollout_status = str(info.get("rollout_status", "ok") or "ok")
+        rollout_status = normalize_rollout_status(info.get("rollout_status", RolloutStatus.OK.value))
         self._last_rollout_status = rollout_status
         self._status_counts[rollout_status] = int(self._status_counts.get(rollout_status, 0)) + 1
         timing = info.get("timing", {})
@@ -808,12 +845,42 @@ class OpenCTFTextEnv(_Base):
                 except (TypeError, ValueError):
                     continue
 
-        # Sync done state from agent
-        if result.done:
-            self._done = hasattr(self._agent, "episode_done") and self._agent.episode_done
-
         done = result.done or self.turns >= self.max_turns
+
+        # Context-budget safety net: proactively trigger done=True when
+        # the estimated context tokens approach max_input_length.  Without
+        # this, SkyRL's agent_loop breaks via its own length check and
+        # calls env.close() — which computes terminal CTFReward for
+        # diagnostics only, never feeding it back into per_token_reward.
+        if not done and self._max_input_length > 0:
+            est_tokens = self._estimate_context_tokens()
+            budget_limit = int(self._max_input_length * self._context_budget_threshold)
+            if est_tokens >= budget_limit:
+                logger.info(
+                    "Context budget trigger: est_tokens=%d >= %d (%.0f%% of %d). "
+                    "Setting done=True to fire terminal CTFReward before "
+                    "SkyRL length-break.",
+                    est_tokens,
+                    budget_limit,
+                    self._context_budget_threshold * 100,
+                    self._max_input_length,
+                )
+                done = True
+
         reward = self._compute_reward(done)
+
+        # Log every step's reward for reward-wiring debugging
+        logger.info(
+            "env.step() returning: challenge=%s turn=%d/%d done=%s "
+            "reward=%.6f step_wise=%s rollout_status=%s",
+            self._challenge_id,
+            self.turns,
+            self.max_turns,
+            done,
+            reward,
+            self._step_wise,
+            self._last_rollout_status,
+        )
 
         if done:
             # Minimal episode-level logging for diagnostics (avoid huge payloads).
@@ -855,6 +922,35 @@ class OpenCTFTextEnv(_Base):
             "metadata": info,
         }
 
+    def _estimate_context_tokens(self) -> int:
+        """Estimate current conversation context size in tokens.
+
+        Uses accumulated tool outputs, assistant text, and per-turn
+        formatting overhead to approximate the total token count.
+        This is intentionally conservative (overestimates) so we
+        trigger done=True before SkyRL's exact tokenizer-based check.
+        """
+        tool_outputs = getattr(self._agent, "tool_outputs", [])
+        all_text = getattr(self._agent, "all_text", "")
+
+        # Baseline: system prompt + tool schemas + user message.
+        # With native_tool_schemas, the tokenizer re-injects ~3000 tokens
+        # of tool schemas on every re-tokenization.
+        initial_tokens = 3500
+
+        # Tool output text (curl HTML responses can be 1000+ chars each).
+        output_chars = sum(len(o) for o in tool_outputs)
+        output_tokens = output_chars / self._chars_per_token
+
+        # Assistant reasoning/action text.
+        text_tokens = len(all_text) / self._chars_per_token
+
+        # ChatML formatting overhead per turn (~15 tokens: role tags,
+        # newlines, im_start/im_end tokens).
+        formatting_tokens = self.turns * 15
+
+        return int(initial_tokens + output_tokens + text_tokens + formatting_tokens)
+
     def _compute_reward(self, done: bool) -> float:
         """Compute reward for the current step.
 
@@ -862,7 +958,8 @@ class OpenCTFTextEnv(_Base):
         for reward computation. Falls back gracefully if the agent doesn't
         expose these attributes (custom agents may not).
         """
-        # Read agent state (DefaultStepAgent exposes these; custom agents may not)
+        # Read agent state (BoxPwnr/Default step agents expose these; custom
+        # agents may not).
         tool_calls_history = getattr(self._agent, "tool_calls_history", [])
         tool_outputs = getattr(self._agent, "tool_outputs", [])
         all_text = getattr(self._agent, "all_text", "")
@@ -872,43 +969,53 @@ class OpenCTFTextEnv(_Base):
             from open_ctf.training.online_rl.step_reward import per_step_reward
             # Compute how many new tool calls were added by this step.
             step_tool_call_count = len(tool_calls_history) - self._prev_tool_call_count
-            return per_step_reward(
-                tool_calls_history, self.turns, self.max_turns,
+            step_reward = per_step_reward(
+                tool_calls_history,
+                self.turns,
                 step_tool_call_count=max(0, step_tool_call_count),
                 step_wise=self._step_wise,
             )
+
+            # In step-wise mode we may never reach terminal done=True in
+            # some generator paths. Persist partial trajectories so smoke and
+            # diagnostics can still validate tool use/reward flow.
+            if self._step_wise:
+                self._log_episode_trajectory(
+                    reward_total=step_reward,
+                    reward_breakdown={"step_reward": float(step_reward)},
+                    tool_calls_history=tool_calls_history,
+                    tool_outputs=tool_outputs,
+                    all_text=all_text,
+                    episode_done=episode_done,
+                    rollout_status=self._last_rollout_status,
+                    update_scoreboard=False,
+                )
+            return step_reward
 
         # Terminal: compute full reward
         reward = 0.0
         breakdown = None
 
         if self._reward_fn is not None:
-            completion_msgs = []
-            for i, tc in enumerate(tool_calls_history):
-                completion_msgs.append({
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": tc["arguments"],
-                        }
-                    }],
-                })
-                if i < len(tool_outputs):
-                    completion_msgs.append({
-                        "role": "tool",
-                        "content": tool_outputs[i],
-                        "name": tc["name"],
-                    })
-            completion_msgs.append({
-                "role": "assistant",
-                "content": all_text,
-            })
+            completion_msgs = self._build_terminal_completion_msgs(
+                tool_calls_history, tool_outputs, all_text,
+            )
 
             # Pass challenge metadata so reward function can adjust weights
             # (e.g. crypto/rev/forensics skip RECON->ENUM->EXPLOIT progression).
             reward_metadata = [{"task_category": self._category or "web", "success": episode_done}]
+
+            logger.info(
+                "Terminal reward input: challenge=%s tool_calls=%d tool_outputs=%d "
+                "completion_msgs=%d gt_flag=%r episode_done=%s all_text_len=%d",
+                self._challenge_id,
+                len(tool_calls_history),
+                len(tool_outputs),
+                len(completion_msgs),
+                self._ground_truth_flag[:30] if self._ground_truth_flag else None,
+                episode_done,
+                len(all_text),
+            )
 
             # Use compute_with_breakdown if available for trajectory logging.
             if self._trajectory_logger and hasattr(self._reward_fn, "compute_with_breakdown"):
@@ -928,6 +1035,14 @@ class OpenCTFTextEnv(_Base):
                     metadata=reward_metadata,
                 )
                 reward = rewards[0] if rewards else 0.0
+
+            logger.info(
+                "Terminal reward computed: challenge=%s reward=%.4f "
+                "breakdown_keys=%s",
+                self._challenge_id,
+                reward,
+                sorted(breakdown.keys()) if breakdown else "none",
+            )
         else:
             # Fallback: binary flag reward
             reward = 1.0 if episode_done else 0.0
@@ -964,9 +1079,46 @@ class OpenCTFTextEnv(_Base):
             all_text=all_text,
             episode_done=episode_done,
             rollout_status=self._last_rollout_status,
+            update_scoreboard=True,
         )
 
         return reward
+
+    @staticmethod
+    def _build_terminal_completion_msgs(
+        tool_calls_history: list,
+        tool_outputs: list,
+        all_text: str,
+    ) -> List[Dict[str, Any]]:
+        """Build completion messages for terminal CTFReward scoring.
+
+        Converts agent tool-call history + outputs into the ChatML format
+        expected by CTFReward. Uses safe ``.get()`` accessors throughout
+        and skips non-dict entries in the history.
+        """
+        completion_msgs: List[Dict[str, Any]] = []
+        for i, tc in enumerate(tool_calls_history):
+            if not isinstance(tc, dict):
+                continue
+            tc_name = tc.get("name", "")
+            completion_msgs.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": tc_name,
+                        "arguments": tc.get("arguments", "{}"),
+                    }
+                }],
+            })
+            if i < len(tool_outputs):
+                completion_msgs.append({
+                    "role": "tool",
+                    "content": tool_outputs[i],
+                    "name": tc_name,
+                })
+        completion_msgs.append({"role": "assistant", "content": all_text})
+        return completion_msgs
 
     def _log_episode_trajectory(
         self,
@@ -977,6 +1129,7 @@ class OpenCTFTextEnv(_Base):
         all_text: str,
         episode_done: bool,
         rollout_status: str,
+        update_scoreboard: bool = True,
     ) -> None:
         """Log episode trajectory and update challenge scoreboard."""
         if not self._trajectory_logger:
@@ -1037,9 +1190,10 @@ class OpenCTFTextEnv(_Base):
                 status_counts=dict(self._status_counts),
                 max_turns=self.max_turns,
             )
+            self._episode_trajectory_logged = True
 
             # Update challenge scoreboard
-            if self._challenge_id:
+            if update_scoreboard and self._challenge_id:
                 self._trajectory_logger.log_challenge_result(
                     challenge_id=self._challenge_id,
                     category=self._category,
@@ -1051,10 +1205,93 @@ class OpenCTFTextEnv(_Base):
             logger.warning("Trajectory logging failed: %s", exc)
 
     def close(self):
-        """Close the episode and release resources."""
+        """Close the episode and release resources.
+
+        Computes terminal CTFReward for trajectory logging only when step()
+        did NOT already log a terminal trajectory. This prevents duplicate
+        trajectory entries that inflate scoreboard counts and confuse
+        reward-wiring diagnostics.
+
+        When step() already fired done=True and logged the trajectory
+        (``_episode_trajectory_logged=True``), close() skips redundant
+        reward computation and logging entirely.
+        """
+        if self._trajectory_logger and self.turns > 0 and not self._episode_trajectory_logged:
+            # step() never reached done=True (e.g. SkyRL agent_loop exited
+            # on sequence length). Compute terminal reward for diagnostics.
+            tool_calls_history = getattr(self._agent, "tool_calls_history", [])
+            tool_outputs = getattr(self._agent, "tool_outputs", [])
+            all_text = getattr(self._agent, "all_text", "")
+            episode_done = bool(getattr(self._agent, "episode_done", False))
+            reward_total = 1.0 if episode_done else 0.0
+            reward_breakdown: Optional[Dict[str, float]] = None
+            if self._reward_fn is not None:
+                completion_msgs = self._build_terminal_completion_msgs(
+                    tool_calls_history, tool_outputs, all_text,
+                )
+                reward_metadata = [
+                    {
+                        "task_category": self._category or "web",
+                        "success": episode_done,
+                    }
+                ]
+                if hasattr(self._reward_fn, "compute_with_breakdown"):
+                    results = self._reward_fn.compute_with_breakdown(
+                        completions=[completion_msgs],
+                        ground_truth_flag=[self._ground_truth_flag],
+                        optimal_steps=[self._optimal_steps],
+                        metadata=reward_metadata,
+                    )
+                    if results:
+                        reward_total, reward_breakdown = results[0]
+                else:
+                    rewards = self._reward_fn(
+                        completions=[completion_msgs],
+                        ground_truth_flag=[self._ground_truth_flag],
+                        optimal_steps=[self._optimal_steps],
+                        metadata=reward_metadata,
+                    )
+                    reward_total = rewards[0] if rewards else reward_total
+
+            if self._last_rollout_status in self._hard_mask_statuses:
+                reward_total = 0.0
+            elif (
+                self._positive_only_until_step > 0
+                and int(self._global_step) < self._positive_only_until_step
+                and float(reward_total) <= self._positive_only_reward_floor
+            ):
+                reward_total = 0.0
+
+            if reward_breakdown is None:
+                reward_breakdown = {
+                    RolloutStatus.NON_TERMINAL_CLOSE.value: float(reward_total)
+                }
+
+            logger.info(
+                "close() terminal reward: challenge=%s turns=%d/%d reward=%.4f "
+                "episode_done=%s rollout_status=%s",
+                self._challenge_id,
+                self.turns,
+                self.max_turns,
+                reward_total,
+                episode_done,
+                RolloutStatus.NON_TERMINAL_CLOSE.value,
+            )
+
+            self._log_episode_trajectory(
+                reward_total=float(reward_total),
+                reward_breakdown=reward_breakdown,
+                tool_calls_history=tool_calls_history,
+                tool_outputs=tool_outputs,
+                all_text=all_text,
+                episode_done=episode_done,
+                rollout_status=RolloutStatus.NON_TERMINAL_CLOSE.value,
+                update_scoreboard=True,
+            )
         if self._agent:
             self._agent.close()
-        logger.debug("OpenCTFTextEnv closed (episode=%s)", self._episode_id)
+        self._cleanup_ephemeral_workspace()
+        logger.debug("OpenCTFTextEnv closed (challenge=%s)", self._challenge_id)
 
     def get_metrics(self) -> Dict[str, Any]:
         """Return episode-level metrics."""

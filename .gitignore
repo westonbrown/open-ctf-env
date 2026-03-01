@@ -101,6 +101,8 @@ scripts/**/*_targets.json
 # Local planning/research notes
 new.md
 FRAMEWORK_COMPARISON_*.md
+CLAUDE.md
+STATUS_EXECUTION_BRIEF_*.md
 
 # One-off RunPod orchestration scripts
 scripts/deploy/runpod_*.sh
@@ -110,6 +112,7 @@ configs/challenges/*_metadata.json
 
 # Keep lightweight metadata/docs in data/, ignore generated datasets.
 data/**/*.jsonl
+data/**/*.manifest.json
 data/**/*.jsonl.gz
 data/**/*.parquet
 data/**/*.arrow

@@ -14,6 +14,7 @@ See also ``open_ctf.cli.evaluate`` for the CLI wrapper.
 """
 
 import json
+import importlib
 import logging
 import os
 import time
@@ -93,6 +94,10 @@ class ModelEvaluator:
         traces_dir: str = "./targets",
         reasoning_effort: str = "medium",
         attempts: int = 1,
+        agent: str = "boxpwnr",
+        challenge_registry: Optional[str] = None,
+        target_map: Optional[str] = None,
+        host: str = "localhost",
     ) -> None:
         self.model = model
         self.challenges_yaml = challenges_yaml
@@ -103,6 +108,10 @@ class ModelEvaluator:
         self.traces_dir = traces_dir
         self.reasoning_effort = reasoning_effort
         self.attempts = attempts
+        self.agent = agent
+        self.challenge_registry = challenge_registry
+        self.target_map = target_map
+        self.host = host
 
     # ------------------------------------------------------------------
     # Challenge loading
@@ -145,8 +154,6 @@ class ModelEvaluator:
         Returns:
             ChallengeResult with solve status, turns, and timing.
         """
-        from open_ctf.agent.runner import AgentRunner
-
         cid = challenge["id"]
         platform = challenge.get("platform", self.platform)
         vuln_type = challenge.get("vuln_type", "unknown")
@@ -154,26 +161,30 @@ class ModelEvaluator:
 
         logger.info("Running challenge %s (%s, %s)", cid, vuln_type, difficulty)
 
-        runner = AgentRunner(
-            platform=platform,
-            model=self.model,
-            strategy=self.strategy,
-            max_turns=self.max_turns,
-            max_time=self.max_time,
-            traces_dir=self.traces_dir,
-            reasoning_effort=self.reasoning_effort,
-            attempts=self.attempts,
-        )
-
         start = time.time()
         solved = False
         turns = 0
         error_msg = None
 
         try:
-            runner.run(target=cid)
-            # Check trace output for success
-            solved, turns = self._parse_trace(cid, platform)
+            if str(self.agent).strip().lower() == "boxpwnr":
+                from open_ctf.agent.runner import AgentRunner
+
+                runner = AgentRunner(
+                    platform=platform,
+                    model=self.model,
+                    strategy=self.strategy,
+                    max_turns=self.max_turns,
+                    max_time=self.max_time,
+                    traces_dir=self.traces_dir,
+                    reasoning_effort=self.reasoning_effort,
+                    attempts=self.attempts,
+                )
+                runner.run(target=cid)
+                # Check trace output for success
+                solved, turns = self._parse_trace(cid, platform)
+            else:
+                solved, turns = self._run_with_custom_agent(challenge, platform)
         except Exception as e:
             error_msg = str(e)
             logger.warning("Challenge %s failed: %s", cid, error_msg)
@@ -191,6 +202,57 @@ class ModelEvaluator:
             error=error_msg,
         )
 
+    def _run_with_custom_agent(
+        self,
+        challenge: Dict[str, Any],
+        platform: str,
+    ) -> tuple[bool, int]:
+        """Run evaluation with a custom CTFAgent implementation."""
+        from open_ctf.agent.protocol import CTFAgent
+
+        agent_spec = str(self.agent or "").strip()
+        if agent_spec.lower().startswith("custom:"):
+            agent_spec = agent_spec.split(":", 1)[1].strip()
+        if not agent_spec:
+            raise ValueError("Custom agent spec is empty")
+
+        module_name, _, class_name = agent_spec.rpartition(".")
+        if not module_name or not class_name:
+            raise ValueError(
+                f"Invalid --agent value {self.agent!r}. "
+                "Use 'boxpwnr' or 'custom:module.ClassName'."
+            )
+
+        module = importlib.import_module(module_name)
+        agent_cls = getattr(module, class_name)
+        agent = agent_cls(
+            model=self.model,
+            platform=platform,
+            strategy=self.strategy,
+            traces_dir=self.traces_dir,
+            reasoning_effort=self.reasoning_effort,
+            attempts=self.attempts,
+        )
+        if not isinstance(agent, CTFAgent):
+            raise TypeError(f"Resolved agent {agent_spec} does not satisfy CTFAgent protocol")
+
+        cid = challenge["id"]
+        target = (
+            challenge.get("target")
+            or challenge.get("target_url")
+            or challenge.get("url")
+            or cid
+        )
+        result = agent.solve(
+            challenge=cid,
+            target=str(target),
+            max_steps=self.max_turns,
+            timeout=max(1, int(self.max_time)) * 60,
+        )
+        solved = bool(getattr(result, "success", False))
+        turns = int(getattr(result, "steps", 0) or 0)
+        return solved, turns
+
     # ------------------------------------------------------------------
     # Batch run
     # ------------------------------------------------------------------
@@ -202,6 +264,7 @@ class ModelEvaluator:
             EvalReport with aggregate statistics and per-challenge results.
         """
         challenges = self.load_challenges()
+        self._run_runtime_preflight(challenges)
         results: List[ChallengeResult] = []
 
         for challenge in challenges:
@@ -231,6 +294,46 @@ class ModelEvaluator:
         )
 
         return report
+
+    def _run_runtime_preflight(self, challenges: List[Dict[str, Any]]) -> None:
+        """Fail fast on registry/target/port/container mismatches for cybench runs."""
+        cybench_ids = [
+            str(challenge["id"])
+            for challenge in challenges
+            if str(challenge.get("platform", self.platform)).lower() == "cybench"
+        ]
+        if not cybench_ids:
+            return
+
+        registry_path = self.challenge_registry
+        if not registry_path:
+            default_registry = (
+                Path(__file__).resolve().parents[3]
+                / "configs"
+                / "challenges"
+                / "cybench.yaml"
+            )
+            if default_registry.exists():
+                registry_path = str(default_registry)
+        if not registry_path:
+            raise ValueError(
+                "Cybench evaluation requires a challenge registry "
+                "(pass --challenge-registry)."
+            )
+
+        from open_ctf.challenges.preflight import validate_runtime_preflight
+        from open_ctf.challenges.registry import ChallengeRegistry
+
+        registry = ChallengeRegistry(str(registry_path))
+        if self.target_map:
+            registry.load_target_overrides(self.target_map, strict=False)
+        validate_runtime_preflight(
+            registry,
+            host=self.host,
+            challenge_ids=cybench_ids,
+            require_reachable=True,
+            strict_container_check=True,
+        )
 
     # ------------------------------------------------------------------
     # Output

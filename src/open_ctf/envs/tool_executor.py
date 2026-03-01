@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -26,6 +27,16 @@ from typing import Any, Callable, Dict, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _noninteractive_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Return a process env tuned for unattended tool execution."""
+    env = os.environ.copy()
+    env.setdefault("UNZIPOPT", "-o")
+    env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+    if extra:
+        env.update(extra)
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +59,7 @@ class _Session:
             "stderr": subprocess.STDOUT,
             "text": True,
             "bufsize": 1,
+            "env": _noninteractive_env(),
         }
         if workdir:
             kwargs["cwd"] = workdir
@@ -186,6 +198,7 @@ def _default_shell(command: str, timeout: int, workdir: str | None = None) -> tu
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_noninteractive_env(),
         )
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
@@ -218,6 +231,7 @@ def _default_python(code: str, timeout: int) -> tuple[str, str, int]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_noninteractive_env(),
         )
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
@@ -308,6 +322,7 @@ class SubprocessExecutor(BaseExecutor):
         tool_handlers: Optional[Dict[str, ToolHandler]] = None,
         stdout_limit: int = 4096,
         stderr_limit: int = 1024,
+        default_workdir: Optional[str] = None,
     ):
         self.target = target or os.getenv("CHALLENGE_TARGET", "http://localhost:8080")
         self.ground_truth = ground_truth or os.getenv("GROUND_TRUTH", "")
@@ -316,6 +331,11 @@ class SubprocessExecutor(BaseExecutor):
         self.tools = tools or sorted(ALL_TOOLS)
         self.stdout_limit = stdout_limit
         self.stderr_limit = stderr_limit
+        self.default_workdir = (
+            default_workdir
+            or os.getenv("CHALLENGE_WORKDIR")
+            or "/root/challenge"
+        )
 
         self._states: Dict[str, ToolState] = {}
         self._states_lock = threading.Lock()
@@ -363,6 +383,19 @@ class SubprocessExecutor(BaseExecutor):
                 "Tools without handlers: %s — calls to these will return errors",
                 sorted(missing),
             )
+
+    def _resolve_default_workdir(self) -> Optional[str]:
+        """Return a safe default working directory if it exists."""
+        workdir = str(self.default_workdir or "").strip()
+        if workdir and os.path.isdir(workdir):
+            return workdir
+        return None
+
+    def _resolve_workdir(self, requested: Any) -> Optional[str]:
+        """Prefer explicit workdir, then fall back to challenge workspace."""
+        if isinstance(requested, str) and requested.strip():
+            return requested.strip()
+        return self._resolve_default_workdir()
 
     # -- Per-generation state -----------------------------------------------
 
@@ -505,17 +538,30 @@ class SubprocessExecutor(BaseExecutor):
     def _handle_shell(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
         cmd = args.get("command", "echo 'no command'")
         t = args.get("timeout", timeout)
-        workdir = args.get("workdir")
+        # Model may pass timeout as string with suffix (e.g. "5s", "10s")
+        if isinstance(t, str):
+            t = t.rstrip("smSM").strip()
+            try:
+                t = int(t)
+            except (ValueError, TypeError):
+                t = timeout
+        workdir = self._resolve_workdir(args.get("workdir"))
         return _default_shell(cmd, t, workdir=workdir)
 
     def _handle_python(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
         code = args.get("code", "print('no code')")
         t = args.get("timeout", timeout)
+        if isinstance(t, str):
+            t = t.rstrip("smSM").strip()
+            try:
+                t = int(t)
+            except (ValueError, TypeError):
+                t = timeout
         return _default_python(code, t)
 
     def _handle_exec_command(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
         cmd = args.get("cmd", args.get("command", "bash"))
-        workdir = args.get("workdir")
+        workdir = self._resolve_workdir(args.get("workdir"))
         yield_time = args.get("yield_time", 5)
         sid, output = self._sessions.start(cmd, workdir, yield_time=yield_time)
         return output, "", 0
@@ -532,7 +578,7 @@ class SubprocessExecutor(BaseExecutor):
     # -- Tier 2: File operation handlers ------------------------------------
 
     def _handle_read_file(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
-        file_path = args.get("file_path", args.get("path", ""))
+        file_path = args.get("file_path", args.get("path", args.get("file", args.get("filename", ""))))
         line_numbers = args.get("line_numbers", True)
         if not file_path:
             return "", "No file_path provided", 1
@@ -542,7 +588,7 @@ class SubprocessExecutor(BaseExecutor):
 
     def _handle_grep(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
         pattern = args.get("pattern", "")
-        path = args.get("path", ".")
+        path = args.get("path", self._resolve_default_workdir() or ".")
         include = args.get("include", "")
         if not pattern:
             return "", "No pattern provided", 1
@@ -553,7 +599,7 @@ class SubprocessExecutor(BaseExecutor):
 
     def _handle_file_search(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
         pattern = args.get("pattern", "*")
-        path = args.get("path", ".")
+        path = args.get("path", self._resolve_default_workdir() or ".")
         cmd = f"find {shlex.quote(path)} -name {shlex.quote(pattern)} 2>/dev/null"
         return _default_shell(cmd, timeout)
 
@@ -575,19 +621,174 @@ class SubprocessExecutor(BaseExecutor):
             except OSError:
                 pass
 
+    def _resolve_patch_path(self, path: str) -> str:
+        """Resolve patch path under the challenge workspace."""
+        raw = str(path or "").strip()
+        if not raw:
+            raise ValueError("Patch path is empty")
+        base = os.path.abspath(self._resolve_default_workdir() or os.getcwd())
+        candidate = (
+            os.path.abspath(raw)
+            if os.path.isabs(raw)
+            else os.path.abspath(os.path.join(base, raw))
+        )
+        if candidate != base and not candidate.startswith(base + os.sep):
+            raise ValueError(f"Patch path escapes workspace: {raw}")
+        return candidate
+
+    @staticmethod
+    def _apply_boxpwnr_update_block(original_text: str, block_lines: List[str]) -> str:
+        """Apply BoxPwnr update-hunk lines to file content."""
+        hunks: List[List[tuple[str, str]]] = [[]]
+        for raw in block_lines:
+            if raw.startswith("@@"):
+                if hunks[-1]:
+                    hunks.append([])
+                continue
+            if raw == "*** End of File":
+                continue
+            if not raw:
+                raise ValueError("Malformed update hunk: empty line without prefix")
+            op = raw[0]
+            if op not in {" ", "+", "-"}:
+                raise ValueError(f"Malformed update hunk line: {raw}")
+            hunks[-1].append((op, raw[1:]))
+        if not hunks[-1]:
+            hunks = [h for h in hunks if h]
+
+        src_lines = original_text.splitlines()
+        out_lines: List[str] = []
+        cursor = 0
+
+        def _find_line(value: str, start: int) -> int:
+            for idx in range(start, len(src_lines)):
+                if src_lines[idx] == value:
+                    return idx
+            return -1
+
+        for ops in hunks:
+            anchor = next((text for op, text in ops if op in {" ", "-"}), None)
+            if anchor is not None:
+                anchor_pos = _find_line(anchor, cursor)
+                if anchor_pos < 0:
+                    raise ValueError(f"Failed to find hunk anchor line: {anchor!r}")
+                out_lines.extend(src_lines[cursor:anchor_pos])
+                cursor = anchor_pos
+
+            for op, text in ops:
+                if op == " ":
+                    if cursor >= len(src_lines) or src_lines[cursor] != text:
+                        got = src_lines[cursor] if cursor < len(src_lines) else "<eof>"
+                        raise ValueError(
+                            f"Context mismatch while applying patch: expected {text!r}, got {got!r}"
+                        )
+                    out_lines.append(src_lines[cursor])
+                    cursor += 1
+                elif op == "-":
+                    if cursor >= len(src_lines) or src_lines[cursor] != text:
+                        got = src_lines[cursor] if cursor < len(src_lines) else "<eof>"
+                        raise ValueError(
+                            f"Delete mismatch while applying patch: expected {text!r}, got {got!r}"
+                        )
+                    cursor += 1
+                else:  # "+"
+                    out_lines.append(text)
+
+        out_lines.extend(src_lines[cursor:])
+        new_text = "\n".join(out_lines)
+        if original_text.endswith("\n") or new_text:
+            new_text += "\n"
+        return new_text
+
     def _apply_boxpwnr_patch(self, patch: str, timeout: int) -> tuple[str, str, int]:
-        results = []
-        for line in patch.splitlines():
-            line = line.strip()
-            if line.startswith("*** Add File:"):
-                path = line.split(":", 1)[1].strip()
-                results.append(f"Would add file: {path}")
-            elif line.startswith("*** Update File:"):
-                path = line.split(":", 1)[1].strip()
-                results.append(f"Would update file: {path}")
-            elif line.startswith("*** Delete File:"):
-                path = line.split(":", 1)[1].strip()
-                results.append(f"Would delete file: {path}")
+        del timeout  # Not used; apply is local filesystem mutation.
+        lines = patch.splitlines()
+        if not lines or lines[0].strip() != "*** Begin Patch":
+            return "", "Invalid patch: missing '*** Begin Patch' header", 1
+
+        i = 1
+        results: List[str] = []
+        try:
+            while i < len(lines):
+                line = lines[i]
+                if line.startswith("*** End Patch"):
+                    break
+
+                if line.startswith("*** Add File: "):
+                    rel = line.split(":", 1)[1].strip()
+                    dst = self._resolve_patch_path(rel)
+                    i += 1
+                    added: List[str] = []
+                    while i < len(lines) and not lines[i].startswith("*** "):
+                        if not lines[i].startswith("+"):
+                            raise ValueError(f"Invalid add-file line (missing '+'): {lines[i]}")
+                        added.append(lines[i][1:])
+                        i += 1
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    with open(dst, "w", encoding="utf-8") as f:
+                        f.write("\n".join(added))
+                        if added:
+                            f.write("\n")
+                    results.append(f"Added file: {rel}")
+                    continue
+
+                if line.startswith("*** Delete File: "):
+                    rel = line.split(":", 1)[1].strip()
+                    dst = self._resolve_patch_path(rel)
+                    if os.path.isdir(dst) and not os.path.islink(dst):
+                        shutil.rmtree(dst)
+                    elif os.path.exists(dst):
+                        os.remove(dst)
+                    results.append(f"Deleted file: {rel}")
+                    i += 1
+                    continue
+
+                if line.startswith("*** Update File: "):
+                    rel = line.split(":", 1)[1].strip()
+                    src = self._resolve_patch_path(rel)
+                    if not os.path.exists(src):
+                        raise ValueError(f"Update target does not exist: {rel}")
+                    i += 1
+
+                    move_to: Optional[str] = None
+                    if i < len(lines) and lines[i].startswith("*** Move to: "):
+                        move_to = lines[i].split(":", 1)[1].strip()
+                        i += 1
+
+                    block: List[str] = []
+                    while i < len(lines):
+                        nxt = lines[i]
+                        if nxt.startswith("*** End Patch"):
+                            break
+                        if nxt.startswith("*** Add File: ") or nxt.startswith("*** Delete File: ") or nxt.startswith("*** Update File: "):
+                            break
+                        block.append(nxt)
+                        i += 1
+
+                    with open(src, "r", encoding="utf-8") as f:
+                        old = f.read()
+                    new = self._apply_boxpwnr_update_block(old, block)
+
+                    dst = src
+                    if move_to:
+                        dst = self._resolve_patch_path(move_to)
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    with open(dst, "w", encoding="utf-8") as f:
+                        f.write(new)
+                    if move_to and os.path.abspath(dst) != os.path.abspath(src):
+                        if os.path.exists(src):
+                            os.remove(src)
+                        results.append(f"Updated file: {rel} -> {move_to}")
+                    else:
+                        results.append(f"Updated file: {rel}")
+                    continue
+
+                raise ValueError(f"Unsupported patch directive: {line}")
+        except Exception as exc:
+            return "", f"Failed to apply patch: {exc}", 1
+
+        if i >= len(lines) or not any(l.startswith("*** End Patch") for l in lines[i:]):
+            return "", "Invalid patch: missing '*** End Patch' footer", 1
         return "\n".join(results) if results else "Patch applied", "", 0
 
     # -- Tier 3: Meta handlers ----------------------------------------------
@@ -691,5 +892,3 @@ class RemoteBatchExecutor(BaseExecutor):
 
     def close(self) -> None:
         pass
-
-ToolExecutor = SubprocessExecutor

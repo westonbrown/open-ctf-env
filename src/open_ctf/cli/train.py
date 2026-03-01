@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "training.yaml"
+DEFAULT_CONFIG = Path(__file__).resolve().parent.parent.parent.parent / "configs" / "training" / "training.yaml"
 
 
 def load_config(path: Path) -> dict:
@@ -200,9 +200,48 @@ def _add_online_rl_args(parser: argparse.ArgumentParser) -> None:
         help="Dotted path to a StepAgent class for tool execution (e.g. my_module.MyAgent)",
     )
     parser.add_argument(
+        "--agent-runtime-cmd",
+        default=None,
+        help=(
+            "Optional external BYO runtime command for DefaultStepAgent. "
+            "Command receives JSON payload on stdin and must print JSON on stdout."
+        ),
+    )
+    parser.add_argument(
+        "--agent-runtime-timeout",
+        type=int,
+        default=None,
+        help="Timeout in seconds for --agent-runtime-cmd invocations.",
+    )
+    parser.add_argument(
+        "--agent-runtime-workdir",
+        default=None,
+        help="Working directory for --agent-runtime-cmd execution.",
+    )
+    parser.add_argument(
+        "--agent-runtime-passthrough",
+        action="store_true",
+        help=(
+            "Let external runtime fully control observations/done "
+            "(skip local ToolExecutor execution in DefaultStepAgent)."
+        ),
+    )
+    parser.add_argument(
+        "--agent-runtime-no-fallback",
+        action="store_true",
+        help=(
+            "Disable fallback to native parse_tool_calls when external runtime fails."
+        ),
+    )
+    parser.add_argument(
         "--target-map",
         default=None,
         help="Optional challenge target map JSON used by preflight checks.",
+    )
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host used for registry target resolution checks in preflight.",
     )
     parser.add_argument(
         "--skip-preflight",
@@ -232,7 +271,7 @@ def _run_online_rl_preflight(args: argparse.Namespace) -> None:
         "-m",
         "open_ctf.cli.validate_pipeline",
         "--mode",
-        "grpo-preflight",
+        "online-rl-preflight",
         "--online-rl-data",
         args.data,
     ]
@@ -240,6 +279,8 @@ def _run_online_rl_preflight(args: argparse.Namespace) -> None:
         cmd.extend(["--challenge-registry", args.challenge_registry])
     if getattr(args, "target_map", None):
         cmd.extend(["--target-map", args.target_map])
+    if getattr(args, "host", None):
+        cmd.extend(["--host", args.host])
     if not getattr(args, "allow_missing_manifest", False):
         cmd.append("--require-manifest")
     if getattr(args, "require_target_map_coverage", False):
@@ -250,10 +291,31 @@ def _run_online_rl_preflight(args: argparse.Namespace) -> None:
 
 
 def cmd_rl(args: argparse.Namespace) -> None:
-    """Run stage-2 online RL training (``grpo`` remains a CLI alias)."""
+    """Run stage-2 online RL training."""
     from open_ctf.training.online_rl import train_online_rl
 
     config = load_config(args.config)
+    online_rl_cfg = config.get("online_rl")
+    if not isinstance(online_rl_cfg, dict):
+        online_rl_cfg = {}
+        config["online_rl"] = online_rl_cfg
+    agent_kwargs = online_rl_cfg.get("agent_kwargs")
+    if not isinstance(agent_kwargs, dict):
+        agent_kwargs = {}
+        online_rl_cfg["agent_kwargs"] = agent_kwargs
+
+    # CLI runtime overrides (hybrid BYO runtime mode).
+    if args.agent_runtime_cmd:
+        agent_kwargs["runtime_cmd"] = args.agent_runtime_cmd
+    if args.agent_runtime_timeout is not None:
+        agent_kwargs["runtime_timeout_seconds"] = int(args.agent_runtime_timeout)
+    if args.agent_runtime_workdir:
+        agent_kwargs["runtime_workdir"] = args.agent_runtime_workdir
+    if args.agent_runtime_passthrough:
+        agent_kwargs["runtime_passthrough"] = True
+    if args.agent_runtime_no_fallback:
+        agent_kwargs["runtime_fallback_to_parser"] = False
+
     _run_online_rl_preflight(args)
 
     train_online_rl(
@@ -370,18 +432,11 @@ def main() -> None:
     # -- stage-2 online RL (SkyRL) ---------------------------------------
     rl_parser = subparsers.add_parser(
         "rl",
-        help="Run stage-2 online RL via SkyRL (preferred command)",
+        aliases=["grpo"],
+        help="Run stage-2 online RL via SkyRL",
     )
     _add_online_rl_args(rl_parser)
     rl_parser.set_defaults(func=cmd_rl)
-
-    # Backward-compatible alias for existing scripts/users.
-    grpo_parser = subparsers.add_parser(
-        "grpo",
-        help="Legacy alias for 'rl' (online RL via SkyRL)",
-    )
-    _add_online_rl_args(grpo_parser)
-    grpo_parser.set_defaults(func=cmd_rl)
 
     # -- gepa (unchanged) -------------------------------------------------
     gepa_parser = subparsers.add_parser(
