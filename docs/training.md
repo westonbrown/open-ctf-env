@@ -9,7 +9,7 @@ flowchart LR
     traces["BoxPwnr traces"] --> convert["Convert traces"] --> split["Split datasets"]
     split -->|"successes"| sft_data["SFT data"]
     split -->|"all + flags"| grpo_data["GRPO data"]
-    sft_data --> sft["SFT stage<br/>(LlamaFactory or TRL)"]
+    sft_data --> sft["SFT stage<br/>(TRL)"]
     sft --> merge["Merge LoRA"]
     merge --> grpo["GRPO stage<br/>(SkyRL)"]
     grpo_data --> grpo
@@ -30,7 +30,7 @@ flowchart LR
 
 | Stage | Framework | What It Does | Weight Updates |
 |-------|-----------|--------------|----------------|
-| **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) / [TRL](https://github.com/huggingface/trl) | YAML-driven LlamaFactory SFT by default, with TRL backend support for newer model families (for example Qwen3.5). | Yes |
+| **1. SFT** | [TRL](https://github.com/huggingface/trl) | YAML-driven TRL SFT backend for extensive model support (including Qwen3.5). | Yes |
 | **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online RL with live tool execution via ToolExecutor (subprocess). Ray-based, vLLM, DAPO. | Yes |
 | **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection. Pareto-based candidate selection. ~6% better than GRPO with 4-35x fewer rollouts. | No |
 
@@ -90,7 +90,7 @@ open-ctf-split \
 
 ## Stage 1: Supervised Fine-Tuning (SFT)
 
-SFT uses **LlamaFactory by default** to teach domain knowledge, tool schemas, and reasoning patterns. For newer model families requiring newer Transformers support (for example Qwen3.5), use the **TRL backend** via `--backend trl`.
+SFT uses the **TRL backend** to teach domain knowledge, tool schemas, and reasoning patterns.
 
 ### Quick Start
 
@@ -100,25 +100,19 @@ open-ctf-train sft \
     --data data/sft.jsonl \
     --output outputs/sft
 
-# Example: force TRL backend (Qwen3.5+ and other newer models)
-open-ctf-train sft \
-    --model Qwen/Qwen3.5-27B \
-    --data data/sft.jsonl \
-    --output outputs/sft-qwen35 \
-    --backend trl
+
 ```
 
 ### Configuration
 
-Model-specific configs live in `configs/llamafactory/`:
+Model-specific configs live in `configs/training/`:
 
-| Model | Config | Template | Tool Format | Notes |
-|-------|--------|----------|-------------|-------|
-| **Nanbeige4.1-3B** | `nanbeige_3b.yaml` | `chatml` | `qwen` | Default, 3B dense, QLoRA 4-bit |
-| **GLM-4.7-Flash** | `glm47_flash.yaml` | `glm4_7` | `glm4_moe` | MoE, BF16 LoRA, batch_size=1 |
-| **Devstral-Small-2-24B** | `devstral_24b.yaml` | `mistral` | (default) | Dense, QLoRA 4-bit |
+| Model | Config | Notes |
+|-------|--------|-------|
+| **Nanbeige4.1-3B** | `training.yaml` | Default, 3B dense, QLoRA 4-bit |
+| **Qwen3.5-27B** | `training_qwen35_27b.yaml`| Fast, dense model|
 
-Example config (`configs/llamafactory/nanbeige_3b.yaml`):
+Example config (`configs/training/training_qwen35_27b.yaml`):
 
 ```yaml
 model_name_or_path: Nanbeige/Nanbeige4.1-3B
@@ -422,11 +416,8 @@ open-ctf-export --adapter outputs/online_rl/final --base-model Nanbeige/Nanbeige
 ## Docker Training
 
 ```bash
-# Stage 1: SFT (LlamaFactory image)
+# Stage 1: SFT
 docker compose run --rm sft
-
-# Stage 1: SFT (TRL backend image, for newer model families)
-docker compose run --rm sft-trl
 
 # Merge LoRA
 docker compose run --rm merge

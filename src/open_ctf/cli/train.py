@@ -2,15 +2,15 @@
 """Open CTF training CLI.
 
 3-stage pipeline:
-  Stage 1 (SFT):       LlamaFactory/TRL
+  Stage 1 (SFT):       TRL
   Stage 2 (online RL): SkyRL (GRPO/RLOO style policy updates)
   Stage 3 (GEPA):      DSPy prompt evolution, no weight updates
 
 Usage:
-    # Stage 1: SFT via LlamaFactory
-    open-ctf-train sft \\
-        --model Nanbeige/Nanbeige4.1-3B \\
-        --data data/sft.jsonl \\
+    # Stage 1: SFT via TRL
+    open-ctf-train sft \
+        --model Nanbeige/Nanbeige4.1-3B \
+        --data data/sft.jsonl \
         --output outputs/sft
 
     # Stage 2: online RL via SkyRL (requires SFT merged model)
@@ -145,36 +145,12 @@ def _patch_merged_tokenizer_config(base_model_id: str, output_dir: str) -> bool:
 # -----------------------------------------------------------------------
 
 
-def _auto_detect_backend(model_id: str) -> str:
-    """Auto-detect the best SFT backend for a given model.
-
-    Defaults to 'trl' — uses the model's native tokenizer.apply_chat_template()
-    which guarantees correct tool call formatting, thinking block handling, and
-    special token rendering for any HuggingFace model.
-
-    Use 'llamafactory' only when its extra features (DeepSpeed ZeRO, neat_packing,
-    built-in tool format adapters) are specifically needed.
-    """
-    return "trl"
-
-
 def cmd_sft(args: argparse.Namespace) -> None:
-    """Run SFT training via LlamaFactory or TRL (selectable backend)."""
+    """Run SFT training via TRL."""
     config = load_config(args.config)
     model_id = args.model or config.get("model", {}).get("name", "Nanbeige/Nanbeige4.1-3B")
 
-    # Resolve backend: explicit flag > config > auto-detect
-    backend = (
-        args.backend
-        or config.get("sft", {}).get("backend")
-        or _auto_detect_backend(model_id)
-    )
-    logger.info("SFT backend: %s", backend)
-
-    if backend == "trl":
-        from open_ctf.training.sft import train_sft_trl as train_sft
-    else:
-        from open_ctf.training.sft import train_sft
+    from open_ctf.training.sft.trl import train_sft
 
     train_sft(
         model_id=model_id,
@@ -411,22 +387,16 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # -- sft (LlamaFactory) -----------------------------------------------
+    # -- sft (TRL) --------------------------------------------------------
     sft_parser = subparsers.add_parser(
         "sft",
-        help="Run SFT (--backend trl for Qwen3.5+, llamafactory for others)",
+        help="Run SFT via TRL",
     )
     sft_parser.add_argument("--model", default=None, help="HF model id (overrides config)")
     sft_parser.add_argument("--data", required=True, help="Path to SFT JSONL data")
     sft_parser.add_argument("--val-data", default=None, help="Path to validation JSONL")
     sft_parser.add_argument("--output", required=True, help="Output directory")
     sft_parser.add_argument("--resume", default=None, help="Resume from checkpoint")
-    sft_parser.add_argument(
-        "--backend",
-        choices=["trl", "llamafactory"],
-        default=None,
-        help="SFT backend (default: auto-detect from model — trl for Qwen3.5+, llamafactory for others)",
-    )
     sft_parser.set_defaults(func=cmd_sft)
 
     # -- stage-2 online RL (SkyRL) ---------------------------------------

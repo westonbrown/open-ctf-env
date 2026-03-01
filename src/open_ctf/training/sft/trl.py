@@ -1,21 +1,13 @@
 """TRL-based Supervised Fine-Tuning (SFT) stage.
 
-Drop-in alternative to the LlamaFactory SFT backend for models that require
-``transformers >= 5.2.0`` (e.g. Qwen3.5-27B with Gated DeltaNet attention).
+SFT backend for models that require ``transformers >= 5.2.0`` (e.g. Qwen3.5-27B).
 
-Uses vanilla HuggingFace ``SFTTrainer`` (TRL) + ``peft`` LoRA directly,
-bypassing LlamaFactory entirely.  Same ``train_sft()`` signature so the CLI
-can route between backends with ``--backend trl|llamafactory``.
+Uses vanilla HuggingFace ``SFTTrainer`` (TRL) + ``peft`` LoRA.
 
 Advantages:
   - No pinned ``transformers`` ceiling — works with any HF-supported model
   - Native ``tokenizer.apply_chat_template()`` formatting (model-specific)
   - Simpler dependency surface (trl + peft + transformers + torch)
-
-Limitations vs LlamaFactory:
-  - No built-in tool format adapters (relies on the tokenizer's own template)
-  - No built-in DeepSpeed ZeRO integration (single-GPU focus for B200)
-  - No built-in ``neat_packing`` (uses TRL's packing instead)
 """
 
 import json
@@ -60,11 +52,11 @@ def _load_model_config(model_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
         "epochs": sft_cfg.get("epochs", 3),
         "batch_size": sft_cfg.get("batch_size", 1),
         "gradient_accumulation_steps": sft_cfg.get("gradient_accumulation_steps", 8),
-        "learning_rate": sft_cfg.get("learning_rate", 2e-4),
+        "learning_rate": sft_cfg.get("learning_rate", 2e-5),
         "warmup_ratio": sft_cfg.get("warmup_ratio", 0.03),
         "weight_decay": sft_cfg.get("weight_decay", 0.01),
         "lr_scheduler_type": sft_cfg.get("lr_scheduler_type", "cosine"),
-        "packing": sft_cfg.get("packing", True),
+        "packing": sft_cfg.get("packing", False),
         "flash_attn": sft_cfg.get("flash_attn", True),
         "gradient_checkpointing": sft_cfg.get("gradient_checkpointing", True),
         "tf32": sft_cfg.get("tf32", False),
@@ -190,9 +182,6 @@ def train_sft(
 ) -> str:
     """Run SFT training via TRL SFTTrainer + peft LoRA.
 
-    Drop-in replacement for the LlamaFactory ``train_sft()`` — same
-    signature, same config format, different backend.
-
     Args:
         model_id: HuggingFace model identifier or local path.
         data_path: Path to JSONL training data (OpenAI messages format).
@@ -211,7 +200,7 @@ def train_sft(
         BitsAndBytesConfig,
     )
     from peft import LoraConfig, TaskType
-    from trl import SFTConfig, SFTTrainer
+    from trl import SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM
 
     logger.info("=" * 60)
     logger.info("SFT TRAINING (TRL)")
@@ -385,6 +374,31 @@ def train_sft(
     if resume_from:
         sft_config.resume_from_checkpoint = resume_from
 
+    # CRITICAL: Prevent catastrophic forgetting by masking out User/System prompts
+    # Note: Qwen uses ChatML. If response_template cannot map directly due to tokenization, 
+    # we convert it to token list first to bypass sub-word boundary issues.
+    # Fallback to pure string if encode fails.
+    try:
+        response_template_ids = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        data_collator = DataCollatorForCompletionOnlyLM(
+            response_template=response_template_ids,
+            tokenizer=tokenizer,
+            mlm=False,
+        )
+    except Exception as e:
+        logger.warning(
+            "Could not initialize CompletionOnly collator with token IDs (%s). "
+            "Falling back to string matching, or no_masking.", e
+        )
+        try:
+            data_collator = DataCollatorForCompletionOnlyLM(
+                response_template="<|im_start|>assistant\n",
+                tokenizer=tokenizer,
+                mlm=False,
+            )
+        except Exception:
+            data_collator = None
+
     # 7. Train
     logger.info("Starting SFT training...")
     trainer = SFTTrainer(
@@ -394,6 +408,7 @@ def train_sft(
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         peft_config=lora_config,
+        data_collator=data_collator,
     )
     trainer.train(resume_from_checkpoint=resume_from)
 

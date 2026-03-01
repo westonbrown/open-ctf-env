@@ -1,6 +1,6 @@
 # Contributing to Open CTF Environment
 
-Open CTF Environment is a pipeline for post-training security LLMs on CTF challenge trajectories. It combines LlamaFactory for supervised fine-tuning, SkyRL for online reinforcement learning with live tool execution, and GEPA for prompt evolution -- producing locally deployable security agents from open-weight models.
+Open CTF Environment is a pipeline for post-training security LLMs on CTF challenge trajectories. It combines TRL for supervised fine-tuning, SkyRL for online reinforcement learning with live tool execution, and GEPA for prompt evolution -- producing locally deployable security agents from open-weight models.
 
 ## Development Setup
 
@@ -13,7 +13,7 @@ pip install -e ".[dev]"
 For training stages, install the relevant extras:
 
 ```bash
-pip install -e ".[sft]"    # Stage 1: LlamaFactory SFT
+pip install -e ".[sft]"    # Stage 1: TRL SFT
 pip install -e ".[grpo]"   # Stage 2: SkyRL GRPO
 pip install -e ".[gepa]"   # Stage 3: GEPA prompt evolution
 ```
@@ -41,7 +41,7 @@ The project has three training stages, each backed by a dedicated framework:
 
 | Stage | Framework | Purpose |
 |-------|-----------|---------|
-| **SFT** | [LlamaFactory](https://github.com/hiyouga/LLaMA-Factory) | Supervised fine-tuning on expert CTF traces |
+| **SFT** | [TRL](https://github.com/huggingface/trl) | Supervised fine-tuning on expert CTF traces |
 | **GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online reinforcement learning with live tool execution |
 | **GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) + [GEPA](https://arxiv.org/abs/2507.19457) | Prompt evolution (no weight updates) |
 
@@ -49,12 +49,12 @@ The environment server ([OpenEnv](https://github.com/OpenEnvs/OpenEnv)) provides
 
 ## Adding a New Model
 
-1. Create a LlamaFactory SFT config at `configs/llamafactory/<model>.yaml`.
-2. Create a SkyRL GRPO config at `configs/skyrl/<model>.yaml`.
+1. Create a training config at `configs/training/<model>.yaml`.
+2. Configure the TRL SFT parameters and SkyRL GRPO parameters.
 3. If the model uses a non-standard chat template, add a formatter in `src/open_ctf/formatters/`.
 4. Test with the validation pipeline: `open-ctf-validate`.
 
-See existing configs (`nanbeige_3b.yaml`, `glm47_flash.yaml`, `devstral_24b.yaml`) for reference.
+See existing configs (e.g., `training_qwen35_27b.yaml`) for reference.
 
 ## Adding a New Benchmark
 

@@ -19,7 +19,7 @@ cd open-ctf-env
 # Install core only
 pip install -e .
 
-# For SFT training (LlamaFactory)
+# For SFT training (TRL)
 pip install -e ".[sft]"
 
 # For GRPO training (SkyRL + Ray)
@@ -90,7 +90,7 @@ open-ctf-split --input data/combined.jsonl
 ### Train a Model (3-Stage Pipeline)
 
 ```bash
-# Stage 1: SFT via LlamaFactory
+# Stage 1: SFT via TRL
 open-ctf-train sft \
     --model Nanbeige/Nanbeige4.1-3B \
     --data data/sft.jsonl \

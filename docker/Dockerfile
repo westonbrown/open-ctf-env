@@ -2,13 +2,18 @@
 #
 # Multi-stage build with targets for each pipeline stage:
 #   - base:      Core package (data tools, reward, formatters, ToolExecutor)
-#   - sft:       LlamaFactory-based SFT + merge + validate + export
-#   - sft-trl:   TRL-based SFT for Qwen3.5+/newer Transformers models
-#   - grpo:      SkyRL GRPO + Ray + vLLM
+#   - sft:       TRL-based SFT (transformers>=5.2.0 for Qwen3.5)
+#   - grpo:      SkyRL GRPO + Ray + vLLM nightly (Qwen3.5 support)
+#
+# Required versions (Qwen3.5 hybrid linear-attention):
+#   - PyTorch:        >=2.10.0 (cu128)
+#   - transformers:   >=5.2.0  (Qwen3_5ForConditionalGeneration)
+#   - vLLM:           nightly  (>=0.16.1rc1 from wheels.vllm.ai/nightly)
+#   - causal-conv1d:  ==1.6.0  (ABI must match PyTorch version)
+#   - flash-linear-attention: ==0.4.1
 #
 # Build:
 #   docker build -t open-ctf:sft      --target sft      -f docker/Dockerfile .
-#   docker build -t open-ctf:sft-trl  --target sft-trl  -f docker/Dockerfile .
 #   docker build -t open-ctf:grpo     --target grpo     -f docker/Dockerfile .
 #
 # Run:
@@ -17,6 +22,7 @@
 
 # ============================================================
 # Base stage -- shared across all targets
+# NGC PyTorch 25.11 provides CUDA 12.8, torch 2.9.1+cu128, NCCL
 # ============================================================
 FROM nvcr.io/nvidia/pytorch:25.11-py3 AS base
 
@@ -41,22 +47,13 @@ RUN pip install --no-cache-dir -e ".[dev]"
 ENV PYTHONPATH=/workspace/open-ctf-env/src:$PYTHONPATH
 
 # ============================================================
-# SFT stage — LlamaFactory + merge + validate + export
+# SFT stage — TRL backend (transformers>=5.2.0 for Qwen3.5)
 # ============================================================
 FROM base AS sft
 
-RUN pip install --no-cache-dir -e ".[sft]"
-
-CMD ["open-ctf-train", "sft", "--help"]
-
-# ============================================================
-# SFT-TRL stage — TRL backend for newer model families
-# ============================================================
-FROM base AS sft-trl
-
 RUN pip install --no-cache-dir -e ".[sft-trl]"
 
-CMD ["open-ctf-train", "sft", "--backend", "trl", "--help"]
+CMD ["open-ctf-train", "sft", "--help"]
 
 # ============================================================
 # GRPO stage — SkyRL + Ray + vLLM

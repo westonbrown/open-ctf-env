@@ -1620,7 +1620,7 @@ def _build_skyrl_config(
     generation_stop = online_rl_cfg.get("generation_stop")
     if generation_stop is not None and not isinstance(generation_stop, list):
         generation_stop = [str(generation_stop)]
-    tool_call_format = str(online_rl_cfg.get("tool_call_format", "hermes")).strip() or "hermes"
+    tool_call_format = str(online_rl_cfg.get("tool_call_format", "qwen3_coder")).strip() or "qwen3_coder"
 
     eval_generation_temperature = _as_float(
         "online_rl.eval_generation_temperature",

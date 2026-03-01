@@ -5,7 +5,7 @@ from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
 def test_tokenizer_drift_schema_injection():
     """
     Test that the tool schema injection in OpenCTFTextEnv matches the exact
-    expected string format used during SFT (e.g. by LlamaFactory or formatters).
+    expected string format used during SFT (e.g. by TRL or formatters).
     This ensures no token drift occurs between offline SFT and online GRPO.
     """
     env = OpenCTFTextEnv(

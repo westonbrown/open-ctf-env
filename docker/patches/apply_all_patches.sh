@@ -1,5 +1,5 @@
 #!/bin/bash
-# Apply all patches for GB10 training (SkyRL + LlamaFactory).
+# Apply all patches for GB10 training (SkyRL).
 # Run this inside the container after installing dependencies.
 #
 # Usage: bash docker/patches/apply_all_patches.sh
@@ -66,13 +66,6 @@ run_patch "ray_collective_compat" optional python3 "$PATCH_DIR/patch_ray_collect
 # 9. flash_attn stub (real flash_attn not compiled for GB10 sm_121a)
 run_patch "flash_attn_stub" optional python3 "$PATCH_DIR/patch_flash_attn_stub.py"
 
-# 10. torchaudio stub (NGC PyTorch ABI incompatibility)
-run_patch "torchaudio_stub" optional python3 "$PATCH_DIR/patch_torchaudio_stub.py"
-
-# --- LlamaFactory patches (for SFT) ---
-
-# 11. tool_calls None guard (HuggingFace datasets schema normalization)
-run_patch "llamafactory_tool_calls" optional python3 "$PATCH_DIR/patch_llamafactory_tool_calls.py"
 
 # --- SkyRL step-wise trajectory fixes ---
 
@@ -114,7 +107,7 @@ run_patch "skyrl_chat_template_kwargs" optional python3 "$PATCH_DIR/patch_skyrl_
 echo ""
 echo "Clearing __pycache__..."
 SITE_PACKAGES="$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))' 2>/dev/null || echo '/usr/local/lib/python3.12/dist-packages')"
-for pkg in skyrl_train llamafactory vllm ray flash_attn; do
+for pkg in skyrl_train vllm ray flash_attn; do
     find "$SITE_PACKAGES/$pkg" -name "*.pyc" -delete 2>/dev/null || true
 done
 echo "   Done"

@@ -51,11 +51,11 @@ sft:
   batch_size: 1
   gradient_accumulation_steps: 8
   # Effective batch: 1 * 8 = 8
-  learning_rate: 2.0e-4
+  learning_rate: 2.0e-5
   warmup_ratio: 0.03
   weight_decay: 0.01
   lr_scheduler_type: cosine
-  packing: true
+  packing: false
   # Flash Attention: B200 HBM3e supports FA natively.
   flash_attn: true
   use_sample_packing: false

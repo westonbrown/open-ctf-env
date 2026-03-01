@@ -382,14 +382,6 @@ def main() -> None:
         errors,
     )
     _compile_first_existing(
-        "src/open_ctf/training/sft/llamafactory.py",
-        [
-            SRC_DIR / "open_ctf" / "training" / "sft" / "llamafactory.py",
-            SRC_DIR / "open_ctf" / "training" / "sft.py",
-        ],
-        errors,
-    )
-    _compile_first_existing(
         "src/open_ctf/training/sft/trl.py",
         [
             SRC_DIR / "open_ctf" / "training" / "sft" / "trl.py",

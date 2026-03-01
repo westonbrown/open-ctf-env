@@ -1,6 +1,6 @@
 # Architecture
 
-Open CTF Environment is a **3-stage post-training pipeline** for fine-tuning LLMs on CTF challenge trajectories using [LlamaFactory](https://github.com/hiyouga/LlamaFactory) (SFT), [SkyRL](https://github.com/NovaSky-AI/SkyRL) (online GRPO), and [GEPA](https://arxiv.org/abs/2507.19457) (prompt evolution).
+Open CTF Environment is a **3-stage post-training pipeline** for fine-tuning LLMs on CTF challenge trajectories using [TRL](https://github.com/huggingface/trl) (SFT), [SkyRL](https://github.com/NovaSky-AI/SkyRL) (online GRPO), and [GEPA](https://arxiv.org/abs/2507.19457) (prompt evolution).
 
 ## System Overview
 
@@ -17,7 +17,7 @@ flowchart TB
 
     subgraph pipeline["3-Stage Training Pipeline"]
         direction TB
-        sft["Stage 1: SFT<br/>(LlamaFactory or TRL)"] -->|"LoRA adapter"| merge["Merge<br/>(PEFT)"]
+        sft["Stage 1: SFT<br/>(TRL)"] -->|"LoRA adapter"| merge["Merge<br/>(PEFT)"]
         merge -->|"Merged checkpoint"| grpo["Stage 2: Online GRPO<br/>(SkyRL)"]
         grpo -->|"Updated model"| gepa["Stage 3: GEPA<br/>(DSPy)"]
     end
@@ -70,7 +70,6 @@ src/open_ctf/
 │   └── reward.py                # CTFReward (8 signals + hallucination penalty)
 └── training/
     ├── sft/
-    │   ├── llamafactory.py      # LlamaFactory SFT backend
     │   └── trl.py               # TRL SFT backend
     ├── online_rl/
     │   ├── runtime.py           # SkyRL runtime + config conversion
@@ -81,7 +80,7 @@ src/open_ctf/
 configs/
 ├── challenges/
 │   └── cybench.yaml             # 40 CyBench challenges (25 docker + 15 static)
-├── llamafactory/                # Per-model SFT configs
+├── training/                    # Unified training configurations
 │   ├── nanbeige_3b.yaml
 │   ├── glm47_flash.yaml
 │   └── devstral_24b.yaml
@@ -186,12 +185,12 @@ flowchart LR
 ### Per-Framework Configs
 
 ```
-configs/llamafactory/<model>.yaml    ← LlamaFactory SFT (native YAML format)
+configs/training/<model>.yaml    ← TRL SFT (native YAML format)
 configs/skyrl/<model>.yaml           ← SkyRL GRPO (native YAML format)
 configs/challenges/<benchmark>.yaml  ← Challenge registry (custom YAML)
 ```
 
-LlamaFactory and SkyRL configs use each framework's native format directly — no translation layer.
+TRL and SkyRL configs use each framework's native format directly — no translation layer.
 
 ### Key Settings (Qwen3.5-27B, 48K Context)
 
@@ -213,12 +212,11 @@ LlamaFactory and SkyRL configs use each framework's native format directly — n
 
 ## Container Strategy
 
-Three Docker targets from a single multi-stage Dockerfile, separated to avoid dependency conflicts between LlamaFactory, TRL, and SkyRL transformer version pins:
+Two Docker targets from a single multi-stage Dockerfile, separated to avoid dependency conflicts:
 
 | Target | Base | Purpose |
 |--------|------|---------|
-| `sft` | `nvcr.io/nvidia/pytorch:25.11-py3` | LlamaFactory SFT + merge + validate + export |
-| `sft-trl` | `nvcr.io/nvidia/pytorch:25.11-py3` | TRL SFT backend for newer model families (for example Qwen3.5) |
+| `sft` | `nvcr.io/nvidia/pytorch:25.11-py3` | TRL SFT + merge + validate + export |
 | `grpo` | `nvcr.io/nvidia/pytorch:25.11-py3` | SkyRL GRPO + Ray + vLLM |
 
 ```bash
@@ -235,16 +233,15 @@ flowchart LR
     agent --> challenges["CyBench<br/>40 challenges"]
     challenges --> metrics["Solve rate<br/>Avg turns<br/>Avg time"]
 ```
-
 Evaluation uses the same BoxPwnr scaffold as data collection. The only variable is model weights — architecture, tools, and evaluation harness are held constant. The `CTFAgent` protocol supports pluggable agents: use `--agent boxpwnr` (default) or `--agent custom:module.Class`.
 
 ## Key Design Decisions
 
-### 1. LlamaFactory for SFT
+### 1. TRL for SFT
 
-**Problem**: Custom `sft.py` had Unsloth dependency, manual message normalization, and broke on new hardware.
+**Problem**: Fine-tuning across different LLM families securely usually requires many custom scripts.
 
-**Solution**: LlamaFactory handles tool formats, packing, multi-GPU, and LoRA natively via YAML config. 11 built-in tool format classes cover all model families. No Python code changes per experiment.
+**Solution**: The TRL backend natively supports model-specific configurations uniformly and scales appropriately. No Python code changes per experiment.
 
 ### 2. SkyRL for GRPO
 
@@ -262,7 +259,7 @@ Evaluation uses the same BoxPwnr scaffold as data collection. The only variable 
 
 **Problem**: Hardcoded model assumptions (MoE batch_size=1, BF16-only, specific template) made it difficult to test new architectures.
 
-**Solution**: All model-specific settings live in YAML configs. To add a model: create `configs/llamafactory/<model>.yaml` and `configs/skyrl/<model>.yaml`. No Python code changes.
+**Solution**: All model-specific settings live in YAML configs. To add a model: create `configs/training/<model>.yaml`. No Python code changes.
 
 ### 5. MoE-Aware Configuration
 
@@ -284,7 +281,7 @@ MoE models (GLM-4.7-Flash) have unique constraints documented in their config fi
 
 ### Adding New Models
 
-1. Create `configs/llamafactory/<model>.yaml` with SFT hyperparameters
+1. Create `configs/training/<model>.yaml` with SFT hyperparameters
 2. Create `configs/skyrl/<model>.yaml` with GRPO hyperparameters
 3. Add a formatter in `src/open_ctf/formatters/` if the chat template is non-standard
 4. Add detection logic to `formatters/base.py` factory method

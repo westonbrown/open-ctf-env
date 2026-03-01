@@ -1,9 +1,9 @@
 """Training modules for SFT, online RL, and GEPA stages.
 
-Imports are lazy to avoid requiring all dependencies (e.g. llamafactory,
+Imports are lazy to avoid requiring all dependencies (e.g. trl,
 skyrl, dspy) when only one training stage is used.
 
-SFT:  LlamaFactory-based supervised fine-tuning
+SFT:  TRL-based supervised fine-tuning
 online RL: SkyRL-based online reinforcement learning (GRPO/RLOO variants)
 GEPA: DSPy-based prompt evolution (no weight updates)
 """
@@ -12,7 +12,6 @@ import logging
 
 __all__ = [
     "train_sft",
-    "train_sft_trl",
     "train_online_rl",
     "run_gepa",
     "check_wandb_available",
@@ -50,9 +49,6 @@ def __getattr__(name):
     if name == "train_sft":
         from .sft import train_sft
         return train_sft
-    if name == "train_sft_trl":
-        from .sft import train_sft_trl
-        return train_sft_trl
     if name == "train_online_rl":
         train_online_rl = _import_online_rl()
         return train_online_rl

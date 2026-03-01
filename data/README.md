@@ -8,7 +8,7 @@ This folder contains the curated datasets used by the training pipeline.
 |---|---|
 | `sft_quality.jsonl` | Stage-1 supervised fine-tuning traces (high-quality solved trajectories). |
 | `online_rl_quality.jsonl` | Stage-2 online RL seed tasks (challenge prompts + metadata + `ground_truth_flag`). |
-| `dataset_info.json` | LlamaFactory dataset registration metadata (SFT-oriented). |
+| `dataset_info.json` | SFT dataset registration metadata. |
 
 ## What `online_rl_quality.jsonl` Is For
 

@@ -34,7 +34,7 @@ flowchart LR
 
     subgraph train["3) Train"]
         direction LR
-        sft["Stage 1: SFT<br/>(LlamaFactory or TRL)"] --> merge["Merge LoRA"]
+        sft["Stage 1: SFT<br/>(TRL)"] --> merge["Merge LoRA"]
         merge --> grpo["Stage 2: Online GRPO<br/>(SkyRL + ToolExecutor)"]
         grpo --> gepa["Stage 3: GEPA<br/>(prompt optimization)"]
     end
@@ -53,7 +53,7 @@ The same scaffold (BoxPwnr) runs both the baseline and fine-tuned models against
 
 | Stage | Framework | What It Does | Weight Updates |
 |-------|-----------|--------------|----------------|
-| **1. SFT** | [LlamaFactory](https://github.com/hiyouga/LlamaFactory) / [TRL](https://github.com/huggingface/trl) | Supervised fine-tuning on expert traces (LoRA). LlamaFactory for broad tool-format support, TRL backend for newer model families (for example Qwen3.5). | Yes |
+| **1. SFT** | [TRL](https://github.com/huggingface/trl) | Supervised fine-tuning on expert traces (LoRA). TRL backend provides native tokenizer formats and high-capacity processing. | Yes |
 | **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online reinforcement learning with live tool execution via ToolExecutor. Async Ray-based, vLLM inference, DAPO sampling. | Yes |
 | **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection -- no weight updates. Pareto-based candidate selection. Outperforms GRPO by ~6% with 4-35x fewer rollouts. | No |
 
@@ -110,9 +110,24 @@ GLM-4.7-Flash Q8_0 (30B MoE, ~3.6B active) evaluated on [CyBench](https://cybenc
 ### Requirements
 
 - Python 3.10+
-- PyTorch 2.4+ with CUDA support
 - Docker and Docker Compose
-- NVIDIA GPU with 24GB+ VRAM (60GB+ for GLM-4.7-Flash BF16 LoRA)
+- NVIDIA GPU with 24GB+ VRAM (140GB+ for Qwen3.5-27B BF16 on 2x GPUs)
+
+#### Dependency Matrix
+
+The pipeline has strict version requirements due to the Qwen3.5 hybrid linear-attention architecture:
+
+| Package | Version | Notes |
+|---------|---------|-------|
+| PyTorch | `>=2.10.0` (cu128) | Required by vLLM nightly and `causal_conv1d` ABI |
+| vLLM | Nightly (`>=0.16.1rc1`) | Qwen3.5 not in 0.16.0 stable. Install from `https://wheels.vllm.ai/nightly` |
+| transformers | `>=5.2.0` | `Qwen3_5ForConditionalGeneration` added in 5.2.0 |
+| flash-linear-attention | `==0.4.1` | Qwen3.5 Gated DeltaNet linear-attention fast path |
+| causal-conv1d | `==1.6.0` | Must be compiled against the same PyTorch version (ABI sensitive) |
+| SkyRL-Train | Source install | Pinned commit + 19 patches (see `docker/patches/`) |
+| Ray | `>=2.40.0` | With `RAY_memory_monitor_refresh_ms=0` for GPU pre-allocation |
+
+> **ABI Warning**: `causal_conv1d` wheels on PyPI are compiled against specific PyTorch builds. If you see `undefined symbol: _ZN3c104cuda29c10_cuda_check_implementation...`, rebuild from source: `CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install --no-deps causal-conv1d==1.6.0`. If the model still fails to load, uninstall `causal_conv1d` entirely — transformers will fall back to torch kernels (slower but functional for inference).
 
 ### Setup
 
@@ -120,33 +135,23 @@ GLM-4.7-Flash Q8_0 (30B MoE, ~3.6B active) evaluated on [CyBench](https://cybenc
 git clone https://github.com/westonbrown/open-ctf-env.git
 cd open-ctf-env
 
-# Install core + SFT dependencies
-pip install -e ".[sft]"
-
-# For newer model families (for example Qwen3.5), use TRL SFT backend deps
+# Install core + SFT dependencies (TRL backend)
 pip install -e ".[sft-trl]"
 
-# Or for GRPO (requires Ray + SkyRL)
+# For GRPO (requires Ray + SkyRL + vLLM nightly)
 pip install git+https://github.com/SkyRL-Team/SkyRL-Train.git
 pip install -e ".[grpo]"
+pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 
-# Or for GEPA
+# For GEPA
 pip install -e ".[gepa]"
 
 # Setup BoxPwnr for trace collection
 git clone https://github.com/0ca/BoxPwnr.git references/boxpwnr
 ```
 
-**Docker (Recommended for DGX/GPU servers)**
-```bash
-# SFT Builder (LlamaFactory + merge + export support)
-docker build -t open-ctf:sft --target sft -f docker/Dockerfile .
-
-# SFT Builder (TRL backend for Qwen3.5+ / newer Transformers)
-docker build -t open-ctf:sft-trl --target sft-trl -f docker/Dockerfile .
-
-# GRPO Builder (SkyRL + Ray + vLLM)
-docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
+See [Docker Setup](#docker-setup) for containerized deployment with all dependencies pre-resolved.
 ```
 
 ### Generate Training Data
@@ -181,7 +186,6 @@ open-ctf-train sft \
     --model Qwen/Qwen3.5-27B \
     --data data/sft.jsonl \
     --output outputs/sft-qwen35 \
-    --backend trl \
     --config configs/training/training_qwen35_27b.yaml
 
 # Merge LoRA adapter into base
@@ -266,29 +270,28 @@ The CTF reward for GRPO training uses **8 signals + 1 penalty**:
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
-| **Flag Capture** | 0.20 | `metadata.success` > exact match > pattern match (0.1) |
-| **Efficiency** | 0.20 | `min(optimal / actual, 1.0)` |
-| **Progression** | 0.12 | RECON -> ENUM -> EXPLOIT phase ordering |
-| **Exploration** | 0.08 | Novel tool usage weighted toward early trajectory |
-| **Uniqueness** | 0.08 | Command diversity (detects stuck loops) |
-| **Format** | 0.15 | Valid tool call structure and schema compliance |
-| **Recovery** | 0.07 | Recovers from failed commands and retries productively |
-| **Cognitive** | 0.10 | Reward for coherent reasoning/execution progression |
-| **Hallucination** | -0.10 | Penalty for `flag_found` calls with wrong flag |
+| **Flag Capture** | 0.40 | Exact flag match (1.0), pattern match (0.1), none (0.0) |
+| **Efficiency** | 0.15 | `min(optimal / actual, 1.0)` |
+| **Format** | 0.10 | Valid tool call structure and schema compliance |
+| **Recovery** | 0.09 | Recovers from failed commands and retries productively |
+| **Progression** | 0.08 | RECON -> ENUM -> EXPLOIT phase ordering |
+| **Cognitive** | 0.08 | Words-per-action density (optimal: 42 WPA) |
+| **Exploration** | 0.05 | Novel tool usage with temporal decay (gamma=0.95) |
+| **Uniqueness** | 0.05 | Command diversity (information entropy) |
+| **Hallucination** | -0.20 | Wrong flag decays all signals to 30% |
 
-All process signals are ungated -- they provide gradient signal regardless of flag capture.
+Flag credit requires explicit `flag_found` submission — no shortcut via `metadata.success`.
 
 ## Model-Agnostic Design
 
 Models are configured via YAML files, not hardcoded. The pipeline supports both dense and MoE architectures:
 
-| Model | Architecture | SFT Config | GRPO Config | Notes |
-|-------|-------------|------------|-------------|-------|
-| **Nanbeige4.1-3B** | Dense (LlamaForCausalLM) | `nanbeige_3b.yaml` | `nanbeige_3b.yaml` | Default test model, fast iteration |
-| **GLM-4.7-Flash** | MoE (30B, 3.6B active) | `glm47_flash.yaml` | `glm47_flash.yaml` | Production target, batch_size=1 for MoE |
-| **Devstral-Small-2-24B** | Dense (Mistral) | `devstral_24b.yaml` | (generated) | Dense alternative |
+| Model | Architecture | Config | Notes |
+|-------|-------------|--------|-------|
+| **Qwen3.5-27B** | Dense, hybrid attention (linear + full) | `training_qwen35_27b.yaml` | Current target. Requires transformers>=5.2.0, vLLM nightly |
+| **Nanbeige4.1-3B** | Dense (LlamaForCausalLM) | `training_smoke_2ch.yaml` | Smoke test model, fast iteration |
 
-To add a new model: create `configs/llamafactory/<model>.yaml` and `configs/skyrl/<model>.yaml`.
+To add a new model: create `configs/training/<model>.yaml`.
 
 ## GEPA Prompt Optimization (Stage 3)
 
@@ -353,12 +356,12 @@ flowchart LR
 open-ctf-env/
 ├── configs/
 │   ├── challenges/cybench.yaml      # 40 CyBench challenges (docker + static)
-│   ├── llamafactory/                # Per-model SFT configs
+│   ├── training/                    # Unified training configurations
 │   └── skyrl/                       # Per-model GRPO configs
 ├── data/                            # Training data (generated)
 │   ├── sft.jsonl                    # 820 successful traces
 │   ├── online_rl_cybench40.jsonl    # 87 CyBench traces with flags
-│   └── dataset_info.json            # LlamaFactory dataset metadata
+│   ├── dataset_info.json            # SFT dataset metadata
 ├── docker/Dockerfile                # Multi-stage (targets: base, sft, grpo)
 ├── src/open_ctf/
 │   ├── agent/                       # Pluggable agent protocol (CTFAgent)
@@ -373,7 +376,6 @@ open-ctf-env/
 │   ├── rewards/reward.py            # CTFReward (8 signals + penalty)
 │   └── training/
 │       ├── sft/
-│       │   ├── llamafactory.py      # LlamaFactory SFT backend
 │       │   └── trl.py               # TRL SFT backend
 │       ├── online_rl/
 │       │   ├── entrypoint.py        # Stage-2 online RL entrypoint
@@ -382,7 +384,7 @@ open-ctf-env/
 │       │   └── trajectory_logger.py # Rollout + reward telemetry
 │       └── gepa.py                  # GEPA prompt optimizer (DSPy)
 ├── tests/                           # Reward, executor, registry, drift tests
-└── references/                      # SkyRL, LlamaFactory, BoxPwnr sources
+└── references/                      # SkyRL, BoxPwnr sources
 ```
 
 ## BoxPwnr Tool Set
@@ -399,7 +401,7 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 
 | Command | Purpose |
 |---------|---------|
-| `open-ctf-train sft` | Stage 1: SFT via LlamaFactory |
+| `open-ctf-train sft` | Stage 1: SFT via TRL |
 | `open-ctf-train merge` | Merge LoRA adapter into base model |
 | `open-ctf-train rl` | Stage 2: Online GRPO via SkyRL |
 | `open-ctf-train gepa` | Stage 3: GEPA prompt optimization (no weight updates) |
@@ -416,7 +418,7 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 ### Phase 1: Pipeline + Infrastructure (Done)
 - [x] Lossless trace converter (tool-calling + chat-command formats)
 - [x] Training data: 820 SFT + 87 online GRPO traces from BoxPwnr across 8 platforms
-- [x] SFT Training with LlamaFactory
+- [x] SFT Training with TRL
 - [x] Multi-signal CTF reward function (8 signals + hallucination penalty)
 - [x] Online GRPO Training with SkyRL (Ray + vLLM)
 - [x] OpenCTF Gym Environment with direct Subprocess ToolExecutor
@@ -445,12 +447,72 @@ Training data, the reward function, the ToolExecutor, and the environment logic 
 - [ ] Upload weights to HuggingFace
 - [ ] Tag v1.0.0 release
 
+## Docker Setup
+
+The recommended way to run the pipeline with all dependencies pre-resolved.
+
+### Base Image
+
+All stages build on the [NGC PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch):
+
+```
+nvcr.io/nvidia/pytorch:25.11-py3
+```
+
+This provides CUDA 12.8, PyTorch 2.9.1+cu128, and NCCL. The GRPO stage upgrades PyTorch to 2.10.0 and installs vLLM nightly for Qwen3.5 support.
+
+### Build
+
+```bash
+# SFT stage (TRL + LoRA)
+docker build -t open-ctf:sft --target sft -f docker/Dockerfile .
+
+# GRPO stage (SkyRL + Ray + vLLM nightly + 19 patches)
+docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
+```
+
+### Run via Compose
+
+```bash
+# Stage 1: SFT
+MODEL=Qwen/Qwen3.5-27B docker compose run --rm sft
+
+# Merge LoRA adapter
+docker compose run --rm merge
+
+# Stage 2: Online GRPO
+docker compose run --rm grpo
+```
+
+See [`docker-compose.yaml`](docker-compose.yaml) for all services and environment variables.
+
+### Patches
+
+The GRPO stage applies **19 compatibility patches** for SkyRL 0.3.1 + vLLM + Ray 2.54. These are automatically applied during Docker build. For bare-metal installs, run:
+
+```bash
+bash docker/patches/apply_all_patches.sh
+```
+
+Patches must be re-applied after any `pip install` that upgrades SkyRL, vLLM, or Ray.
+
+### vLLM Serving (Qwen3.5)
+
+```bash
+vllm serve /path/to/qwen35-27b \
+  --max-model-len 8192 --dtype auto \
+  --gpu-memory-utilization 0.85 --trust-remote-code \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 --enforce-eager
+```
+
+> vLLM stable (0.16.0) does **not** support Qwen3.5. Use the nightly wheel: `pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly`
+
 ## Related Work
 
 - [CyBench](https://cybench.github.io/) -- Cybersecurity benchmark, 40 challenges, ICLR 2025 Oral ([paper](https://arxiv.org/abs/2408.08926))
 - [BoxPwnr](https://github.com/0ca/BoxPwnr) -- LLM-powered CTF solver (data collection + evaluation)
 - [SkyRL](https://github.com/NovaSky-AI/SkyRL) -- Ray-based RL training framework (online GRPO with vLLM)
-- [LlamaFactory](https://github.com/hiyouga/LlamaFactory) -- Unified fine-tuning framework (SFT backend)
 - [GEPA](https://arxiv.org/abs/2507.19457) -- Reflective prompt evolution, outperforms GRPO by ~6% (ICLR 2026 Oral)
 - [DSPy](https://github.com/stanfordnlp/dspy) -- Programming framework for LM pipelines (GEPA integration)
 - [DeepSeek R1](https://arxiv.org/abs/2501.12948) -- SFT → GRPO pipeline inspiration

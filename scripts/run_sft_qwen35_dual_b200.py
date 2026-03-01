@@ -18,7 +18,7 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from trl import SFTConfig, SFTTrainer
+from trl import SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM
 
 LOGGER = logging.getLogger("run_sft_qwen35_dual_b200")
 
@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--save-steps", type=int, default=25)
@@ -281,12 +281,28 @@ def main() -> None:
 
     sft_config = SFTConfig(**sft_kwargs)
 
+    # CRITICAL: Prevent catastrophic forgetting by masking out User/System prompts
+    # Note: Qwen uses ChatML. If response_template cannot map directly due to tokenization, 
+    # we convert it to token list first to bypass sub-word boundary issues.
+    response_template_ids = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+    
+    try:
+        data_collator = DataCollatorForCompletionOnlyLM(
+            response_template=response_template_ids,
+            tokenizer=tokenizer,
+            mlm=False,
+        )
+    except Exception as e:
+        LOGGER.warning("Could not initialize CompletionOnly collator: %s", e)
+        data_collator = None
+
     trainer = SFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=dataset,
         processing_class=tokenizer,
         peft_config=lora_config,
+        data_collator=data_collator,
     )
 
     LOGGER.info("Starting SFT train() ...")

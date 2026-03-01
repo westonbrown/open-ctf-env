@@ -1,7 +1,7 @@
 [project]
 name = "open-ctf-env"
 version = "0.4.0"
-description = "Open-source CTF training environment: LlamaFactory SFT + SkyRL GRPO + GEPA"
+description = "Open-source CTF training environment: TRL SFT + SkyRL GRPO + GEPA"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -27,21 +27,8 @@ merge = [
     "peft>=0.15.0",
     "accelerate>=1.4.0",
 ]
-# Stage 1: LlamaFactory SFT
-# NOTE: LlamaFactory pins transformers<=4.57.1, accelerate<=1.2.1,
-# datasets<=3.6.0. Do NOT override these — let LlamaFactory resolve them.
-# Docker separates SFT and GRPO envs so they can have different versions.
+# Stage 1: TRL SFT
 sft = [
-    "llamafactory>=0.9.0",
-    "torch>=2.4.0",
-    "bitsandbytes>=0.45.0",
-    "deepspeed>=0.15.0",
-    "wandb",
-]
-# Stage 1 (alt): TRL SFT — for models needing transformers >= 5.2.0 (Qwen3.5).
-# Use instead of 'sft' extra when LlamaFactory's transformers pin is too old.
-# Compatible with GRPO/merge extras (same transformers version).
-sft-trl = [
     "trl>=0.28.0",
     "torch>=2.5.0",
     "transformers>=5.2.0",
@@ -139,28 +126,7 @@ constraint-dependencies = [
     "flash-linear-attention==0.4.1; sys_platform == 'linux'",
     "causal-conv1d==1.6.0; sys_platform == 'linux'",
 ]
-# SFT and GRPO/merge extras have incompatible transformers versions:
-#   SFT (LlamaFactory) pins transformers ≤4.57.1
-#   GRPO/merge need transformers ≥5.2.0 (Qwen3.5)
-# Docker separates these into different environments. Tell uv they're exclusive.
-conflicts = [
-    [
-        { extra = "sft" },
-        { extra = "grpo" },
-    ],
-    [
-        { extra = "sft" },
-        { extra = "online-rl" },
-    ],
-    [
-        { extra = "sft" },
-        { extra = "merge" },
-    ],
-    [
-        { extra = "sft" },
-        { extra = "sft-trl" },
-    ],
-]
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

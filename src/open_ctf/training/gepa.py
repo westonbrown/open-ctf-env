@@ -517,9 +517,31 @@ def run_gepa(
 
     # --- Run GEPA ----------------------------------------------------------
     num_threads = gepa_cfg.get("num_threads", 1)
+
+    # Budget: prefer explicit max_metric_calls (from config or small datasets),
+    # fall back to auto preset.  auto="light" with default minibatch_size=35
+    # produces ~736 rollouts even for 1 challenge — far too many for a smoke test.
+    max_metric_calls = gepa_cfg.get("max_metric_calls")
+    if max_metric_calls is None and len(trainset) <= 3:
+        # Small dataset heuristic: 20 rollouts per challenge is plenty for a
+        # quick test while still giving GEPA enough signal to evolve.
+        max_metric_calls = max(20 * len(trainset), 20)
+        logger.info(
+            "Small dataset (%d examples) — using max_metric_calls=%d "
+            "(override via gepa.max_metric_calls in config)",
+            len(trainset),
+            max_metric_calls,
+        )
+
+    budget_kwargs = {}
+    if max_metric_calls is not None:
+        budget_kwargs["max_metric_calls"] = int(max_metric_calls)
+    else:
+        budget_kwargs["auto"] = budget
+
     optimizer = GEPA(
         metric=metric,
-        auto=budget,
+        **budget_kwargs,
         reflection_lm=reflection_lm,
         reflection_minibatch_size=gepa_cfg.get("reflection_minibatch_size", 3),
         log_dir=str(out_dir / "gepa_logs"),
