@@ -168,7 +168,7 @@ open-ctf-convert \
 cat data/all_traces.jsonl data/failed_traces.jsonl > data/combined.jsonl
 open-ctf-split \
     --input data/combined.jsonl \
-    --sft-output data/sft_v6.jsonl \
+    --sft-output data/sft.jsonl \
     --online-rl-output data/online_rl.jsonl
 
 # Synthesize Massively Parallel Agent Traces
@@ -184,7 +184,7 @@ open-ctf-synthetic-data \
 # Stage 1: SFT via TRL (Qwen3.5 baseline)
 open-ctf-train sft \
     --model Qwen/Qwen3.5-27B \
-    --data data/sft_v6.jsonl \
+    --data data/sft.jsonl \
     --output outputs/sft-qwen35 \
     --config configs/training/training_qwen35_27b.yaml
 
@@ -258,7 +258,7 @@ Data is generated from [BoxPwnr-Traces](https://github.com/0ca/BoxPwnr-Traces) -
 
 | Dataset | Traces | Size | Description |
 |---------|--------|------|-------------|
-| `data/sft_v6.jsonl` | 285 | 14MB | Successful solves for SFT |
+| `data/sft.jsonl` | 285 | 14MB | Successful solves for SFT |
 | `data/online_rl_cybench40.jsonl` | 87 | 7.3MB | CyBench traces with flags for online GRPO |
 | `data/grpo_offline_683.jsonl` | 676 | 38.8MB | Cross-platform traces for offline GRPO |
 
@@ -359,7 +359,7 @@ open-ctf-env/
 │   ├── training/                    # Unified training configurations
 │   └── skyrl/                       # Per-model GRPO configs
 ├── data/                            # Training data (generated)
-│   ├── sft_v6.jsonl                 # 285 successful traces
+│   ├── sft.jsonl                    # 285 successful traces
 │   ├── online_rl_cybench40.jsonl    # 87 CyBench traces with flags
 │   ├── dataset_info.json            # SFT dataset metadata
 ├── docker/Dockerfile                # Multi-stage (targets: base, sft, grpo)

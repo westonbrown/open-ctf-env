@@ -98,7 +98,7 @@ flowchart LR
     synth["Synthetic data generator"] --> sft
     synth --> grpo
     converter --> splitter["DatasetSplitter"]
-    splitter -->|"successes"| sft["sft_v6.jsonl (SFT)"]
+    splitter -->|"successes"| sft["sft.jsonl (SFT)"]
     splitter -->|"all + flags"| grpo["grpo_cybench40.jsonl (GRPO)"]
     sft --> sft_stage["SFT stage"]
     sft_stage -->|"LoRA"| merge["PEFT merge"]

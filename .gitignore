@@ -120,7 +120,7 @@ data/**/*.csv
 data/archive/
 !data/.gitkeep
 !data/README.md
-!data/sft_v6.jsonl
+!data/sft.jsonl
 !data/online_rl_quality.jsonl
 !data/online_rl_quality.jsonl.manifest.json
 

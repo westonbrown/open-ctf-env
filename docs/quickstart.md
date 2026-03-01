@@ -93,7 +93,7 @@ open-ctf-split --input data/combined.jsonl
 # Stage 1: SFT via TRL
 open-ctf-train sft \
     --model Nanbeige/Nanbeige4.1-3B \
-    --data data/sft_v6.jsonl \
+    --data data/sft.jsonl \
     --output outputs/sft
 
 # Merge LoRA adapter into base model

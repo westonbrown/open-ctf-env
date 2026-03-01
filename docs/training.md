@@ -57,7 +57,7 @@ open-ctf-convert \
 ```bash
 open-ctf-split \
     --input data/sft_train.jsonl \
-    --sft-output data/sft_v6.jsonl \
+    --sft-output data/sft.jsonl \
     --online-rl-output data/online_rl.jsonl \
     --max-online-rl-tokens 32768
 ```
@@ -97,7 +97,7 @@ SFT uses the **TRL backend** to teach domain knowledge, tool schemas, and reason
 ```bash
 open-ctf-train sft \
     --model Nanbeige/Nanbeige4.1-3B \
-    --data data/sft_v6.jsonl \
+    --data data/sft.jsonl \
     --output outputs/sft
 
 
@@ -397,7 +397,7 @@ open-ctf-convert --input targets/ --output data/all.jsonl --dedup
 open-ctf-split --input data/all.jsonl
 
 # 2. SFT
-open-ctf-train sft --model Nanbeige/Nanbeige4.1-3B --data data/sft_v6.jsonl --output outputs/sft
+open-ctf-train sft --model Nanbeige/Nanbeige4.1-3B --data data/sft.jsonl --output outputs/sft
 
 # 3. Merge
 open-ctf-train merge --adapter outputs/sft --base-model Nanbeige/Nanbeige4.1-3B --output outputs/sft-merged

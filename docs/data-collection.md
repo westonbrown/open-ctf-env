@@ -108,13 +108,13 @@ cd ../..  # Back to open-ctf-env root
 # Convert all successful CyBench traces
 open-ctf-convert \
   --input targets/cybench/ \
-  --output data/sft_v6.jsonl \
+  --output data/sft.jsonl \
   --success-only \
   --dedup
 
 # Check output
-wc -l data/sft_v6.jsonl
-head -1 data/sft_v6.jsonl | jq .
+wc -l data/sft.jsonl
+head -1 data/sft.jsonl | jq .
 ```
 
 ### Convert All Traces (SFT + GRPO)
@@ -124,7 +124,7 @@ head -1 data/sft_v6.jsonl | jq .
 # All traces → GRPO data (failures help with exploration)
 open-ctf-convert \
   --input targets/cybench/ \
-  --output data/sft_v6.jsonl \
+  --output data/sft.jsonl \
   --output-failure data/grpo_all.jsonl \
   --dedup
 ```
@@ -133,7 +133,7 @@ open-ctf-convert \
 
 ```bash
 open-ctf-split \
-  --input data/sft_v6.jsonl \
+  --input data/sft.jsonl \
   --sft-output data/sft_final.jsonl \
   --online-rl-output data/online_rl_final.jsonl \
   --max-online-rl-tokens 32768
