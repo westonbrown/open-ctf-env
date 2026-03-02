@@ -110,6 +110,16 @@ run_patch "skyrl_chat_template_kwargs" optional python3 "$PATCH_DIR/patch_skyrl_
 #     of silently dropping them (Issue #38 safety net)
 run_patch "skyrl_custom_template_tools" optional python3 "$PATCH_DIR/patch_skyrl_custom_template_tools.py"
 
+# --- loss_mask fix for retokenized multi-turn ---
+
+# 21. REVERTED: return_assistant_tokens_mask actually works correctly.
+#     The real root cause of policy_loss=0 was apply_overlong_filtering()
+#     zeroing loss_mask when custom template adds trailing \n after
+#     {% endgeneration %} (response[-1] != eos_token_id).
+#     Fix: apply_overlong_filtering: false in training config (Patch #22).
+#     See patch_skyrl_loss_mask_retokenize.py for full analysis.
+# run_patch "skyrl_loss_mask_retokenize" critical python3 "$PATCH_DIR/patch_skyrl_loss_mask_retokenize.py"
+
 # --- Cleanup ---
 echo ""
 echo "Clearing __pycache__..."

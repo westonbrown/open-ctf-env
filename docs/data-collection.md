@@ -1,19 +1,19 @@
 # Data Collection Guide
 
-This guide shows how to collect **real training data** from BoxPwnr agent traces solving CyBench challenges.
+This guide shows how to collect **real training data** from agent traces solving CyBench challenges. BoxPwnr is used as the reference example agent, but any agent producing multi-turn tool-use traces in ChatML format works with `open-ctf-convert`.
 
 ## Overview
 
-To train a production model, collect hundreds or thousands of traces by running BoxPwnr against CyBench's 40 professional CTF challenges.
+To train a production model, collect hundreds or thousands of traces by running an agent against CyBench's 40 professional CTF challenges. The examples below use BoxPwnr as the reference agent.
 
 **Pipeline:**
 ```
-BoxPwnr Agent → CyBench Challenges → Raw Traces → Converter → Training Data
+Agent → CyBench Challenges → Raw Traces → Converter → Training Data
 ```
 
 ## Prerequisites
 
-1. **BoxPwnr installed** (in `references/boxpwnr/` after setup)
+1. **BoxPwnr installed** (optional reference agent, in `references/boxpwnr/` after setup)
 2. **CyBench benchmarks cloned** (in `benchmarks/cybench/`)
 3. **Docker running** (for challenge containers)
 4. **LLM API access** (GPT-4o, Claude Sonnet, or local models)

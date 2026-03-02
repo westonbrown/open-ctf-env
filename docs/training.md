@@ -7,7 +7,7 @@ Open CTF uses a **3-stage training pipeline**: SFT (supervised fine-tuning) for 
 ```mermaid
 flowchart LR
     %% Data Flow
-    Traces[/"BoxPwnr Traces"/] --> Convert[["Convert & Split"]]
+    Traces[/"Agent Traces"/] --> Convert[["Convert & Split"]]
     Convert -->|"Successes"| SFTData[("SFT Data")]
     Convert -->|"All + Flags"| GRPOData[("GRPO Data")]
 
@@ -41,7 +41,9 @@ flowchart LR
 
 ## Data Preparation
 
-### 1. Convert BoxPwnr Traces
+### 1. Convert Agent Traces
+
+The converter supports traces from any agent that produces multi-turn tool-use conversations. BoxPwnr is the default reference agent, but any trace source following the same format works.
 
 ```bash
 # Convert successful traces only (recommended for SFT)
@@ -79,7 +81,7 @@ open-ctf-split \
     {"role": "assistant", "content": "...", "tool_calls": [...]},
     {"role": "tool", "tool_call_id": "...", "name": "shell_command", "content": "..."}
   ],
-  "metadata": {"source": "boxpwnr", "platform": "cybench"}
+  "metadata": {"source": "agent_name", "platform": "cybench"}
 }
 ```
 
@@ -120,47 +122,78 @@ Model-specific configs live in `configs/training/`:
 Example config (`configs/training/training_qwen35_27b.yaml`):
 
 ```yaml
-model_name_or_path: Nanbeige/Nanbeige4.1-3B
-trust_remote_code: true
-stage: sft
-do_train: true
-finetuning_type: lora
-lora_rank: 64
-lora_alpha: 128
-lora_dropout: 0.0
-lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
-template: chatml
-tool_format: qwen
-cutoff_len: 32768
-packing: true
-neat_packing: true
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 8
-learning_rate: 2.0e-4
-num_train_epochs: 5
-bf16: true
-gradient_checkpointing: true
-quantization_bit: 4
-quantization_method: bitsandbytes
+model:
+  name: "Qwen/Qwen3.5-27B"
+  max_seq_length: 49152
+  load_in_4bit: false
+  load_in_8bit: false
+
+lora:
+  r: 64
+  alpha: 128
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  use_rslora: false
+
+sft:
+  epochs: 3
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  packing: false
+  flash_attn: true
 ```
 
 ### SFT Key Parameters
 
 | Parameter | Recommended | Notes |
 |-----------|-------------|-------|
-| `cutoff_len` | 32768 | Context window for training |
-| `num_train_epochs` | 5 | Research shows short SFT (1-3) can underfit for RL |
-| `learning_rate` | 2e-4 | Standard for LoRA SFT |
-| `packing` | true | 3x throughput improvement |
-| `lora_rank` | 64 | Higher rank = more capacity |
-| `template` | model-specific | `chatml` for ChatML, `glm4_7` for GLM, `mistral` for Devstral |
-| `tool_format` | model-specific | `qwen` for Hermes/ChatML, `glm4_moe` for GLM |
+| `model.max_seq_length` | 49152 | Context window for training (96.8% of data fits 49K) |
+| `sft.epochs` | 3 | Research shows short SFT (1-3) can underfit for RL |
+| `sft.learning_rate` | 2e-5 | Standard for LoRA SFT |
+| `sft.packing` | true | 3x throughput improvement (dense packing into max_seq_length batches) |
+| `lora.r` | 64 | Higher rank = more capacity |
+| `sft.flash_attn` | true | Falls back to SDPA if flash_attn not available |
+| `sft.gradient_checkpointing` | true | Required for long-context training |
 
 ### MoE Model Notes (GLM-4.7-Flash)
 
 - **No 4-bit quantization**: MoE expert tensors are incompatible with BitsAndBytes. Use BF16 LoRA (`quantization_bit` omitted).
 - **batch_size=1**: Padding tokens through MoE router produce NaN gradients. Compensate with `gradient_accumulation_steps: 16`.
 - **Router layers excluded**: Only attention + FFN shared layers targeted by LoRA.
+
+### Multi-GPU SFT
+
+For models that exceed single-GPU memory (e.g., Qwen3.5-27B at 49K context), use the dual-GPU SFT script:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 scripts/run_sft_qwen35_dual_b200.py \
+    --model /workspace/models/qwen35-27b-fp8 \
+    --data data/sft.jsonl \
+    --output /workspace/outputs/sft_qwen35_27b \
+    --packing
+```
+
+This script shards the base model across both GPUs via `device_map=balanced` and applies a global Liger fused cross-entropy patch to avoid the 45.5 GiB logits OOM at 49K context x 248K vocab. Key differences from the standard `open-ctf-train sft` path:
+
+- `device_map=balanced` for multi-GPU sharding
+- `completion_only_loss=True` (TRL 0.29+ native assistant-only masking)
+- Liger kernel global CE monkey-patch for unsupported model types
+- TensorBoard logging by default
+
+### Alternative SFT Data Sources
+
+In addition to agent trace conversion, SFT data can be generated synthetically using the offline synthetic data generation pipeline. See `configs/synthetic_data_generation/` for configuration examples covering incident response, lateral movement, and APT emulation scenarios.
 
 ## Merging LoRA Adapters
 

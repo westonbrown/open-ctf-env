@@ -68,3 +68,58 @@ open-ctf-validate --mode grpo-preflight \
 ```
 
 This keeps data naming, target mapping, and challenge reachability reproducible across new instances.
+
+## Synthetic Data Generation
+
+Synthetic traces are generated offline using manifest-driven simulated environments (no Docker required). These supplement real agent traces for SFT and can scale to thousands of trajectories.
+
+### Generate Synthetic Traces
+
+```bash
+# CLI
+open-ctf-synthetic-data \
+    --config configs/synthetic_data_generation/default.yaml \
+    --teacher-model "azure/gpt-5.2-codex" \
+    --num-traces 500 \
+    --sft-out data/synthetic_sft.jsonl
+
+# All manifests at once (via test script)
+python scripts/test_synth_model.py --model "azure/gpt-5.2-codex" --manifests all
+```
+
+### Output Format
+
+Synthetic traces use the same OpenAI ChatML format as `sft.jsonl`:
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "...", "tool_calls": [...]},
+    {"role": "tool", "tool_call_id": "...", "name": "shell_command", "content": "..."},
+    ...
+  ],
+  "metadata": {
+    "source": "synthetic_generator",
+    "challenge": "internal_wiki_data_exfiltration",
+    "success": true,
+    "total_turns": 15,
+    "model": "azure/gpt-5.2-codex"
+  },
+  "ground_truth_flag": "FLAG{randomized_uuid}",
+  "optimal_steps": 7
+}
+```
+
+Each trace has a unique randomized flag (UUID-based) to prevent memorization.
+
+### Mixing Synthetic + Real Data
+
+Concatenate synthetic traces with real agent traces for SFT:
+
+```bash
+cat data/sft.jsonl data/synthetic_sft.jsonl > data/sft_combined.jsonl
+```
+
+See `configs/synthetic_data_generation/README.md` for manifest authoring and `src/open_ctf/synthetic_data_generation/README.md` for implementation details.

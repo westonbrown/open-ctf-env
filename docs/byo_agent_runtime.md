@@ -6,7 +6,7 @@ Support real BYO agent frameworks while keeping SkyRL/OpenCTF training stable:
 - `native` mode: external framework runtime process owns observations/done.
 
 Bridge fallback framework is generic (`generic`); training profiles can set
-`OPEN_CTF_AGENT_FRAMEWORK` explicitly (for example `boxpwnr_langgraph`).
+`OPEN_CTF_AGENT_FRAMEWORK` explicitly (for example `langgraph` or any custom name).
 
 ## What Was Added
 - Generic runtime bridge: `src/open_ctf/agent/framework_runtime_bridge.py`
@@ -92,12 +92,10 @@ This makes wrappers straightforward for LangGraph or custom runtimes.
 
 ## Adapter Templates + Contract Tests
 - Adapter scripts are provided in `examples/adapters/`:
-  - `boxpwnr_native_runtime_adapter.py` (functional — strict request validation + fail-fast)
-  - `langgraph_native_runtime_adapter.py` (functional — recommended for LangGraph)
-  - `langgraph_runtime_adapter.py` (functional — lightweight template adapter)
-  - `autogen_runtime_adapter.py` (template stub — not tested end-to-end)
-  - `strands_runtime_adapter.py` (template stub — not tested end-to-end)
-  - `adk_runtime_adapter.py` (template stub — not tested end-to-end)
+  - `template_runtime_adapter.py` (generic copy-and-customize template — recommended starting point for any framework)
+  - `langgraph_native_runtime_adapter.py` (functional — LangGraph example)
+  - `langgraph_runtime_adapter.py` (functional — lightweight LangGraph template)
+  - `boxpwnr_native_runtime_adapter.py` (functional — BoxPwnr reference agent example)
 - Contract smoke tests:
   - `tests/test_framework_runtime_adapters.py`
   - `tests/test_framework_runtime_bridge.py`
@@ -107,11 +105,12 @@ This makes wrappers straightforward for LangGraph or custom runtimes.
 - These tests validate protocol wrapping, passthrough shape, and framework metadata across adapter types.
 
 ## Native Smoke Path
-- `examples/smoke_test_2ch.sh` now supports `--native-boxpwnr`.
+- `examples/smoke_test_2ch.sh` supports `--native-boxpwnr` as an example of native mode.
 - This sets:
   - `OPEN_CTF_AGENT_MODE=native`
   - `OPEN_CTF_AGENT_CMD=python examples/adapters/boxpwnr_native_runtime_adapter.py`
 - Adapter returns protocol `tool_calls_response` (not passthrough), so OpenCTF local tool execution stays in-loop for RL training updates.
+- Replace the adapter command with your own to test any framework in native mode.
 
 ## Default Config Pattern
 ```yaml
@@ -121,7 +120,7 @@ agent_kwargs:
   runtime_passthrough: false
   runtime_fallback_to_parser: false
   runtime_env:
-    OPEN_CTF_AGENT_FRAMEWORK: "boxpwnr_langgraph"
+    OPEN_CTF_AGENT_FRAMEWORK: "generic"
     OPEN_CTF_AGENT_MODE: "tool_calls"
 ```
 

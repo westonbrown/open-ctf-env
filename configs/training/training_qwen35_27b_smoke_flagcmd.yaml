@@ -44,7 +44,9 @@ online_rl:
   warmup_ratio: 0.10
   beta: 0.0
   loss_type: dapo
-  num_generations: 2
+  # 4 generations for RLOO variance — with 2, both solving = zero advantage.
+  # H200 143GB can handle 4 concurrent generations within 65K context budget.
+  num_generations: 4
   advantage_estimator: rloo
   max_completion_length: 3072
   max_tool_calling_iterations: 20
@@ -82,7 +84,7 @@ online_rl:
   vllm_max_model_len: 65536
   vllm_language_model_only: true
   vllm_attention_backend: "TRITON_ATTN"
-  max_grad_norm: 0.1
+  max_grad_norm: 1.0
   epsilon_high: 0.28
   weight_decay: 0.1
   scale_rewards: false
@@ -93,7 +95,10 @@ online_rl:
   gpu_memory_utilization: 0.80
   max_num_seqs: 8
   max_num_batched_tokens: 16384
-  apply_overlong_filtering: true
+  # Disabled: overlong filter zeros loss_mask when custom template adds
+  # trailing \n after {% endgeneration %} (response[-1] != eos_token_id).
+  # See Patch #22.  Safe to disable for retokenized multi-turn.
+  apply_overlong_filtering: false
   max_env_workers: 4
   flash_attn: false
   use_sample_packing: false

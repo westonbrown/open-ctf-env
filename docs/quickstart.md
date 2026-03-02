@@ -35,7 +35,7 @@ pip install -e ".[agent]"
 ## Setup
 
 ```bash
-# Clone BoxPwnr reference (agent framework with CyBench support)
+# Clone BoxPwnr reference agent (optional — example agent with CyBench support)
 git clone https://github.com/0ca/BoxPwnr.git references/boxpwnr
 
 # Clone CyBench benchmarks (40 professional CTF challenges)

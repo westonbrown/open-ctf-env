@@ -7,7 +7,7 @@ Open CTF Environment is a **3-stage post-training pipeline** for fine-tuning LLM
 ```mermaid
 flowchart TD
     %% Node Definitions
-    Traces[/"Raw BoxPwnr Traces"/]
+    Traces[/"Raw Agent Traces"/]
     Synth[/"Synthetic Data"/]
     Convert[["Converter & Splitter"]]
     
@@ -45,9 +45,14 @@ flowchart TD
 ```
 src/open_ctf/
 ├── agent/
-│   ├── protocol.py              # CTFAgent protocol + AgentResult dataclass
-│   ├── boxpwnr_adapter.py      # BoxPwnr adapter implementing CTFAgent
-│   └── runner.py                # BoxPwnr AgentRunner (low-level)
+│   ├── protocol.py              # StepAgent + CTFAgent protocols, AgentResult, validate_step_agent
+│   ├── default_agent.py         # DefaultStepAgent — default GRPO tool parser + executor
+│   ├── framework_runtime_bridge.py  # BYO adapter bridge (tool_calls + native mode)
+│   ├── runtime_protocol.py      # RuntimeProtocol v1.0 with capability negotiation
+│   ├── rollout_status.py        # RolloutStatus enum (replaces stringly-typed values)
+│   ├── proxy_step_agent.py      # ProxyStepAgent for external RL proxy integration
+│   ├── boxpwnr_adapter.py      # Example CTFAgent adapter (BoxPwnr reference agent)
+│   └── runner.py                # Example agent runner (BoxPwnr reference agent)
 ├── challenges/
 │   ├── registry.py              # ChallengeRegistry — YAML-backed challenge lookup
 │   └── manager.py               # ChallengeManager — Docker container lifecycle
@@ -60,17 +65,17 @@ src/open_ctf/
 │   ├── validate_pipeline.py     # open-ctf-validate
 │   └── export_gguf.py           # open-ctf-export
 ├── data/
-│   ├── converter.py             # BoxPwnr trace → ChatML conversion
+│   ├── converter.py             # Agent trace → ChatML conversion (default: BoxPwnr format)
 │   └── splitter.py              # SFT/GRPO dataset splitting
 ├── envs/
 │   ├── tool_executor.py         # SubprocessExecutor + RemoteBatchExecutor
 │   └── skyrl/
 │       ├── openctf_env.py       # OpenCTFTextEnv (SkyRL BaseTextEnv subclass)
 │       └── tool_groups.py       # 13 tool schema definitions for SkyRL
-├── synthetic_data_generation/   # Offline World Manifests & Generators
-│   ├── manifest.py              # Enforces Spatial limits & K8s fault injects
-│   ├── executor.py              # CPU-bound tool execution mocking
-│   └── generator.py             # Orchestrates BaseAgentAdapters
+├── synthetic_data_generation/   # Offline synthetic trace generation
+│   ├── manifest.py              # WorldManifest dataclass — loads YAML configs defining hosts, files, services, tool responses
+│   ├── executor.py              # SimulatedEnvironmentExecutor — mocks all 13 agent tools using manifest data
+│   └── generator.py             # LiteLLMAgentAdapter + SyntheticGenerator — runs teacher LLM in ReAct loop, exports traces
 ├── formatters/
 │   ├── base.py                  # ModelFormatter abstract base + auto-detection
 │   ├── qwen3.py                 # ChatML + Hermes tool format
@@ -107,7 +112,7 @@ flowchart LR
     %% Definitions
     Traces[/"Raw Traces"/]
     Synth[/"Synthetic Gens"/]
-    Converter[["BoxPwnrConverter"]]
+    Converter[["TraceConverter"]]
     Splitter[["DatasetSplitter"]]
     
     SFT_DB[("sft.jsonl")]
@@ -165,7 +170,7 @@ Each model family has a formatter that handles chat template differences:
 
 We deliberately use `skyrl-gym`'s low-level `BaseTextEnv` interface rather than the higher-level `skyrl-agent` framework (`AutoAgentRunner`, `ReActAgent`). The reasons:
 
-1. **13 BoxPwnr tools** don't exist in `skyrl-agent`'s `TOOL_REGISTRY` — wrapping our `SubprocessExecutor` inside their tool class hierarchy would add an unnecessary abstraction layer.
+1. **13 CTF tools** don't exist in `skyrl-agent`'s `TOOL_REGISTRY` — wrapping our `SubprocessExecutor` inside their tool class hierarchy would add an unnecessary abstraction layer.
 2. **Token format parity**: Tool schemas in the GRPO system prompt must exactly match what the model saw during SFT (verified by `test_tokenizer_drift`). SkyRL-Agent's own prompt construction would break this.
 3. **Multi-signal reward**: SkyRL-Agent's verifiers are binary pass/fail. Our `CTFReward` computes 6 continuous process signals.
 4. **Per-challenge routing**: CTF challenges require Docker container lifecycle management and per-challenge target URLs — not supported by SkyRL-Agent's task abstraction.
@@ -280,11 +285,11 @@ docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
 
 ```mermaid
 flowchart LR
-    Model(("Trained Model")) --> Agent[["CTFAgent (BoxPwnr)"]]
+    Model(("Trained Model")) --> Agent[["CTFAgent (Pluggable)"]]
     Agent <--> Challenges[("CyBench 40")]
     Challenges --> Metrics[["Compute Metrics:<br/>Solve rate, Turns, Time"]]
 ```
-Evaluation uses the same BoxPwnr scaffold as data collection. The only variable is model weights — architecture, tools, and evaluation harness are held constant. The `CTFAgent` protocol supports pluggable agents: use `--agent boxpwnr` (default) or `--agent custom:module.Class`.
+Evaluation uses any agent implementing the `CTFAgent` protocol. The only variable is model weights — architecture, tools, and evaluation harness are held constant. Use `--agent boxpwnr` (default example) or `--agent custom:module.Class` to plug in your own agent.
 
 ## Key Design Decisions
 
@@ -349,3 +354,13 @@ Challenge registries are YAML-driven. To add a new benchmark:
 1. Create `configs/challenges/<name>.yaml` with challenge definitions
 2. Run `open-ctf-challenges setup --registry configs/challenges/<name>.yaml`
 3. No changes to training pipeline, reward function, or tool schemas
+
+### Adding Custom Agents (BYO Agent)
+
+Open CTF supports two agent protocols depending on the integration point:
+
+1. **StepAgent** (GRPO training): Set `online_rl.agent_class` in your training config to a dotted path to your class. The agent handles tool parsing and execution while SkyRL owns generation.
+2. **CTFAgent** (eval/GEPA): Pass `--agent custom:module.MyAgent` to `open-ctf-eval` or `open-ctf-train gepa`.
+3. **Runtime bridge** (external frameworks): Use `OPEN_CTF_AGENT_MODE=native` with an adapter script. See `examples/adapters/template_runtime_adapter.py`.
+
+For the complete BYO agent guide, see `src/open_ctf/agent/README.md`.

@@ -654,13 +654,22 @@ def run_gepa(
 
     # --- Configure DSPy LM ------------------------------------------------
     agent_max_tokens = gepa_cfg.get("max_tokens", 4096)
-    lm = dspy.LM(model=model_id, temperature=0.7, max_tokens=agent_max_tokens)
+    agent_lm_kwargs: dict[str, Any] = {"model": model_id, "max_tokens": agent_max_tokens}
+    agent_temp = gepa_cfg.get("temperature", 0.7)
+    if agent_temp is not None:
+        agent_lm_kwargs["temperature"] = agent_temp
+    lm = dspy.LM(**agent_lm_kwargs)
     dspy.configure(lm=lm)
 
     # Reflection LM — defaults to same model (no cloud APIs needed).
     # Override via --reflection-model CLI flag or gepa.reflection_model in config.
     ref_model = reflection_model or gepa_cfg.get("reflection_model") or model_id
-    reflection_lm = dspy.LM(model=ref_model, temperature=1.0, max_tokens=32000)
+    ref_max_tokens = gepa_cfg.get("reflection_max_tokens", 32000)
+    ref_lm_kwargs: dict[str, Any] = {"model": ref_model, "max_tokens": ref_max_tokens}
+    ref_temp = gepa_cfg.get("reflection_temperature", 1.0)
+    if ref_temp is not None:
+        ref_lm_kwargs["temperature"] = ref_temp
+    reflection_lm = dspy.LM(**ref_lm_kwargs)
 
     # --- Load challenge registry (if provided) ----------------------------
     registry = None

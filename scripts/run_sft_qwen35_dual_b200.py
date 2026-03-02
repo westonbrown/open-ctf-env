@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run Qwen3.5-27B SFT across 2x B200 GPUs using TRL + PEFT.
+"""Run Qwen3.5-27B SFT across 2x H200 GPUs using TRL + PEFT.
 
-This script is tuned for long-context SFT on RunPod dual-B200 nodes.
-It shards the base model across both GPUs via ``device_map=auto`` and
+This script is tuned for long-context SFT on RunPod dual-H200 nodes (143GB each).
+It shards the base model across both GPUs via ``device_map=balanced`` and
 supports optional QLoRA (4-bit base model + BF16 compute).
+Liger kernel is enabled by default to avoid 45.5 GiB logits OOM at 49K context.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from trl import SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM
+from trl import SFTConfig, SFTTrainer
 
 LOGGER = logging.getLogger("run_sft_qwen35_dual_b200")
 
@@ -37,8 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--save-steps", type=int, default=25)
     parser.add_argument("--logging-steps", type=int, default=1)
-    parser.add_argument("--max-memory-gpu0", default="175GiB")
-    parser.add_argument("--max-memory-gpu1", default="175GiB")
+    parser.add_argument("--max-memory-gpu0", default="140GiB")
+    parser.add_argument("--max-memory-gpu1", default="140GiB")
     parser.add_argument("--attn-impl", default="sdpa", choices=["sdpa", "eager", "flash_attention_2"])
     parser.add_argument(
         "--device-map",
@@ -59,7 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=int, default=128)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use-liger-kernel", action="store_true")
+    parser.add_argument("--use-liger-kernel", action="store_true", default=True)
+    parser.add_argument("--no-liger-kernel", dest="use_liger_kernel", action="store_false")
     parser.add_argument("--require-both-gpus", action="store_true")
     parser.set_defaults(require_both_gpus=True)
     parser.add_argument(
@@ -89,6 +91,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize messages for tokenizer.apply_chat_template().
+
+    Delegates to the shared implementation in open_ctf.training.sft.utils.
+    Falls back to inline logic if the package is not importable (standalone use).
+    """
+    try:
+        from open_ctf.training.sft.utils import normalize_messages
+        return normalize_messages(messages)
+    except ImportError:
+        pass
+
+    # Inline fallback for standalone execution outside the package
     normalized: list[dict[str, Any]] = []
     for msg in messages:
         out = dict(msg)
@@ -173,7 +187,7 @@ def main() -> None:
 
     os.makedirs(args.output, exist_ok=True)
     LOGGER.info("=" * 72)
-    LOGGER.info("QWEN3.5-27B SFT (Dual B200)")
+    LOGGER.info("QWEN3.5-27B SFT (Dual H200)")
     LOGGER.info("model=%s", args.model)
     LOGGER.info("data=%s", args.data)
     LOGGER.info("output=%s", args.output)
@@ -269,7 +283,7 @@ def main() -> None:
         "save_steps": args.save_steps,
         "save_only_model": True,
         "save_total_limit": 4,
-        "report_to": "none",
+        "report_to": "tensorboard",
         "seed": args.seed,
         "dataloader_num_workers": 2,
         "remove_unused_columns": True,
@@ -281,29 +295,26 @@ def main() -> None:
 
     sft_config = SFTConfig(**sft_kwargs)
 
-    # CRITICAL: Prevent catastrophic forgetting by masking out User/System prompts
-    # Note: Qwen uses ChatML. If response_template cannot map directly due to tokenization, 
-    # we convert it to token list first to bypass sub-word boundary issues.
-    response_template_ids = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
-    
-    try:
-        data_collator = DataCollatorForCompletionOnlyLM(
-            response_template=response_template_ids,
-            tokenizer=tokenizer,
-            mlm=False,
-        )
-    except Exception as e:
-        LOGGER.warning("Could not initialize CompletionOnly collator: %s", e)
-        data_collator = None
-
+    # TRL 0.29+ uses completion_only_loss in SFTConfig (replaces DataCollatorForCompletionOnlyLM).
+    # This masks loss on system/user/tool turns, training only on assistant responses.
     trainer = SFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=dataset,
         processing_class=tokenizer,
         peft_config=lora_config,
-        data_collator=data_collator,
     )
+
+    # Liger kernel doesn't natively support qwen3_5_text, but we can apply
+    # its fused cross-entropy globally to avoid the 45.5 GiB logits OOM.
+    # This is exactly what Liger's qwen3 monkey-patch does when cross_entropy=True.
+    try:
+        from liger_kernel.transformers.functional import liger_cross_entropy
+        from transformers.loss import loss_utils
+        loss_utils.nn.functional.cross_entropy = liger_cross_entropy
+        LOGGER.info("Applied Liger fused cross-entropy globally (avoids logits OOM)")
+    except Exception as e:
+        LOGGER.warning("Could not apply Liger cross-entropy: %s", e)
 
     LOGGER.info("Starting SFT train() ...")
     trainer.train()

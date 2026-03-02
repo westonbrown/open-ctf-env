@@ -1,13 +1,13 @@
-# Qwen3.5-27B Training Configuration (B200 183GB HBM3e)
+# Qwen3.5-27B Training Configuration (2x H200 143GB HBM3e)
 # ==============================================================
 # Dense Qwen3.5 text model (27B params).
-# Fits on single B200 (183GB) in BF16 for SFT + SkyRL local non-colocated vLLM for GRPO.
+# 2x H200 (143GB each): GPU 0 vLLM FP8, GPU 1 FSDP2 trainer BF16.
 #
 # Key properties:
-#   - Dense model: QLoRA supported but unnecessary on B200 (use BF16 LoRA)
+#   - Dense model: BF16 LoRA on H200 (no quantization needed)
 #   - batch_size > 1 safe (no MoE routing NaN)
-#   - GRPO should use run_engines_locally=true with colocate_all=false (LoRA-safe)
-#   - ~54 GB BF16 inference weights
+#   - GRPO: non-colocated vLLM server mode with LoRA weight sync
+#   - ~29 GB FP8 inference / ~54 GB BF16 training weights
 #
 # Architecture: Qwen3_5ForConditionalGeneration (text-only path in GRPO/SFT)
 # Vocab: 248,320 (text config); tokenizer vocab is 248,044
@@ -22,8 +22,8 @@ model:
   # This remains within the requested 32K-64K window and avoids recurrent
   # 64K OOMs observed with Qwen3.5's large vocabulary logits.
   max_seq_length: 49152
-  # BF16 LoRA: B200 has 183GB — no need for 4-bit quantization.
-  # ~54 GB BF16 weights + ~20 GB training overhead = ~74 GB, well within budget.
+  # BF16 LoRA: H200 has 143GB — no need for 4-bit quantization.
+  # ~54 GB BF16 weights + ~25 GB training overhead = ~79 GB, within budget.
   load_in_4bit: false
   load_in_8bit: false
 
@@ -47,7 +47,7 @@ sft:
   # 3 epochs: balances convergence vs training time.
   epochs: 3
   # batch_size=1: 248K vocab -> logits tensor is ~7.6 GiB at batch=1 x 8K seq.
-  # Could try batch=2 on B200 (183GB headroom), but batch=1 is safe default.
+  # Could try batch=2 on H200 (143GB headroom), but batch=1 is safe default.
   batch_size: 1
   gradient_accumulation_steps: 8
   # Effective batch: 1 * 8 = 8
@@ -56,17 +56,17 @@ sft:
   weight_decay: 0.01
   lr_scheduler_type: cosine
   packing: false
-  # Flash Attention: B200 HBM3e supports FA natively.
+  # Flash Attention: H200 HBM3e supports FA natively.
   flash_attn: true
   use_sample_packing: false
-  # Memory budget for SFT on B200 (183 GB HBM3e) @ 48K context:
+  # Memory budget for SFT on H200 (143 GB HBM3e) @ 48K context:
   #   Model (BF16): ~54 GB
   #   LoRA adapters (r=64, 7 modules): ~1.5 GB
   #   Optimizer (8-bit AdamW): ~3 GB
   #   Logits (1 x 48K x 248K x 4B): ~45.5 GiB
   #   Gradient activations (checkpointed, 48K, batch=1): ~45 GB
   #   Framework/OS: ~5 GB
-  #   Total: ~154 GiB (safe on one B200; more headroom on dual-B200 sharding)
+  #   Total: ~154 GiB — tight on single H200, use dual-GPU sharding.
   #   If OOM: reduce to max_seq_length=40960.
 
 online_rl:
@@ -75,18 +75,21 @@ online_rl:
   # Includes master difficulty so all 40 registry challenges can participate.
   difficulty_max: "master"
   batch_size: 1
-  # batch_size(1) * grad_accum(4) must be divisible by num_gen(2): 4 % 2 = 0 (valid)
+  # batch_size(1) * grad_accum(4) must be divisible by num_gen(4): 4 % 4 = 0 (valid)
   gradient_accumulation_steps: 4
   learning_rate: 5.0e-6
   warmup_ratio: 0.10
   beta: 0.0
   loss_type: dapo
-  # Keep two generations per prompt to reduce policy backward memory spikes.
-  num_generations: 2
+  # 4 generations for RLOO variance — proven on 2x H200 143GB with FP8 model.
+  # With 2, easy challenges where both solve produce zero advantage.
+  # batch_size(1) * grad_accum(4) = 4, 4 % 4 = 0 (valid).
+  num_generations: 4
   advantage_estimator: rloo
-  # Per-turn generation cap (multi-turn): keep enough headroom for long-horizon
-  # reasoning while avoiding prompt+completion overflow on 2xB200.
-  max_completion_length: 3072
+  # Per-turn generation cap (multi-turn): 4K per completion allows long reasoning
+  # chains. prompt(32K) + completion(4K) = 36K < vllm_max_model_len(65K).
+  # H200 143GB has ~59 GB trainer headroom — 4K completions are safe.
+  max_completion_length: 4096
   # 60 tool iterations for long-horizon BoxPwnr-style runs.
   max_tool_calling_iterations: 60
   # Progressive horizon schedule:
@@ -144,19 +147,22 @@ online_rl:
   enable_chunked_prefill: true
   enforce_eager: true
   # Cap prompt length for GRPO/vLLM memory while preserving long trajectories.
-  # Reduced from 20k after observed policy-backward OOM on 2xB200.
-  max_prompt_length: 16384
+  # 32K proven on 2x H200 143GB with FP8 model (v12 smoke test).
+  max_prompt_length: 32768
   # Explicit vLLM max model len for stable KV-cache sizing.
-  # Keep this above max_prompt_length + max_completion_length to avoid 400
-  # context-length rejects on long tool loops.
-  vllm_max_model_len: 24576
+  # 65K proven on 2x H200 143GB (v12 smoke test).
+  # Keep above max_prompt_length + max_completion_length (32768+4096=36864).
+  vllm_max_model_len: 65536
   # Qwen3.5 uses a conditional-generation config in merged checkpoints.
   # Force text-only vLLM path so local engines do not initialize vision processors.
   vllm_language_model_only: true
   # Force Triton attention backend to avoid PTX/toolchain incompatibilities
   # observed with flash-kernel paths on this runtime.
   vllm_attention_backend: "TRITON_ATTN"
-  max_grad_norm: 0.1
+  # Relaxed from 0.1 to 1.0 for initial training: per-token advantages
+  # are small (0.008-0.019) with early RLOO, so 0.1 clip is too aggressive.
+  # Standard GRPO default is 1.0.
+  max_grad_norm: 1.0
   epsilon_high: 0.28
   weight_decay: 0.1
   scale_rewards: false
@@ -166,15 +172,17 @@ online_rl:
   use_vllm: true
   vllm_mode: server
   vllm_server_url: null
-  # Dedicated GPU0 local vLLM engine: reserve more KV-cache while keeping
-  # safety headroom for adapter reloads / fragmentation.
-  gpu_memory_utilization: 0.72
+  # Dedicated GPU0 vLLM engine on H200 143GB: FP8 model ~29GB + KV cache
+  # at 65K context. 0.80 proven in v12 smoke test.
+  gpu_memory_utilization: 0.80
   # vLLM scheduling bounds (configurable in training/online_rl/runtime.py; avoid hardcoded 32 seqs).
   # Lower seq concurrency to stabilize memory at higher context windows.
   max_num_seqs: 8
   max_num_batched_tokens: 16384
-  # Skip overlong rollouts instead of failing the entire run.
-  apply_overlong_filtering: true
+  # Disabled: overlong filter zeros loss_mask when custom template adds
+  # trailing \n after {% endgeneration %} (response[-1] != eos_token_id).
+  # See Patch #22.  Safe to disable for retokenized multi-turn.
+  apply_overlong_filtering: false
   # Parallel env workers (up to one per challenge in CyBench40 profile).
   max_env_workers: 40
   # Disable trainer flash-attn path on this runtime due PTX/toolchain mismatch.
@@ -193,6 +201,10 @@ online_rl:
   # preserves on last turn. Loss mask includes thinking on final turn only.
   # OpenThoughts-Agent pattern: enable_thinking + response_prefix seeds generation.
   chat_template: "qwen3_without_thinking"
+  # enable_thinking has no effect when using the custom qwen3_without_thinking
+  # template (which strips <think> from history but preserves on final turn).
+  # The model still generates thinking blocks via SFT conditioning.
+  # Set to true to express intent for future native-template migration.
   chat_template_kwargs:
     enable_thinking: true
   # SkyRL's custom qwen3_without_thinking template does NOT have a
@@ -232,23 +244,22 @@ online_rl:
     runtime_env:
       OPEN_CTF_AGENT_FRAMEWORK: "boxpwnr_langgraph"
       OPEN_CTF_AGENT_MODE: "tool_calls"
-  # Memory budget for GRPO on B200 (183 GB HBM3e), server mode:
-  #   Policy model (BF16): ~54 GB
-  #   Ref model (BF16, CPU offload when beta=0): ~0 GB (offloaded)
-  #   LoRA + optimizer: ~5 GB
-  #   Logits (1 x 8K x 248K x 4B): ~7.6 GiB
-  #   Gradient activations (checkpointed, 8K): ~25 GB
-  #   Framework/OS: ~5 GB
-  #   Training total: ~94 GB
+  # Memory budget for GRPO on 2x H200 (143 GB HBM3e each), server mode:
+  #   GPU 1 — FSDP2 Trainer:
+  #     Policy model (BF16): ~54 GB
+  #     Ref model (beta=0): ~0 GB (offloaded)
+  #     LoRA (r=64, 7 modules) + AdamW optimizer: ~5 GB
+  #     Gradient activations (checkpointed): ~25 GB
+  #     Framework/OS: ~5 GB
+  #     Total: ~89 GB / 143 GB (~54 GB headroom)
   #
-  #   vLLM engine worker (non-colocated local actor, 50% of 183GB = ~92 GB):
-  #     Model (BF16): ~54 GB
-  #     KV cache (4 seqs x 12K): ~15 GB
+  #   GPU 0 — vLLM Engine (FP8):
+  #     Model (FP8): ~29 GB
+  #     KV cache (8 seqs x 65K, gpu_mem_util=0.80): ~85 GB
   #     Overhead: ~5 GB
-  #     Total: ~74 GB -> ~18 GB headroom
+  #     Total: ~119 GB / 143 GB (~24 GB headroom)
   #
-  #   If on same GPU: Training ~94 GB + vLLM ~92 GB = 186 GB (tight!).
-  #   Recommended: use 2 GPUs, or reduce gpu_memory_utilization to 0.35.
+  #   Proven in v12 smoke test: 4 generations, 65K context, 0.80 gpu_mem.
 
 reward:
   # v8 reward weights: flag-dominant design.
