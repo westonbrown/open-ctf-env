@@ -1,7 +1,12 @@
-# Open CTF Environment
+<div align="center">
+  <img src="docs/assets/logo.png" alt="Open Agent RL Gym Logo" width="300" />
+</div>
+
+# Open Agent RL Gym
+
 
 [![Version](https://img.shields.io/badge/version-0.4.0-blue)](https://github.com/westonbrown/open-ctf-env)
-[![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org)
+[![Python](https://img.shields.io/badge/python-3.11+-blue)](https://www.python.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 An open-source pipeline for **post-training security LLMs on CTF challenge trajectories**. Collect agent traces with [BoxPwnr](https://github.com/0ca/BoxPwnr), fine-tune with SFT + online GRPO, optimize prompts with [GEPA](https://arxiv.org/abs/2507.19457), evaluate on [CyBench](https://cybench.github.io/), and deploy locally via GGUF quantization.
@@ -56,8 +61,10 @@ The same scaffold (BoxPwnr) runs both the baseline and fine-tuned models against
 | Stage | Framework | What It Does | Weight Updates |
 |-------|-----------|--------------|----------------|
 | **1. SFT** | [TRL](https://github.com/huggingface/trl) | Supervised fine-tuning on expert traces (LoRA). TRL backend provides native tokenizer formats and high-capacity processing. | Yes |
-| **2. GRPO** | [SkyRL](https://github.com/NovaSky-AI/SkyRL) | Online reinforcement learning with live tool execution via ToolExecutor. Async Ray-based, vLLM inference, DAPO sampling. | Yes |
+| **2. GRPO** | [SkyRL](https://github.com/westonbrown/SkyRL/tree/open-ctf/v0.3.1-patched) | Online reinforcement learning with live tool execution via ToolExecutor. Async Ray-based, vLLM inference, DAPO sampling. | Yes |
 | **3. GEPA** | [DSPy](https://github.com/stanfordnlp/dspy) | Prompt evolution via reflection -- no weight updates. Pareto-based candidate selection. Outperforms GRPO by ~6% with 4-35x fewer rollouts. | No |
+
+> **Why a SkyRL fork?** Upstream SkyRL 0.3.1 has compatibility gaps with vLLM 0.16, Ray 2.54, and FSDP2 that cause silent training failures (zero loss masks, NCCL deadlocks, truncated tool calls). Our [fork](https://github.com/westonbrown/SkyRL/tree/open-ctf/v0.3.1-patched) bakes in 14 targeted fixes so GRPO works out of the box on modern GPU stacks without runtime monkey-patching.
 
 ### Training Sequence (High Level)
 
@@ -74,7 +81,7 @@ flowchart LR
 
 ## Baseline Results
 
-GLM-4.7-Flash Q8_0 (30B MoE, ~3.6B active) evaluated on [CyBench](https://cybench.github.io/) 40-challenge suite via BoxPwnr on NVIDIA DGX Spark (GB10). 40 turns max, 161 total runs across retries.
+GLM-4.7-Flash Q8_0 (30B MoE, ~3.6B active) evaluated on [CyBench](https://cybench.github.io/) 40-challenge suite via BoxPwnr on a multi-GPU server (128GB unified memory). 40 turns max, 161 total runs across retries.
 
 | Model | CyBench Solve Rate | Avg Turns (solved) | Avg Time (solved) |
 |-------|-------------------|-----------|----------|
@@ -111,50 +118,83 @@ GLM-4.7-Flash Q8_0 (30B MoE, ~3.6B active) evaluated on [CyBench](https://cybenc
 
 ### Requirements
 
-- Python 3.10+
+- Python 3.11+
 - Docker and Docker Compose
 - NVIDIA GPU with 24GB+ VRAM (140GB+ for Qwen3.5-27B BF16 on 2x GPUs)
 
 #### Dependency Matrix
 
-The pipeline has strict version requirements due to the Qwen3.5 hybrid linear-attention architecture:
+The pipeline has strict version requirements due to the Qwen3.5 hybrid linear-attention architecture and version conflicts between vLLM, transformers, and SkyRL:
 
 | Package | Version | Notes |
 |---------|---------|-------|
-| PyTorch | `>=2.10.0` (cu128) | Required by vLLM nightly and `causal_conv1d` ABI |
-| vLLM | Nightly (`>=0.16.1rc1`) | Qwen3.5 not in 0.16.0 stable. Install from `https://wheels.vllm.ai/nightly` |
-| transformers | `>=5.2.0` | `Qwen3_5ForConditionalGeneration` added in 5.2.0 |
+| PyTorch | `>=2.5.0` (cu128) | NGC containers ship 2.9.1; works without upgrade |
+| vLLM | `>=0.16.0` | Installed via `pip install vllm`. Pins `transformers<5` — override required (see below) |
+| transformers | `>=5.2.0` | `Qwen3_5ForConditionalGeneration` added in 5.2.0. Force-install after vLLM |
 | flash-linear-attention | `==0.4.1` | Qwen3.5 Gated DeltaNet linear-attention fast path |
-| causal-conv1d | `==1.6.0` | Must be compiled against the same PyTorch version (ABI sensitive) |
-| SkyRL-Train | Source install | Pinned commit + 19 patches (see `docker/patches/`) |
+| causal-conv1d | `==1.6.0` | Compiled from source via nvcc (~5 min). ABI sensitive |
+| SkyRL-Train | `0.3.1` (source) | Clone SkyRL repo, install `skyrl-train/` sub-package + 20 patches |
 | Ray | `>=2.40.0` | With `RAY_memory_monitor_refresh_ms=0` for GPU pre-allocation |
+
+> **Version conflict**: vLLM 0.16 and SkyRL both pin `transformers<5`, but Qwen3.5 needs `>=5.2.0`. The `[tool.uv]` section includes `override-dependencies` to force the correct version. Both packages work fine at runtime with transformers 5.2.0.
 
 > **ABI Warning**: `causal_conv1d` wheels on PyPI are compiled against specific PyTorch builds. If you see `undefined symbol: _ZN3c104cuda29c10_cuda_check_implementation...`, rebuild from source: `CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install --no-deps causal-conv1d==1.6.0`. If the model still fails to load, uninstall `causal_conv1d` entirely — transformers will fall back to torch kernels (slower but functional for inference).
 
 ### Setup
 
+#### Option A: uv (recommended)
+
+[uv](https://docs.astral.sh/uv/) handles the version conflicts via `override-dependencies` in `pyproject.toml`.
+
 ```bash
 git clone https://github.com/westonbrown/open-ctf-env.git
 cd open-ctf-env
 
-# Install core + SFT dependencies (TRL backend)
+# Install core + SFT + GRPO deps (includes vLLM, Ray, etc.)
+uv sync --extra grpo --extra sft --extra dev
+
+# Install SkyRL-Train from our patched fork (not on PyPI):
+git clone -b open-ctf/v0.3.1-patched https://github.com/westonbrown/SkyRL.git skyrl
+sed -i 's/requires-python = "==3.12\.\*"/requires-python = ">=3.11"/' \
+    skyrl/skyrl-train/pyproject.toml
+uv pip install -e skyrl/skyrl-train --no-deps
+
+# Apply vLLM/Ray compatibility patches (4 remaining runtime patches)
+bash docker/patches/apply_all_patches.sh
+
+# For GEPA (optional)
+uv pip install -e ".[gepa]"
+```
+
+#### Option B: pip
+
+```bash
+git clone https://github.com/westonbrown/open-ctf-env.git
+cd open-ctf-env
+
+# Install core + SFT dependencies
 pip install -e ".[sft]"
 
-# For GRPO (requires Ray + SkyRL + vLLM nightly)
-pip install git+https://github.com/SkyRL-Team/SkyRL-Train.git
+# Install GRPO dependencies (includes vLLM, Ray, etc.)
 pip install -e ".[grpo]"
-pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly
-pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 
-# For GEPA
+# Force transformers 5.2.0 (vLLM pins <5, but Qwen3.5 needs >=5.2.0)
+pip install 'transformers>=5.2.0' 'huggingface-hub>=1.4' --no-deps
+
+# Install SkyRL-Train from our patched fork (not on PyPI):
+git clone -b open-ctf/v0.3.1-patched https://github.com/westonbrown/SkyRL.git skyrl
+sed -i 's/requires-python = "==3.12\.\*"/requires-python = ">=3.11"/' \
+    skyrl/skyrl-train/pyproject.toml
+pip install -e skyrl/skyrl-train --no-deps
+
+# Apply vLLM/Ray compatibility patches (4 remaining runtime patches)
+bash docker/patches/apply_all_patches.sh
+
+# For GEPA (optional)
 pip install -e ".[gepa]"
-
-# Setup BoxPwnr for trace collection
-git clone https://github.com/0ca/BoxPwnr.git references/boxpwnr
 ```
 
 See [Docker Setup](#docker-setup) for containerized deployment with all dependencies pre-resolved.
-```
 
 ### Generate Training Data
 
@@ -207,7 +247,7 @@ open-ctf-train rl \
 
 Stage-2 launch runs a strict preflight gate automatically (`open-ctf-validate --mode online-rl-preflight`) and expects a dataset manifest at `<data>.manifest.json`.
 
-If challenges run on a different host than the trainer (for example DGX + RunPod tunnel), export live challenge targets and pass the map at launch:
+If challenges run on a different host than the trainer (for example a challenge server tunneled to a remote GPU instance), export live challenge targets and pass the map at launch:
 
 ```bash
 # On challenge host
@@ -328,7 +368,7 @@ GEPA produces an optimized system prompt at `outputs/gepa/optimized_prompt.txt` 
 | `--reflection-model` | same as model | Optional reflection LM (can be a larger local model) |
 | `--budget` | `medium` | Optimization budget: `light` / `medium` / `heavy` |
 | `--challenge-registry` | none | Challenge registry for target URL resolution |
-| `--agent` | none | Optional custom CTFAgent adapter |
+| `--agent` | none | Optional custom Agent adapter |
 | `--val-data` | none | Optional validation set |
 | `--max-samples` | all | Limit training examples |
 
@@ -366,7 +406,7 @@ open-ctf-env/
 │   ├── dataset_info.json            # SFT dataset metadata
 ├── docker/Dockerfile                # Multi-stage (targets: base, sft, grpo)
 ├── src/open_ctf/
-│   ├── agent/                       # Pluggable agent protocol (CTFAgent)
+│   ├── agent/                       # Pluggable agent protocol (Agent)
 │   ├── challenges/                  # ChallengeRegistry + ChallengeManager
 │   ├── cli/                         # CLI entry points
 │   ├── data/                        # BoxPwnr trace converter + splitter
@@ -469,7 +509,7 @@ This provides CUDA 12.8, PyTorch 2.9.1+cu128, and NCCL. The GRPO stage upgrades 
 # SFT stage (TRL + LoRA)
 docker build -t open-ctf:sft --target sft -f docker/Dockerfile .
 
-# GRPO stage (SkyRL + Ray + vLLM nightly + 19 patches)
+# GRPO stage (SkyRL + Ray + vLLM nightly + 20 patches)
 docker build -t open-ctf:grpo --target grpo -f docker/Dockerfile .
 ```
 
@@ -490,7 +530,7 @@ See [`docker-compose.yaml`](docker-compose.yaml) for all services and environmen
 
 ### Patches
 
-The GRPO stage applies **19 compatibility patches** for SkyRL 0.3.1 + vLLM + Ray 2.54. These are automatically applied during Docker build. For bare-metal installs, run:
+The GRPO stage applies **20 compatibility patches** for SkyRL 0.3.1 + vLLM + Ray 2.54. These are automatically applied during Docker build. For bare-metal installs, run:
 
 ```bash
 bash docker/patches/apply_all_patches.sh
@@ -514,7 +554,7 @@ vllm serve /path/to/qwen35-27b \
 
 - [CyBench](https://cybench.github.io/) -- Cybersecurity benchmark, 40 challenges, ICLR 2025 Oral ([paper](https://arxiv.org/abs/2408.08926))
 - [BoxPwnr](https://github.com/0ca/BoxPwnr) -- LLM-powered CTF solver (data collection + evaluation)
-- [SkyRL](https://github.com/NovaSky-AI/SkyRL) -- Ray-based RL training framework (online GRPO with vLLM)
+- [SkyRL](https://github.com/westonbrown/SkyRL/tree/open-ctf/v0.3.1-patched) -- Ray-based RL training framework (online GRPO with vLLM); our patched fork of [NovaSky-AI/SkyRL](https://github.com/NovaSky-AI/SkyRL)
 - [GEPA](https://arxiv.org/abs/2507.19457) -- Reflective prompt evolution, outperforms GRPO by ~6% (ICLR 2026 Oral)
 - [DSPy](https://github.com/stanfordnlp/dspy) -- Programming framework for LM pipelines (GEPA integration)
 - [DeepSeek R1](https://arxiv.org/abs/2501.12948) -- SFT → GRPO pipeline inspiration
