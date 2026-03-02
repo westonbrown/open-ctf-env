@@ -121,20 +121,14 @@ def _flash_attn_available() -> bool:
         import flash_attn  # type: ignore
     except Exception:
         return False
-    return all(
-        hasattr(flash_attn, attr)
-        for attr in ("flash_attn_func", "flash_attn_varlen_func")
-    )
+    return all(hasattr(flash_attn, attr) for attr in ("flash_attn_func", "flash_attn_varlen_func"))
 
 
 def _is_qwen3_5_config(hf_cfg: Any) -> bool:
     """Return True if a HF config appears to be Qwen3.5."""
     model_type = str(getattr(hf_cfg, "model_type", "")).lower()
     cfg_cls_name = str(hf_cfg.__class__.__name__).lower()
-    architectures = [
-        str(arch).lower()
-        for arch in (getattr(hf_cfg, "architectures", None) or [])
-    ]
+    architectures = [str(arch).lower() for arch in (getattr(hf_cfg, "architectures", None) or [])]
     return (
         "qwen3_5" in model_type
         or "qwen3_5" in cfg_cls_name
@@ -195,8 +189,7 @@ def _validate_qwen3_5_runtime_dependencies(
     strict = bool(online_rl_cfg.get("require_fast_linear_attention", True))
     if strict:
         raise RuntimeError(
-            msg
-            + " To bypass temporarily, set online_rl.require_fast_linear_attention=false "
+            msg + " To bypass temporarily, set online_rl.require_fast_linear_attention=false "
             "(not recommended for production)."
         )
     logger.warning(
@@ -305,6 +298,7 @@ def _should_force_legacy_inference(
     """
     try:
         from transformers import AutoConfig
+
         hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except Exception as exc:
         logger.warning(
@@ -343,6 +337,7 @@ def _resolve_vllm_ready_model_path(model_path: str) -> str:
     """
     try:
         from transformers import AutoConfig
+
         cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except Exception as exc:
         logger.warning("Could not inspect model config at %s: %s", model_path, exc)
@@ -358,11 +353,12 @@ def _resolve_vllm_ready_model_path(model_path: str) -> str:
     if os.path.isdir(candidate):
         try:
             from transformers import AutoConfig
+
             cand_cfg = AutoConfig.from_pretrained(candidate, trust_remote_code=True)
             cand_cls_name = cand_cfg.__class__.__name__
             cand_model_type = str(getattr(cand_cfg, "model_type", ""))
-            cand_is_text_wrapper = (
-                cand_cls_name.endswith("TextConfig") or cand_model_type.endswith("_text")
+            cand_is_text_wrapper = cand_cls_name.endswith("TextConfig") or cand_model_type.endswith(
+                "_text"
             )
             if not cand_is_text_wrapper:
                 logger.warning(
@@ -391,6 +387,7 @@ def _canonical_system_prompt() -> str:
     """Return the canonical system prompt with tool docs."""
     try:
         from open_ctf.prompts import get_canonical_system_prompt
+
         return str(get_canonical_system_prompt())
     except Exception:
         # Keep a minimal fallback if converter import fails in stripped envs.
@@ -447,9 +444,7 @@ def _normalize_prompt_system_tools(prompt: list[dict[str, Any]]) -> list[dict[st
         else:
             msg["content"] = canonical
 
-        logger.warning(
-            "Normalized truncated system prompt by injecting canonical tool docs."
-        )
+        logger.warning("Normalized truncated system prompt by injecting canonical tool docs.")
         return prompt
 
     prompt.insert(0, {"role": "system", "content": _canonical_system_prompt()})
@@ -541,9 +536,7 @@ def _resolve_generator_topology(online_rl_cfg: dict[str, Any], lora_rank: int) -
     }
     valid_modes = {"colocate", "local"} | local_disagg_modes
     if vllm_mode not in valid_modes:
-        logger.warning(
-            "Unknown online_rl.vllm_mode=%r; defaulting to 'colocate'.", vllm_mode
-        )
+        logger.warning("Unknown online_rl.vllm_mode=%r; defaulting to 'colocate'.", vllm_mode)
         vllm_mode = "colocate"
 
     # Upstream SkyRL remote inference mode does not support NCCL LoRA sync.
@@ -575,9 +568,7 @@ def _resolve_generator_topology(online_rl_cfg: dict[str, Any], lora_rank: int) -
     run_engines_locally = not remote_requested
     colocate_all = run_engines_locally and vllm_mode in {"colocate", "local"}
     remote_urls = (
-        [_normalize_remote_url(requested_remote_url)]
-        if remote_requested
-        else ["127.0.0.1:8001"]
+        [_normalize_remote_url(requested_remote_url)] if remote_requested else ["127.0.0.1:8001"]
     )
 
     # SkyRL's _SKYRL_USE_NEW_INFERENCE=1 path reads external_proxy_url /
@@ -586,9 +577,7 @@ def _resolve_generator_topology(online_rl_cfg: dict[str, Any], lora_rank: int) -
     # spawn an internal vLLM engine on the training GPU (which would OOM on
     # multi-GPU setups where vLLM is on a different device).
     external_proxy = str(requested_remote_url).strip() if remote_requested else None
-    external_servers = (
-        [str(requested_remote_url).strip()] if remote_requested else None
-    )
+    external_servers = [str(requested_remote_url).strip()] if remote_requested else None
 
     return {
         "remote_vllm": remote_requested,
@@ -679,21 +668,18 @@ def _convert_online_rl_data(
     if difficulty_min is not None:
         if difficulty_min not in _DIFFICULTY_RANK:
             raise ValueError(
-                f"Invalid difficulty_min={difficulty_min!r}. "
-                f"Must be one of: {_DIFFICULTY_ORDER}"
+                f"Invalid difficulty_min={difficulty_min!r}. Must be one of: {_DIFFICULTY_ORDER}"
             )
         min_rank = _DIFFICULTY_RANK[difficulty_min]
     if difficulty_max is not None:
         if difficulty_max not in _DIFFICULTY_RANK:
             raise ValueError(
-                f"Invalid difficulty_max={difficulty_max!r}. "
-                f"Must be one of: {_DIFFICULTY_ORDER}"
+                f"Invalid difficulty_max={difficulty_max!r}. Must be one of: {_DIFFICULTY_ORDER}"
             )
         max_rank = _DIFFICULTY_RANK[difficulty_max]
     if min_rank is not None and max_rank is not None and min_rank > max_rank:
         raise ValueError(
-            f"difficulty_min={difficulty_min!r} is harder than "
-            f"difficulty_max={difficulty_max!r}."
+            f"difficulty_min={difficulty_min!r} is harder than difficulty_max={difficulty_max!r}."
         )
 
     converted = 0
@@ -777,6 +763,7 @@ def _convert_online_rl_data(
         endpoints only, and strips known legacy prompt sections that leak
         challenge-specific shortcuts.
         """
+
         def _strip_legacy_non_neutral_sections(text: str) -> str:
             blocked_headers = {
                 "# WEB RECON CHECKLIST",
@@ -886,13 +873,15 @@ def _convert_online_rl_data(
             # Ensure prompt ends with user message (SkyRL requirement)
             if not prompt or prompt[-1]["role"] != "user":
                 challenge = sample.get("metadata", {}).get("challenge", "")
-                prompt.append({
-                    "role": "user",
-                    "content": (
-                        f"Solve the CTF challenge{f': {challenge}' if challenge else ''}. "
-                        "Find and capture the flag."
-                    ),
-                })
+                prompt.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Solve the CTF challenge{f': {challenge}' if challenge else ''}. "
+                            "Find and capture the flag."
+                        ),
+                    }
+                )
 
             # Flatten extras as top-level keys (SkyRL reads them as extras).
             # env_class is required — SkyRL dataset pops it to find the registered env.
@@ -946,7 +935,11 @@ def _convert_online_rl_data(
                     continue
 
             # Difficulty curriculum filter: skip challenges outside the allowed range.
-            if (min_rank is not None or max_rank is not None) and registry and resolved_challenge_id:
+            if (
+                (min_rank is not None or max_rank is not None)
+                and registry
+                and resolved_challenge_id
+            ):
                 try:
                     _diff_info = registry.get(str(resolved_challenge_id))
                     diff_rank = _DIFFICULTY_RANK.get(_diff_info.difficulty)
@@ -978,7 +971,11 @@ def _convert_online_rl_data(
                     registry_flag = info.ground_truth_flag or None
                     if not registry_flag:
                         missing_registry_flag_ids.add(str(resolved_challenge_id))
-                    if registry_flag and sample_flag and sample_flag.strip() != str(registry_flag).strip():
+                    if (
+                        registry_flag
+                        and sample_flag
+                        and sample_flag.strip() != str(registry_flag).strip()
+                    ):
                         key = str(resolved_challenge_id)
                         flag_mismatch_counts[key] = flag_mismatch_counts.get(key, 0) + 1
                 except KeyError:
@@ -998,9 +995,7 @@ def _convert_online_rl_data(
             # Enforce target protocol semantics by challenge category.
             # Web challenges should use HTTP URLs; pwn/crypto should use raw TCP
             # host:port targets so tool usage aligns with challenge interfaces.
-            category_hint = str(
-                registry_category or metadata.get("category") or ""
-            ).strip().lower()
+            category_hint = str(registry_category or metadata.get("category") or "").strip().lower()
             if target and category_hint in {"pwn", "crypto"}:
                 parsed_target = urlparse(str(target))
                 if (
@@ -1208,8 +1203,7 @@ def _resolve_skyrl_logger(report_to: str, output_dir: str) -> str:
         return value
 
     logger.warning(
-        "Unrecognized report_to=%r; falling back to 'console'. "
-        "Valid options: %s",
+        "Unrecognized report_to=%r; falling back to 'console'. Valid options: %s",
         report_to,
         sorted(_VALID_SKYRL_LOGGERS),
     )
@@ -1237,25 +1231,18 @@ def _setup_persistent_logging(output_dir: str) -> None:
     logger.info("Persistent training log: %s", log_path)
 
 
-def _build_skyrl_config(
-    model_path: str,
-    output_dir: str,
-    config: dict[str, Any],
-    data_path: str,
-) -> dict[str, Any]:
-    """Build a SkyRL config dict matching SkyRLConfig dataclass schema.
+def _load_skyrl_defaults() -> dict[str, Any]:
+    """Load SkyRL's default config as a base dict.
 
-    Uses SkyRLConfig dataclass defaults as the base, then overrides with
-    our training-specific values. This ensures all required keys exist
-    regardless of SkyRL version.
+    Tries the Python dataclass first (SkyRL < 0.3.1), then falls back to
+    the Hydra YAML config (SkyRL 0.3.1+).
     """
-    # Load SkyRL's default config as a base. SkyRL 0.3.1 uses a Hydra
-    # YAML config (ppo_base_config.yaml) rather than a Python dataclass.
-    skyrl_defaults = {}
+    skyrl_defaults: dict[str, Any] = {}
     try:
         from dataclasses import asdict
 
         from skyrl_train.config.config import SkyRLConfig
+
         skyrl_defaults = asdict(SkyRLConfig())
     except (ImportError, ModuleNotFoundError):
         pass
@@ -1264,10 +1251,8 @@ def _build_skyrl_config(
             import importlib.resources as pkg_resources
 
             from omegaconf import OmegaConf as _OC
-            # Load the YAML base config from skyrl_train package
-            cfg_dir = Path(
-                pkg_resources.files("skyrl_train") / "config"
-            )
+
+            cfg_dir = Path(pkg_resources.files("skyrl_train") / "config")
             base_yaml = cfg_dir / "ppo_base_config.yaml"
             if base_yaml.exists():
                 raw = _OC.load(base_yaml)
@@ -1275,27 +1260,19 @@ def _build_skyrl_config(
                 logger.info("Loaded SkyRL base config from %s", base_yaml)
         except Exception as exc:
             logger.warning("Could not load SkyRL base config: %s", exc)
+    return skyrl_defaults
 
-    model_cfg = config.get("model", {})
-    lora_cfg = config.get("lora", {})
-    online_rl_cfg = _resolve_online_rl_cfg(config)
-    output_cfg = config.get("output", {})
-    lora_rank = _parse_lora_rank(lora_cfg)
-    lora_target_modules, lora_exclude_modules = _parse_lora_modules(lora_cfg)
-    topology = _resolve_generator_topology(online_rl_cfg, lora_rank=lora_rank)
-    remote_vllm = topology["remote_vllm"]
-    requested_flash_attn = bool(online_rl_cfg.get("flash_attn", False))
-    enable_flash_attn = requested_flash_attn and _flash_attn_available()
-    if requested_flash_attn and not enable_flash_attn:
-        logger.warning(
-            "flash_attn requested but unavailable in this environment; falling back to SDPA."
-        )
-    use_sample_packing = bool(online_rl_cfg.get("use_sample_packing", False))
-    if use_sample_packing and not enable_flash_attn:
-        logger.warning(
-            "use_sample_packing requested without flash_attn support; disabling sample packing."
-        )
-        use_sample_packing = False
+
+def _resolve_vllm_params(
+    online_rl_cfg: dict[str, Any],
+    model_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve vLLM context-window, sequence, and batching parameters.
+
+    Returns a flat dict with all resolved integer params that downstream
+    config assembly needs (max_prompt_length, max_completion_length,
+    vllm_max_model_len, num_generations, max_num_seqs, etc.).
+    """
     model_max_seq_length = _as_positive_int(
         "model.max_seq_length",
         model_cfg.get("max_seq_length"),
@@ -1311,9 +1288,10 @@ def _build_skyrl_config(
         online_rl_cfg.get("max_prompt_length"),
         model_max_seq_length,
     )
-    # Keep vLLM's max_model_len sized for actual rollout windows instead of the
-    # model's full context by default (for example 262K Qwen max pos emb), which
-    # can allocate excessive KV cache and OOM on otherwise-valid settings.
+
+    # Keep vLLM's max_model_len sized for actual rollout windows instead of
+    # the model's full context (e.g. 262K Qwen max pos emb), which can
+    # allocate excessive KV cache and OOM on otherwise-valid settings.
     vllm_headroom_tokens = _as_positive_int(
         "online_rl.vllm_context_headroom_tokens",
         online_rl_cfg.get("vllm_context_headroom_tokens"),
@@ -1342,13 +1320,7 @@ def _build_skyrl_config(
             min_required_vllm_len,
         )
         vllm_max_model_len = min_required_vllm_len
-    vllm_language_model_only = bool(online_rl_cfg.get("vllm_language_model_only", False))
-    vllm_attention_backend = online_rl_cfg.get("vllm_attention_backend")
-    if vllm_attention_backend is not None:
-        vllm_attention_backend = str(vllm_attention_backend).strip() or None
-    vllm_mm_encoder_attn_backend = online_rl_cfg.get("vllm_mm_encoder_attn_backend")
-    if vllm_mm_encoder_attn_backend is not None:
-        vllm_mm_encoder_attn_backend = str(vllm_mm_encoder_attn_backend).strip() or None
+
     num_generations = _as_positive_int(
         "online_rl.num_generations",
         online_rl_cfg.get("num_generations"),
@@ -1368,6 +1340,7 @@ def _build_skyrl_config(
             num_generations,
         )
         max_num_seqs = num_generations
+
     default_batched_tokens = min(
         32768,
         max(max_prompt_length, num_generations * max(1024, max_completion_length // 2)),
@@ -1396,6 +1369,329 @@ def _build_skyrl_config(
         )
         max_num_batched_tokens = max_prefill_capacity
 
+    vllm_attention_backend = online_rl_cfg.get("vllm_attention_backend")
+    if vllm_attention_backend is not None:
+        vllm_attention_backend = str(vllm_attention_backend).strip() or None
+    vllm_mm_encoder_attn_backend = online_rl_cfg.get("vllm_mm_encoder_attn_backend")
+    if vllm_mm_encoder_attn_backend is not None:
+        vllm_mm_encoder_attn_backend = str(vllm_mm_encoder_attn_backend).strip() or None
+
+    return {
+        "model_max_seq_length": model_max_seq_length,
+        "max_completion_length": max_completion_length,
+        "max_prompt_length": max_prompt_length,
+        "vllm_max_model_len": vllm_max_model_len,
+        "vllm_language_model_only": bool(online_rl_cfg.get("vllm_language_model_only", False)),
+        "vllm_attention_backend": vllm_attention_backend,
+        "vllm_mm_encoder_attn_backend": vllm_mm_encoder_attn_backend,
+        "num_generations": num_generations,
+        "max_num_seqs": max_num_seqs,
+        "max_num_batched_tokens": max_num_batched_tokens,
+    }
+
+
+def _resolve_generation_params(
+    online_rl_cfg: dict[str, Any],
+    remote_vllm: bool,
+    chat_template_name: str | None,
+) -> dict[str, Any]:
+    """Resolve sampling / temperature / stop parameters for train and eval.
+
+    Returns a dict with ``train_sampling`` and ``eval_sampling`` sub-dicts
+    ready for insertion into the SkyRL generator config, plus ``logprobs``
+    and ``eval_logprobs`` top-level keys.
+    """
+    default_logprobs = None if remote_vllm else 0
+    train_logprobs = online_rl_cfg.get("logprobs", default_logprobs)
+    eval_logprobs = online_rl_cfg.get("eval_logprobs", train_logprobs)
+
+    # SkyRL's multi-turn generator does not support response-logprob
+    # bookkeeping when a custom chat template is used.
+    if chat_template_name and train_logprobs is not None:
+        logger.warning(
+            "Custom chat_template=%r set with logprobs=%r; forcing "
+            "generator.sampling_params.logprobs=None for SkyRL compatibility.",
+            chat_template_name,
+            train_logprobs,
+        )
+        train_logprobs = None
+    if chat_template_name and eval_logprobs is not None:
+        logger.warning(
+            "Custom chat_template=%r set with eval_logprobs=%r; forcing "
+            "generator.eval_sampling_params.logprobs=None for SkyRL compatibility.",
+            chat_template_name,
+            eval_logprobs,
+        )
+        eval_logprobs = None
+
+    generation_temperature = _as_float(
+        "online_rl.generation_temperature",
+        online_rl_cfg.get("generation_temperature"),
+        1.0,
+    )
+    generation_top_p = _as_float(
+        "online_rl.generation_top_p",
+        online_rl_cfg.get("generation_top_p"),
+        0.95,
+    )
+    generation_min_p = _as_float(
+        "online_rl.generation_min_p",
+        online_rl_cfg.get("generation_min_p"),
+        0.0,
+    )
+    generation_top_k = int(online_rl_cfg.get("generation_top_k", -1))
+    generation_stop = online_rl_cfg.get("generation_stop")
+    if generation_stop is not None and not isinstance(generation_stop, list):
+        generation_stop = [str(generation_stop)]
+
+    eval_generation_temperature = _as_float(
+        "online_rl.eval_generation_temperature",
+        online_rl_cfg.get("eval_generation_temperature"),
+        0.6,
+    )
+    eval_generation_top_p = _as_float(
+        "online_rl.eval_generation_top_p",
+        online_rl_cfg.get("eval_generation_top_p"),
+        0.95,
+    )
+    eval_generation_min_p = _as_float(
+        "online_rl.eval_generation_min_p",
+        online_rl_cfg.get("eval_generation_min_p"),
+        0.0,
+    )
+    eval_generation_top_k = int(online_rl_cfg.get("eval_generation_top_k", -1))
+    eval_generation_stop = online_rl_cfg.get("eval_generation_stop")
+    if eval_generation_stop is not None and not isinstance(eval_generation_stop, list):
+        eval_generation_stop = [str(eval_generation_stop)]
+
+    return {
+        "train_logprobs": train_logprobs,
+        "eval_logprobs": eval_logprobs,
+        "train_sampling": {
+            "temperature": generation_temperature,
+            "top_p": generation_top_p,
+            "min_p": generation_min_p,
+            "top_k": generation_top_k,
+            "stop": generation_stop,
+        },
+        "eval_sampling": {
+            "temperature": eval_generation_temperature,
+            "top_p": eval_generation_top_p,
+            "min_p": eval_generation_min_p,
+            "top_k": eval_generation_top_k,
+            "stop": eval_generation_stop,
+        },
+    }
+
+
+def _resolve_chat_template_and_tools(
+    online_rl_cfg: dict[str, Any],
+) -> tuple[str | None, dict[str, Any], bool, bool]:
+    """Resolve chat template name, kwargs, native tool schema flag, and step-wise flag.
+
+    Returns:
+        (chat_template_name, chat_template_kwargs, native_tool_schemas, step_wise_trajectories)
+    """
+    chat_template_name = online_rl_cfg.get("chat_template")
+    chat_template_kwargs = online_rl_cfg.get("chat_template_kwargs", {})
+
+    # Native tool schema injection via chat_template_kwargs.
+    # IMPORTANT: SkyRL custom templates (qwen3_without_thinking,
+    # qwen3_with_thinking) do NOT have a {% if tools %} block — they
+    # silently ignore the tools= kwarg.  Auto-downgrade when detected.
+    native_tool_schemas = bool(online_rl_cfg.get("native_tool_schemas", True))
+    if native_tool_schemas and chat_template_name:
+        logger.warning(
+            "native_tool_schemas=True but custom chat_template=%r is set. "
+            "SkyRL custom templates do NOT have {%% if tools %%} — tools "
+            "would be silently dropped.  Auto-downgrading to "
+            "native_tool_schemas=False (text injection via "
+            "_inject_tool_schemas).  [Issue #38]",
+            chat_template_name,
+        )
+        native_tool_schemas = False
+    if native_tool_schemas and "tools" not in chat_template_kwargs:
+        from open_ctf.formatters.tool_registry import get_runtime_tools
+
+        chat_template_kwargs = dict(chat_template_kwargs)
+        chat_template_kwargs["tools"] = get_runtime_tools()
+        logger.info(
+            "Native tool schemas enabled: injecting %d tools into "
+            "chat_template_kwargs (tokenizer will format per model template).",
+            len(chat_template_kwargs["tools"]),
+        )
+
+    step_wise_trajectories = bool(online_rl_cfg.get("step_wise_trajectories", False))
+    allow_step_wise_with_custom_template = bool(
+        online_rl_cfg.get("allow_step_wise_with_custom_chat_template", False)
+    )
+    if chat_template_name and step_wise_trajectories and not allow_step_wise_with_custom_template:
+        if bool(online_rl_cfg.get("step_wise_strict_compat", False)):
+            raise ValueError(
+                "online_rl.step_wise_trajectories=true is incompatible with "
+                f"online_rl.chat_template={chat_template_name!r} in current SkyRL. "
+                "Set online_rl.step_wise_trajectories=false, remove online_rl.chat_template, "
+                "or set online_rl.step_wise_strict_compat=false to auto-disable."
+            )
+        logger.warning(
+            "online_rl.step_wise_trajectories=true is incompatible with custom "
+            "chat_template=%r in current SkyRL; auto-disabling step-wise "
+            "trajectories for this run.",
+            chat_template_name,
+        )
+        step_wise_trajectories = False
+    elif chat_template_name and step_wise_trajectories and allow_step_wise_with_custom_template:
+        logger.warning(
+            "Using online_rl.allow_step_wise_with_custom_chat_template=true with "
+            "chat_template=%r. Ensure SkyRL includes the step-wise + custom "
+            "chat-template compatibility fix.",
+            chat_template_name,
+        )
+
+    _validate_step_wise_resp_index_guard(online_rl_cfg, step_wise_trajectories)
+
+    return chat_template_name, chat_template_kwargs, native_tool_schemas, step_wise_trajectories
+
+
+def _detect_transformer_layer_cls(
+    model_path: str,
+    online_rl_cfg: dict[str, Any],
+) -> tuple[str | None, Any]:
+    """Auto-detect the transformer decoder layer class name for FSDP wrapping.
+
+    Also validates Qwen3.5-specific runtime dependencies when applicable.
+
+    Returns:
+        (transformer_layer_cls_name, auto_config)
+    """
+    _ARCH_TO_LAYER_CLS = {
+        "LlamaForCausalLM": "LlamaDecoderLayer",
+        "Qwen2ForCausalLM": "Qwen2DecoderLayer",
+        "Qwen3ForCausalLM": "Qwen3DecoderLayer",
+        "Qwen3_5ForConditionalGeneration": "Qwen3_5DecoderLayer",
+        "MistralForCausalLM": "MistralDecoderLayer",
+        "GptOssForCausalLM": "GptOssDecoderLayer",
+    }
+    auto_cfg = None
+    transformer_layer_cls = None
+    try:
+        from transformers import AutoConfig
+
+        auto_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        arch = getattr(auto_cfg, "architectures", [None])[0]
+        transformer_layer_cls = _ARCH_TO_LAYER_CLS.get(arch)
+        if not transformer_layer_cls and arch:
+            base = arch.replace("ForCausalLM", "")
+            transformer_layer_cls = f"{base}DecoderLayer"
+    except Exception:
+        pass
+    if auto_cfg is not None:
+        _validate_qwen3_5_runtime_dependencies(auto_cfg, online_rl_cfg)
+    return transformer_layer_cls, auto_cfg
+
+
+def _merge_skyrl_defaults(
+    skyrl_config: dict[str, Any],
+    skyrl_defaults: dict[str, Any],
+) -> dict[str, Any]:
+    """Deep-merge SkyRL defaults under our overrides, then sanitize.
+
+    Strips Hydra/OmegaConf interpolation artefacts and removes vLLM 0.16
+    incompatible ``additional_kwargs`` from sampling params.
+    """
+    if not skyrl_defaults:
+        return skyrl_config
+
+    _HYDRA_KEYS = {"defaults", "deepspeed_config", "megatron_config"}
+    for k in _HYDRA_KEYS:
+        skyrl_defaults.pop(k, None)
+
+    def _strip_interpolations(d: Any) -> Any:
+        """Remove dict values that are OmegaConf interpolation strings."""
+        if not isinstance(d, dict):
+            return d
+        cleaned = {}
+        for k, v in d.items():
+            if isinstance(v, str) and "${" in v:
+                continue
+            elif isinstance(v, dict):
+                cleaned[k] = _strip_interpolations(v)
+            else:
+                cleaned[k] = v
+        return cleaned
+
+    skyrl_defaults = _strip_interpolations(skyrl_defaults)
+
+    def _deep_merge(base: dict, override: dict) -> dict:
+        """Recursively merge override into base dict."""
+        result = dict(base)
+        for k, v in override.items():
+            if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+                result[k] = _deep_merge(result[k], v)
+            else:
+                result[k] = v
+        return result
+
+    merged = _deep_merge(skyrl_defaults, skyrl_config)
+
+    # Remove any remaining Hydra/OmegaConf interpolation keys
+    for k in ("defaults", "deepspeed_config", "megatron_config"):
+        merged.pop(k, None)
+
+    # vLLM 0.16 rejects SamplingParams.additional_kwargs; older SkyRL
+    # defaults can reintroduce it during deep-merge.
+    generator_cfg = merged.get("generator", {})
+    for key in ("sampling_params", "eval_sampling_params"):
+        sampling = generator_cfg.get(key)
+        if isinstance(sampling, dict):
+            sampling.pop("additional_kwargs", None)
+
+    return merged
+
+
+def _build_skyrl_config(
+    model_path: str,
+    output_dir: str,
+    config: dict[str, Any],
+    data_path: str,
+) -> dict[str, Any]:
+    """Build a SkyRL config dict matching SkyRLConfig dataclass schema.
+
+    Delegates to focused helpers for each configuration concern, then
+    assembles the final dict.
+    """
+    skyrl_defaults = _load_skyrl_defaults()
+
+    model_cfg = config.get("model", {})
+    lora_cfg = config.get("lora", {})
+    online_rl_cfg = _resolve_online_rl_cfg(config)
+    output_cfg = config.get("output", {})
+    lora_rank = _parse_lora_rank(lora_cfg)
+    lora_target_modules, lora_exclude_modules = _parse_lora_modules(lora_cfg)
+    topology = _resolve_generator_topology(online_rl_cfg, lora_rank=lora_rank)
+    remote_vllm = topology["remote_vllm"]
+    requested_flash_attn = bool(online_rl_cfg.get("flash_attn", False))
+    enable_flash_attn = requested_flash_attn and _flash_attn_available()
+    if requested_flash_attn and not enable_flash_attn:
+        logger.warning(
+            "flash_attn requested but unavailable in this environment; falling back to SDPA."
+        )
+    use_sample_packing = bool(online_rl_cfg.get("use_sample_packing", False))
+    if use_sample_packing and not enable_flash_attn:
+        logger.warning(
+            "use_sample_packing requested without flash_attn support; disabling sample packing."
+        )
+        use_sample_packing = False
+    # --- vLLM context / sequence / batching params ----------------------
+    vllm = _resolve_vllm_params(online_rl_cfg, model_cfg)
+    max_prompt_length = vllm["max_prompt_length"]
+    max_completion_length = vllm["max_completion_length"]
+    vllm_max_model_len = vllm["vllm_max_model_len"]
+    num_generations = vllm["num_generations"]
+    max_num_seqs = vllm["max_num_seqs"]
+    max_num_batched_tokens = vllm["max_num_batched_tokens"]
+
+    # --- Inference engine parallelism ----------------------------------
     num_inference_engines = _as_positive_int(
         "online_rl.num_inference_engines",
         online_rl_cfg.get("num_inference_engines"),
@@ -1416,6 +1712,13 @@ def _build_skyrl_config(
         online_rl_cfg.get("inference_engine_data_parallel_size"),
         1,
     )
+    inference_engine_expert_parallel_size = _as_positive_int(
+        "online_rl.inference_engine_expert_parallel_size",
+        online_rl_cfg.get("inference_engine_expert_parallel_size"),
+        1,
+    )
+
+    # --- Training loop params ------------------------------------------
     max_tool_calling_iterations = _as_positive_int(
         "online_rl.max_tool_calling_iterations",
         online_rl_cfg.get("max_tool_calling_iterations"),
@@ -1451,11 +1754,11 @@ def _build_skyrl_config(
     async_engine = bool(online_rl_cfg.get("async_engine", True))
     batched = bool(online_rl_cfg.get("batched", False))
     apply_overlong_filtering = bool(online_rl_cfg.get("apply_overlong_filtering", False))
-    inference_engine_expert_parallel_size = _as_positive_int(
-        "online_rl.inference_engine_expert_parallel_size",
-        online_rl_cfg.get("inference_engine_expert_parallel_size"),
-        1,
+    tool_call_format = (
+        str(online_rl_cfg.get("tool_call_format", "qwen3_coder")).strip() or "qwen3_coder"
     )
+
+    # --- Validation data -----------------------------------------------
     val_data_cfg = online_rl_cfg.get("val_data", [])
     if isinstance(val_data_cfg, str) and val_data_cfg.strip():
         val_data = [val_data_cfg]
@@ -1468,7 +1771,11 @@ def _build_skyrl_config(
         online_rl_cfg.get("max_env_workers"),
         32,
     )
-    use_ref_model = bool(online_rl_cfg.get("beta", 0.0) > 0.0 or online_rl_cfg.get("use_kl_in_reward", False))
+
+    # --- GPU topology / placement --------------------------------------
+    use_ref_model = bool(
+        online_rl_cfg.get("beta", 0.0) > 0.0 or online_rl_cfg.get("use_kl_in_reward", False)
+    )
     policy_num_gpus_per_node = _as_positive_int(
         "online_rl.policy_num_gpus_per_node",
         online_rl_cfg.get("policy_num_gpus_per_node"),
@@ -1507,6 +1814,7 @@ def _build_skyrl_config(
         ref_num_gpus_per_node = 0
     colocate_policy_ref = bool(online_rl_cfg.get("colocate_policy_ref", True)) and use_ref_model
 
+    # Auto-adjust inference engines if GPU count is insufficient.
     visible_gpu_count = _detect_visible_gpu_count()
     if (
         visible_gpu_count is not None
@@ -1522,10 +1830,14 @@ def _build_skyrl_config(
             * inference_engine_pipeline_parallel_size
             * inference_engine_data_parallel_size
         )
-        required_gpus = policy_gpus + ref_gpus + critic_gpus + (num_inference_engines * gpus_per_engine)
+        required_gpus = (
+            policy_gpus + ref_gpus + critic_gpus + (num_inference_engines * gpus_per_engine)
+        )
         if required_gpus > visible_gpu_count:
             explicit_num_engines = "num_inference_engines" in online_rl_cfg
-            available_for_inference = max(0, visible_gpu_count - policy_gpus - ref_gpus - critic_gpus)
+            available_for_inference = max(
+                0, visible_gpu_count - policy_gpus - ref_gpus - critic_gpus
+            )
             max_auto_engines = available_for_inference // max(1, gpus_per_engine)
             if not explicit_num_engines and max_auto_engines > 0:
                 logger.warning(
@@ -1548,207 +1860,55 @@ def _build_skyrl_config(
                     num_inference_engines * gpus_per_engine,
                     visible_gpu_count,
                 )
-    chat_template_name = online_rl_cfg.get("chat_template", None)
-    chat_template_kwargs = online_rl_cfg.get("chat_template_kwargs", {})
 
-    # --- Native tool schema injection via chat_template_kwargs ---------
-    # When True, tools are passed as chat_template_kwargs["tools"] so the
-    # tokenizer's Jinja2 template formats them natively (e.g. Qwen3.5's
-    # native template renders qwen3_coder XML with format instructions).
-    #
-    # IMPORTANT: SkyRL's custom chat templates (qwen3_without_thinking,
-    # qwen3_with_thinking) do NOT have a {% if tools %} block — they
-    # silently ignore the tools= kwarg.  When a custom template is in use,
-    # we MUST fall back to text injection via _inject_tool_schemas() in
-    # OpenCTFTextEnv.init().  This guard auto-downgrades to avoid the
-    # silent tool-drop bug (Issue #38).
-    native_tool_schemas = bool(
-        online_rl_cfg.get("native_tool_schemas", True)
-    )
-    if native_tool_schemas and chat_template_name:
-        # SkyRL custom templates (qwen3_without_thinking, qwen3_with_thinking)
-        # don't handle tools= kwarg.  Auto-downgrade to text injection.
-        logger.warning(
-            "native_tool_schemas=True but custom chat_template=%r is set. "
-            "SkyRL custom templates do NOT have {%% if tools %%} — tools "
-            "would be silently dropped.  Auto-downgrading to "
-            "native_tool_schemas=False (text injection via "
-            "_inject_tool_schemas).  [Issue #38]",
-            chat_template_name,
-        )
-        native_tool_schemas = False
-    if native_tool_schemas and "tools" not in chat_template_kwargs:
-        from open_ctf.formatters.tool_registry import get_runtime_tools
-        chat_template_kwargs = dict(chat_template_kwargs)  # avoid mutating config
-        chat_template_kwargs["tools"] = get_runtime_tools()
-        logger.info(
-            "Native tool schemas enabled: injecting %d tools into "
-            "chat_template_kwargs (tokenizer will format per model template).",
-            len(chat_template_kwargs["tools"]),
-        )
+    # --- Chat template, tool schemas, step-wise ------------------------
+    (
+        chat_template_name,
+        chat_template_kwargs,
+        native_tool_schemas,
+        step_wise_trajectories,
+    ) = _resolve_chat_template_and_tools(online_rl_cfg)
 
-    step_wise_trajectories = bool(online_rl_cfg.get("step_wise_trajectories", False))
-    allow_step_wise_with_custom_template = bool(
-        online_rl_cfg.get("allow_step_wise_with_custom_chat_template", False)
-    )
-    default_logprobs = None if remote_vllm else 0
-    train_logprobs = online_rl_cfg.get("logprobs", default_logprobs)
-    eval_logprobs = online_rl_cfg.get("eval_logprobs", train_logprobs)
+    # --- Generation sampling params ------------------------------------
+    gen = _resolve_generation_params(online_rl_cfg, remote_vllm, chat_template_name)
 
-    # SkyRL's multi-turn generator does not support response-logprob bookkeeping
-    # when a custom chat template is used. Enforce this at config build time
-    # so every benchmark/model path gets the same safe behavior.
-    if chat_template_name and train_logprobs is not None:
-        logger.warning(
-            "Custom chat_template=%r set with logprobs=%r; forcing "
-            "generator.sampling_params.logprobs=None for SkyRL compatibility.",
-            chat_template_name,
-            train_logprobs,
-        )
-        train_logprobs = None
-    if chat_template_name and eval_logprobs is not None:
-        logger.warning(
-            "Custom chat_template=%r set with eval_logprobs=%r; forcing "
-            "generator.eval_sampling_params.logprobs=None for SkyRL compatibility.",
-            chat_template_name,
-            eval_logprobs,
-        )
-        eval_logprobs = None
+    # --- FSDP transformer layer detection ------------------------------
+    transformer_layer_cls, _ = _detect_transformer_layer_cls(model_path, online_rl_cfg)
 
-    generation_temperature = _as_float(
-        "online_rl.generation_temperature",
-        online_rl_cfg.get("generation_temperature"),
-        1.0,
-    )
-    generation_top_p = _as_float(
-        "online_rl.generation_top_p",
-        online_rl_cfg.get("generation_top_p"),
-        0.95,
-    )
-    generation_min_p = _as_float(
-        "online_rl.generation_min_p",
-        online_rl_cfg.get("generation_min_p"),
-        0.0,
-    )
-    generation_top_k = int(online_rl_cfg.get("generation_top_k", -1))
-    generation_stop = online_rl_cfg.get("generation_stop")
-    if generation_stop is not None and not isinstance(generation_stop, list):
-        generation_stop = [str(generation_stop)]
-    tool_call_format = str(online_rl_cfg.get("tool_call_format", "qwen3_coder")).strip() or "qwen3_coder"
-
-    eval_generation_temperature = _as_float(
-        "online_rl.eval_generation_temperature",
-        online_rl_cfg.get("eval_generation_temperature"),
-        0.6,
-    )
-    eval_generation_top_p = _as_float(
-        "online_rl.eval_generation_top_p",
-        online_rl_cfg.get("eval_generation_top_p"),
-        0.95,
-    )
-    eval_generation_min_p = _as_float(
-        "online_rl.eval_generation_min_p",
-        online_rl_cfg.get("eval_generation_min_p"),
-        0.0,
-    )
-    eval_generation_top_k = int(online_rl_cfg.get("eval_generation_top_k", -1))
-    eval_generation_stop = online_rl_cfg.get("eval_generation_stop")
-    if eval_generation_stop is not None and not isinstance(eval_generation_stop, list):
-        eval_generation_stop = [str(eval_generation_stop)]
-
-    # SkyRL currently rejects step-wise trajectories with custom chat templates.
-    # Apply one centralized compatibility policy for all model/config combinations.
-    if (
-        chat_template_name
-        and step_wise_trajectories
-        and not allow_step_wise_with_custom_template
-    ):
-        if bool(online_rl_cfg.get("step_wise_strict_compat", False)):
-            raise ValueError(
-                "online_rl.step_wise_trajectories=true is incompatible with "
-                f"online_rl.chat_template={chat_template_name!r} in current SkyRL. "
-                "Set online_rl.step_wise_trajectories=false, remove online_rl.chat_template, "
-                "or set online_rl.step_wise_strict_compat=false to auto-disable."
-            )
-        logger.warning(
-            "online_rl.step_wise_trajectories=true is incompatible with custom "
-            "chat_template=%r in current SkyRL; auto-disabling step-wise "
-            "trajectories for this run.",
-            chat_template_name,
-        )
-        step_wise_trajectories = False
-    elif (
-        chat_template_name
-        and step_wise_trajectories
-        and allow_step_wise_with_custom_template
-    ):
-        logger.warning(
-            "Using online_rl.allow_step_wise_with_custom_chat_template=true with "
-            "chat_template=%r. Ensure SkyRL includes the step-wise + custom "
-            "chat-template compatibility fix.",
-            chat_template_name,
-        )
-
-    _validate_step_wise_resp_index_guard(online_rl_cfg, step_wise_trajectories)
-
-    # Detect transformer layer class for FSDP wrapping.
-    # model._no_split_modules returns a set on some architectures (e.g. Llama),
-    # which triggers a set-indexing bug in SkyRL's apply_fsdp2.
-    # We auto-detect and pass the class name as a string to avoid this.
-    _ARCH_TO_LAYER_CLS = {
-        "LlamaForCausalLM": "LlamaDecoderLayer",
-        "Qwen2ForCausalLM": "Qwen2DecoderLayer",
-        "Qwen3ForCausalLM": "Qwen3DecoderLayer",
-        "Qwen3_5ForConditionalGeneration": "Qwen3_5DecoderLayer",
-        "MistralForCausalLM": "MistralDecoderLayer",
-        "GptOssForCausalLM": "GptOssDecoderLayer",
-    }
-    auto_cfg = None
-    transformer_layer_cls = None
-    try:
-        from transformers import AutoConfig
-        auto_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        arch = getattr(auto_cfg, "architectures", [None])[0]
-        transformer_layer_cls = _ARCH_TO_LAYER_CLS.get(arch)
-        if not transformer_layer_cls and arch:
-            # Fallback: guess from architecture name
-            base = arch.replace("ForCausalLM", "")
-            transformer_layer_cls = f"{base}DecoderLayer"
-    except Exception:
-        pass
-    if auto_cfg is not None:
-        _validate_qwen3_5_runtime_dependencies(auto_cfg, online_rl_cfg)
-
-    # Reference model path for KL divergence. Defaults to the policy model
-    # (standard GRPO), but can be overridden for distillation.
+    # --- Reference model & clipping ------------------------------------
     ref_model_path = config.get("ref_model_path", model_path)
     eps_clip_low = online_rl_cfg.get("epsilon_low", 0.2)
     eps_clip_high = online_rl_cfg.get("epsilon_high", eps_clip_low)
 
-    # --- Warmup step computation from warmup_ratio -----------------------
-    # Configs specify warmup_ratio (e.g. 0.10) but SkyRL's optimizer_config
-    # expects num_warmup_steps.  Compute from the ratio and total_episodes
-    # (number of optimizer steps across all epochs).  If warmup_ratio is not
-    # set or 0, fall back to an explicit num_warmup_steps (default 0).
+    # --- Warmup steps --------------------------------------------------
     warmup_ratio = float(online_rl_cfg.get("warmup_ratio", 0.0))
     if warmup_ratio > 0:
         total_episodes = int(online_rl_cfg.get("total_episodes", 100))
         num_warmup_steps = max(1, int(total_episodes * warmup_ratio))
         logger.info(
             "Warmup: ratio=%.3f, total_episodes=%d -> num_warmup_steps=%d",
-            warmup_ratio, total_episodes, num_warmup_steps,
+            warmup_ratio,
+            total_episodes,
+            num_warmup_steps,
         )
     else:
         num_warmup_steps = int(online_rl_cfg.get("num_warmup_steps", 0))
 
+    # --- FSDP wrap policy helper ---------------------------------------
+    fsdp_wrap_policy = (
+        {"transformer_layer_cls_to_wrap": [transformer_layer_cls]} if transformer_layer_cls else {}
+    )
+
+    # ===================================================================
+    # Assemble the final SkyRL config dict
+    # ===================================================================
     skyrl_config = {
         # Data
         "data": {
             "train_data": [data_path],
             "val_data": val_data,
         },
-
-        # Trainer — includes all fields required by SkyRL 0.3.1 validate_cfg
+        # Trainer
         "trainer": {
             "strategy": strategy,
             "bf16": True,
@@ -1764,8 +1924,6 @@ def _build_skyrl_config(
             "micro_train_batch_size_per_gpu": 1,
             "micro_forward_batch_size_per_gpu": 1,
             "max_prompt_length": max_prompt_length,
-            # Keep trainer-side response window bounded; without this,
-            # very long multi-turn traces can spike backward-pass memory.
             "max_response_length": max_completion_length,
             "use_sample_packing": use_sample_packing,
             "eval_batch_size": eval_batch_size,
@@ -1783,19 +1941,14 @@ def _build_skyrl_config(
             "eval_before_train": eval_before_train,
             "project_name": "open-ctf",
             "run_name": "online_rl",
-            "logger": _resolve_skyrl_logger(
-                output_cfg.get("report_to", "tensorboard"), output_dir
-            ),
+            "logger": _resolve_skyrl_logger(output_cfg.get("report_to", "tensorboard"), output_dir),
             "dump_data_batch": False,
             "dump_eval_results": False,
             "target_modules": None,
             "exclude_modules": None,
             "rope_scaling": None,
             "rope_theta": None,
-
             "placement": {
-                # Non-colocated mode allows trainer and local engines to use
-                # separate GPUs while staying on SkyRL's supported LoRA path.
                 "colocate_all": topology["colocate_all"],
                 "colocate_policy_ref": colocate_policy_ref,
                 "policy_num_nodes": policy_num_nodes,
@@ -1805,12 +1958,10 @@ def _build_skyrl_config(
                 "ref_num_nodes": ref_num_nodes,
                 "ref_num_gpus_per_node": ref_num_gpus_per_node,
             },
-
             "fully_async": {
                 "max_staleness_steps": fully_async_max_staleness_steps,
                 "num_parallel_generation_workers": fully_async_num_workers,
             },
-
             "policy": {
                 "model": {
                     "path": model_path,
@@ -1830,11 +1981,7 @@ def _build_skyrl_config(
                     "cpu_offload": False,
                     "reshard_after_forward": True,
                     "fsdp_size": -1,
-                    "wrap_policy": (
-                        {"transformer_layer_cls_to_wrap": [transformer_layer_cls]}
-                        if transformer_layer_cls
-                        else {}
-                    ),
+                    "wrap_policy": fsdp_wrap_policy,
                 },
                 "sequence_parallel_size": 1,
                 "use_torch_compile": False,
@@ -1849,7 +1996,6 @@ def _build_skyrl_config(
                     "scheduler": "constant_with_warmup",
                 },
             },
-
             "ref": {
                 "model": {
                     "path": ref_model_path,
@@ -1858,22 +2004,12 @@ def _build_skyrl_config(
                 "model_config_kwargs": {},
                 "sequence_parallel_size": 1,
                 "fsdp_config": {
-                    # CPU offload ref model when KL beta is 0 (ref logprobs unused).
-                    # Saves ~16-32GB GPU memory for 8B+ models on single-GPU setups.
                     "cpu_offload": online_rl_cfg.get("beta", 0.0) == 0.0,
                     "reshard_after_forward": True,
                     "fsdp_size": -1,
-                    # Mirror policy wrap hints so FSDP2 does not fall back to
-                    # model._no_split_modules (a set on some models, causing
-                    # skyrl_train/distributed/fsdp_utils.py TypeError).
-                    "wrap_policy": (
-                        {"transformer_layer_cls_to_wrap": [transformer_layer_cls]}
-                        if transformer_layer_cls
-                        else {}
-                    ),
+                    "wrap_policy": fsdp_wrap_policy,
                 },
             },
-
             "critic": {
                 "model": {
                     "path": critic_model_path,
@@ -1903,7 +2039,6 @@ def _build_skyrl_config(
                     "scheduler": "constant_with_warmup",
                 },
             },
-
             "algorithm": {
                 "advantage_estimator": online_rl_cfg.get("advantage_estimator", "rloo"),
                 "policy_loss_type": policy_loss_type,
@@ -1978,8 +2113,7 @@ def _build_skyrl_config(
                 },
             },
         },
-
-        # Generator (vLLM inference) — all fields from SkyRL 0.3.1
+        # Generator (vLLM inference)
         "generator": {
             "model_name": model_path,
             "model_dtype": "bfloat16",
@@ -1995,17 +2129,6 @@ def _build_skyrl_config(
             "n_samples_per_prompt": num_generations,
             "async_engine": async_engine,
             "batched": batched,
-            # max_input_length governs when SkyRL truncates the multi-turn
-            # conversation loop.  Setting it to max_prompt_length (the initial
-            # prompt budget) starves multi-turn episodes: the conversation
-            # exceeds max_prompt_length after a few turns, SkyRL breaks the
-            # loop, and the terminal CTFReward is never computed (→ reward=0.0
-            # for all non-terminal steps in episodic mode).
-            #
-            # Use vllm_max_model_len instead — this is the actual KV-cache
-            # budget the inference server can handle, and the total context
-            # window available for the entire conversation (prompt + all
-            # response/observation turns).
             "max_input_length": vllm_max_model_len,
             "vllm_v1_disable_multiproc": True,
             "enable_prefix_caching": bool(online_rl_cfg.get("enable_prefix_caching", True)),
@@ -2017,10 +2140,6 @@ def _build_skyrl_config(
             "gpu_memory_utilization": online_rl_cfg.get("gpu_memory_utilization", 0.4),
             "max_num_seqs": max_num_seqs,
             "remote_inference_engine_urls": topology["remote_inference_engine_urls"],
-            # SkyRL's _SKYRL_USE_NEW_INFERENCE=1 reads external_proxy_url /
-            # external_server_urls to decide whether to skip internal vLLM
-            # engine creation.  Without these, SkyRL spawns a 67+ GiB
-            # internal engine on the training GPU → OOM.
             "external_proxy_url": topology.get("external_proxy_url"),
             "external_server_urls": topology.get("external_server_urls"),
             "tool_call_format": tool_call_format,
@@ -2033,29 +2152,18 @@ def _build_skyrl_config(
                 "source": "name",
                 "name_or_path": chat_template_name,
             },
-            # Pass enable_thinking, reasoning_effort, etc. to tokenizer.
-            # SkyRL unpacks these in every apply_chat_template() call.
-            # For Qwen3/Qwen3.5: {"enable_thinking": true} activates
-            # <think>...</think> generation and correct loss masking.
             "chat_template_kwargs": chat_template_kwargs,
-            # max_model_len limits vLLM's KV cache allocation.  Without this,
-            # vLLM uses the model's max_position_embeddings (e.g. 262144) which
-            # can exceed available GPU memory.  Set to max_input_length + headroom.
             "engine_init_kwargs": {
                 "max_model_len": vllm_max_model_len,
+                **({"language_model_only": True} if vllm["vllm_language_model_only"] else {}),
                 **(
-                    {"language_model_only": True}
-                    if vllm_language_model_only
+                    {"attention_backend": vllm["vllm_attention_backend"]}
+                    if vllm["vllm_attention_backend"]
                     else {}
                 ),
                 **(
-                    {"attention_backend": vllm_attention_backend}
-                    if vllm_attention_backend
-                    else {}
-                ),
-                **(
-                    {"mm_encoder_attn_backend": vllm_mm_encoder_attn_backend}
-                    if vllm_mm_encoder_attn_backend
+                    {"mm_encoder_attn_backend": vllm["vllm_mm_encoder_attn_backend"]}
+                    if vllm["vllm_mm_encoder_attn_backend"]
                     else {}
                 ),
             },
@@ -2063,26 +2171,16 @@ def _build_skyrl_config(
             "sampling_params": {
                 "max_generate_length": max_completion_length,
                 "repetition_penalty": online_rl_cfg.get("repetition_penalty", 1.0),
-                "temperature": generation_temperature,
-                "top_p": generation_top_p,
-                "min_p": generation_min_p,
-                "top_k": generation_top_k,
-                # Local default is 0, remote default is None. If a custom
-                # chat template is configured we force None above.
-                "logprobs": train_logprobs,
-                "stop": generation_stop,
+                **gen["train_sampling"],
+                "logprobs": gen["train_logprobs"],
             },
             "use_conversation_multi_turn": True,
             "append_eos_token_after_stop_str_in_multi_turn": True,
             "eval_sampling_params": {
                 "max_generate_length": max_completion_length,
                 "repetition_penalty": online_rl_cfg.get("repetition_penalty", 1.0),
-                "temperature": eval_generation_temperature,
-                "top_p": eval_generation_top_p,
-                "min_p": eval_generation_min_p,
-                "top_k": eval_generation_top_k,
-                "logprobs": eval_logprobs,
-                "stop": eval_generation_stop,
+                **gen["eval_sampling"],
+                "logprobs": gen["eval_logprobs"],
             },
             "eval_n_samples_per_prompt": 1,
             "zero_reward_on_non_stop": False,
@@ -2090,10 +2188,8 @@ def _build_skyrl_config(
             "rope_scaling": None,
             "rope_theta": None,
             "step_wise_trajectories": step_wise_trajectories,
-            # Pass through so _build_openctf_env_kwargs can read it.
             "native_tool_schemas": native_tool_schemas,
         },
-
         # Environment
         "environment": {
             "env_class": "openctf",
@@ -2103,55 +2199,7 @@ def _build_skyrl_config(
         },
     }
 
-    # Merge with SkyRL defaults to ensure all required keys exist.
-    # Our overrides take precedence over defaults.
-    if skyrl_defaults:
-        # Strip Hydra-specific keys that contain OmegaConf interpolations
-        # (e.g. ${deepspeed_config.train}) — we don't use DeepSpeed/Megatron.
-        _HYDRA_KEYS = {"defaults", "deepspeed_config", "megatron_config"}
-        for k in _HYDRA_KEYS:
-            skyrl_defaults.pop(k, None)
-
-        # Strip any values containing OmegaConf interpolation syntax
-        def _strip_interpolations(d):
-            """Remove dict values that are OmegaConf interpolation strings."""
-            if not isinstance(d, dict):
-                return d
-            cleaned = {}
-            for k, v in d.items():
-                if isinstance(v, str) and "${" in v:
-                    continue  # Skip interpolation references
-                elif isinstance(v, dict):
-                    cleaned[k] = _strip_interpolations(v)
-                else:
-                    cleaned[k] = v
-            return cleaned
-        skyrl_defaults = _strip_interpolations(skyrl_defaults)
-
-        def _deep_merge(base, override):
-            """Recursively merge override into base dict."""
-            result = dict(base)
-            for k, v in override.items():
-                if k in result and isinstance(result[k], dict) and isinstance(v, dict):
-                    result[k] = _deep_merge(result[k], v)
-                else:
-                    result[k] = v
-            return result
-        skyrl_config = _deep_merge(skyrl_defaults, skyrl_config)
-
-    # Remove any remaining Hydra/OmegaConf interpolation keys from final config
-    for k in ("defaults", "deepspeed_config", "megatron_config"):
-        skyrl_config.pop(k, None)
-
-    # vLLM 0.16 rejects SamplingParams.additional_kwargs; older SkyRL defaults
-    # can reintroduce it during deep-merge even when our overrides omit it.
-    generator_cfg = skyrl_config.get("generator", {})
-    for key in ("sampling_params", "eval_sampling_params"):
-        sampling = generator_cfg.get(key)
-        if isinstance(sampling, dict):
-            sampling.pop("additional_kwargs", None)
-
-    return skyrl_config
+    return _merge_skyrl_defaults(skyrl_config, skyrl_defaults)
 
 
 def train_online_rl(
@@ -2199,21 +2247,18 @@ def train_online_rl(
     online_rl_cfg = _resolve_online_rl_cfg(config)
     registry = None
     target_map_path = (
-        os.getenv("OPEN_CTF_TARGET_MAP_PATH")
-        or online_rl_cfg.get("target_map_path")
-        or None
+        os.getenv("OPEN_CTF_TARGET_MAP_PATH") or online_rl_cfg.get("target_map_path") or None
     )
     if challenge_registry:
         from open_ctf.challenges.registry import ChallengeRegistry
+
         registry = ChallengeRegistry(challenge_registry)
         if target_map_path:
-            strict_map = bool(
-                int(os.getenv("OPEN_CTF_TARGET_MAP_STRICT", "0"))
-            ) or bool(online_rl_cfg.get("target_map_strict", False))
+            strict_map = bool(int(os.getenv("OPEN_CTF_TARGET_MAP_STRICT", "0"))) or bool(
+                online_rl_cfg.get("target_map_strict", False)
+            )
             registry.load_target_overrides(str(target_map_path), strict=strict_map)
-    drop_unresolved = bool(
-        online_rl_cfg.get("drop_unresolved_registry_samples", True)
-    )
+    drop_unresolved = bool(online_rl_cfg.get("drop_unresolved_registry_samples", True))
     port_offset = int(
         os.getenv(
             "OPEN_CTF_TARGET_PORT_OFFSET",
@@ -2240,8 +2285,12 @@ def train_online_rl(
         target_host_override=host_override,
         fail_on_target_collisions=bool(online_rl_cfg.get("fail_on_target_collisions", False)),
         fail_on_flag_mismatch=bool(online_rl_cfg.get("fail_on_flag_mismatch", True)),
-        fail_on_missing_registry_flag=bool(online_rl_cfg.get("fail_on_missing_registry_flag", True)),
-        require_all_registry_challenges=bool(online_rl_cfg.get("require_all_registry_challenges", False)),
+        fail_on_missing_registry_flag=bool(
+            online_rl_cfg.get("fail_on_missing_registry_flag", True)
+        ),
+        require_all_registry_challenges=bool(
+            online_rl_cfg.get("require_all_registry_challenges", False)
+        ),
         prefer_registry_target=prefer_registry_target,
         difficulty_min=online_rl_cfg.get("difficulty_min"),
         difficulty_max=online_rl_cfg.get("difficulty_max"),
@@ -2265,9 +2314,7 @@ def train_online_rl(
     # 4. Launch SkyRL training
     reward_config = _resolve_reward_config(config)
     use_new_inference = bool(online_rl_cfg.get("use_new_inference", False))
-    allow_qwen35_new_inference = bool(
-        online_rl_cfg.get("allow_new_inference_for_qwen35", False)
-    )
+    allow_qwen35_new_inference = bool(online_rl_cfg.get("allow_new_inference_for_qwen35", False))
     if use_new_inference and _should_force_legacy_inference(
         model_path,
         allow_qwen35_new_inference=allow_qwen35_new_inference,
@@ -2276,12 +2323,8 @@ def train_online_rl(
 
     # Trajectory logging: pass output_dir through env kwargs (Ray-serializable string).
     logging_cfg = config.get("online_rl_logging", {})
-    enable_trajectory_logging = bool(
-        logging_cfg.get("enable_trajectory_logging", True)
-    )
-    require_trajectory_files = bool(
-        logging_cfg.get("require_trajectory_files", False)
-    )
+    enable_trajectory_logging = bool(logging_cfg.get("enable_trajectory_logging", True))
+    require_trajectory_files = bool(logging_cfg.get("require_trajectory_files", False))
     trajectory_output_dir = output_dir if enable_trajectory_logging else None
 
     # Agent class from CLI flag > config file > DefaultStepAgent fallback.
@@ -2318,7 +2361,9 @@ def train_online_rl(
         )
         positive_only_until_step = 0
     try:
-        positive_only_reward_floor = float(online_rl_cfg.get("positive_only_reward_floor", 0.0) or 0.0)
+        positive_only_reward_floor = float(
+            online_rl_cfg.get("positive_only_reward_floor", 0.0) or 0.0
+        )
     except (TypeError, ValueError):
         logger.warning(
             "Invalid online_rl.positive_only_reward_floor=%r; defaulting to 0.0.",
@@ -2327,7 +2372,8 @@ def train_online_rl(
         positive_only_reward_floor = 0.0
     try:
         _run_skyrl_training(
-            skyrl_config, reward_config,
+            skyrl_config,
+            reward_config,
             agent_class=resolved_agent_class,
             agent_kwargs=resolved_agent_kwargs,
             use_new_inference=use_new_inference,
@@ -2364,11 +2410,14 @@ def train_online_rl(
     if trajectory_output_dir:
         try:
             from .trajectory_logger import TrajectoryLogger
+
             tb_dir = os.environ.get("TENSORBOARD_LOGDIR")
             tl = TrajectoryLogger(trajectory_output_dir, tensorboard_dir=tb_dir)
             tl.save_scoreboard()
             latest_step = 0
-            summary_path = os.path.join(trajectory_output_dir, "trajectories", "step_summaries.jsonl")
+            summary_path = os.path.join(
+                trajectory_output_dir, "trajectories", "step_summaries.jsonl"
+            )
             if os.path.exists(summary_path):
                 with open(summary_path) as f:
                     for line in f:
@@ -2462,13 +2511,9 @@ def _run_skyrl_training(
             "step_wise_trajectories": bool(
                 getattr(cfg_obj.generator, "step_wise_trajectories", False)
             ),
-            "native_tool_schemas": bool(
-                getattr(cfg_obj.generator, "native_tool_schemas", False)
-            ),
+            "native_tool_schemas": bool(getattr(cfg_obj.generator, "native_tool_schemas", False)),
         }
-        tool_call_format = str(
-            getattr(cfg_obj.generator, "tool_call_format", "") or ""
-        ).strip()
+        tool_call_format = str(getattr(cfg_obj.generator, "tool_call_format", "") or "").strip()
         if tool_call_format:
             env_kwargs["tool_call_format"] = tool_call_format
         if horizon:
@@ -2553,6 +2598,7 @@ def _run_skyrl_training(
         positive_only_reward_floor,
     ):
         import os as _os
+
         _os.environ["VLLM_USE_V1"] = "1"
         _os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         if pytorch_cuda_alloc_conf:
