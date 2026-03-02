@@ -13,14 +13,14 @@ Usage (programmatic):
 See also ``open_ctf.cli.evaluate`` for the CLI wrapper.
 """
 
-import json
 import importlib
+import json
 import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import yaml
 
@@ -45,7 +45,7 @@ class ChallengeResult:
     solved: bool
     turns: int
     elapsed_seconds: float
-    error: Optional[str] = None
+    error: str | None = None
 
 
 @dataclass
@@ -60,7 +60,7 @@ class EvalReport:
     solve_rate: float
     avg_turns: float
     avg_time_seconds: float
-    results: List[Dict[str, Any]] = field(default_factory=list)
+    results: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +95,8 @@ class ModelEvaluator:
         reasoning_effort: str = "medium",
         attempts: int = 1,
         agent: str = "boxpwnr",
-        challenge_registry: Optional[str] = None,
-        target_map: Optional[str] = None,
+        challenge_registry: str | None = None,
+        target_map: str | None = None,
         host: str = "localhost",
     ) -> None:
         self.model = model
@@ -117,7 +117,7 @@ class ModelEvaluator:
     # Challenge loading
     # ------------------------------------------------------------------
 
-    def load_challenges(self) -> List[Dict[str, Any]]:
+    def load_challenges(self) -> list[dict[str, Any]]:
         """Load challenge list from YAML config.
 
         Returns:
@@ -144,7 +144,7 @@ class ModelEvaluator:
     # Single challenge run
     # ------------------------------------------------------------------
 
-    def run_challenge(self, challenge: Dict[str, Any]) -> ChallengeResult:
+    def run_challenge(self, challenge: dict[str, Any]) -> ChallengeResult:
         """Run a single challenge and return the result.
 
         Args:
@@ -204,7 +204,7 @@ class ModelEvaluator:
 
     def _run_with_custom_agent(
         self,
-        challenge: Dict[str, Any],
+        challenge: dict[str, Any],
         platform: str,
     ) -> tuple[bool, int]:
         """Run evaluation with a custom CTFAgent implementation."""
@@ -265,7 +265,7 @@ class ModelEvaluator:
         """
         challenges = self.load_challenges()
         self._run_runtime_preflight(challenges)
-        results: List[ChallengeResult] = []
+        results: list[ChallengeResult] = []
 
         for challenge in challenges:
             result = self.run_challenge(challenge)
@@ -295,7 +295,7 @@ class ModelEvaluator:
 
         return report
 
-    def _run_runtime_preflight(self, challenges: List[Dict[str, Any]]) -> None:
+    def _run_runtime_preflight(self, challenges: list[dict[str, Any]]) -> None:
         """Fail fast on registry/target/port/container mismatches for cybench runs."""
         cybench_ids = [
             str(challenge["id"])
@@ -364,8 +364,8 @@ class ModelEvaluator:
     def _format_markdown(report: EvalReport) -> str:
         """Format an EvalReport as a markdown table."""
         lines = [
-            f"# Evaluation Report",
-            f"",
+            "# Evaluation Report",
+            "",
             f"- **Model:** {report.model}",
             f"- **Strategy:** {report.strategy}",
             f"- **Timestamp:** {report.timestamp}",
@@ -374,11 +374,11 @@ class ModelEvaluator:
             f"({report.solve_rate * 100:.1f}%)",
             f"- **Avg Turns:** {report.avg_turns}",
             f"- **Avg Time:** {report.avg_time_seconds}s",
-            f"",
-            f"## Per-Challenge Results",
-            f"",
-            f"| Challenge | Platform | Vuln Type | Difficulty | Solved | Turns | Time (s) | Error |",
-            f"|-----------|----------|-----------|------------|--------|-------|----------|-------|",
+            "",
+            "## Per-Challenge Results",
+            "",
+            "| Challenge | Platform | Vuln Type | Difficulty | Solved | Turns | Time (s) | Error |",
+            "|-----------|----------|-----------|------------|--------|-------|----------|-------|",
         ]
 
         for r in report.results:

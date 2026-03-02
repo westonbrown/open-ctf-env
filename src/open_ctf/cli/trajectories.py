@@ -20,17 +20,17 @@ import os
 import sys
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def _load_step_summaries(trajectories_dir: str) -> List[Dict[str, Any]]:
+def _load_step_summaries(trajectories_dir: str) -> list[dict[str, Any]]:
     """Load step_summaries.jsonl into a list of dicts."""
     path = os.path.join(trajectories_dir, "step_summaries.jsonl")
     if not os.path.exists(path):
         return []
-    entries_by_step: Dict[int, Dict[str, Any]] = {}
+    entries_by_step: dict[int, dict[str, Any]] = {}
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -42,7 +42,7 @@ def _load_step_summaries(trajectories_dir: str) -> List[Dict[str, Any]]:
     return [entries_by_step[k] for k in sorted(entries_by_step)]
 
 
-def _load_step_generations(trajectories_dir: str, step: int) -> List[Dict[str, Any]]:
+def _load_step_generations(trajectories_dir: str, step: int) -> list[dict[str, Any]]:
     """Load all generations for a given step."""
     path = os.path.join(trajectories_dir, f"step_{step}.jsonl")
     if not os.path.exists(path):
@@ -56,7 +56,7 @@ def _load_step_generations(trajectories_dir: str, step: int) -> List[Dict[str, A
     return entries
 
 
-def _load_scoreboard(output_dir: str) -> Dict[str, Any]:
+def _load_scoreboard(output_dir: str) -> dict[str, Any]:
     """Load challenge_scoreboard.json."""
     path = os.path.join(output_dir, "challenge_scoreboard.json")
     if not os.path.exists(path):
@@ -121,7 +121,7 @@ def generate_html(output_dir: str) -> str:
         </tr>"""
 
     # Build step-level generation data (embedded as JSON for JS drill-down)
-    all_generations: Dict[int, List[Dict[str, Any]]] = {}
+    all_generations: dict[int, list[dict[str, Any]]] = {}
     for step_num in step_numbers[:200]:  # Cap at 200 steps to keep HTML reasonable
         gens = _load_step_generations(trajectories_dir, step_num)
         # Slim down for embedding: truncate model_output, drop prompt_messages

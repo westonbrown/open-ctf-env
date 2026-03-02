@@ -830,10 +830,10 @@ def main() -> None:
     else:
         print(f"Output: {sft_totals['samples_out']} samples (dry run)")
     print(f"Dropped: {sft_totals['samples_dropped']}")
-    print(f"\nExclusion reasons:")
+    print("\nExclusion reasons:")
     for reason, count in sorted(sft_totals["exclude_reasons"].items(), key=lambda x: -x[1]):
         print(f"  {reason}: {count}")
-    print(f"\nPreprocessing fixes applied:")
+    print("\nPreprocessing fixes applied:")
     for key in ("html_fixed", "think_fixed", "ansi_stripped", "nulls_stripped",
                 "output_artifacts", "echo_stripped", "noncanonical_stripped",
                 "verification_injected", "verification_replaced",
@@ -841,7 +841,7 @@ def main() -> None:
                 "consecutive_merged", "orphan_env_removed"):
         print(f"  {key}: {sft_totals[key]}")
 
-    print(f"\nPlatform distribution:")
+    print("\nPlatform distribution:")
     for plat, count in sorted(sft_totals["platform_counts"].items(), key=lambda x: -x[1]):
         print(f"  {plat}: {count}")
 
@@ -886,7 +886,7 @@ def main() -> None:
                 print(f"Output: {online_rl_stats['included']} samples (dry run)")
             print(f"Excluded: {online_rl_stats['excluded']}")
             if online_rl_stats["reasons"]:
-                print(f"\nExclusion reasons:")
+                print("\nExclusion reasons:")
                 for reason, count in sorted(online_rl_stats["reasons"].items(), key=lambda x: -x[1]):
                     print(f"  {reason}: {count}")
 

@@ -15,21 +15,22 @@ to the StepAgent, and computes rewards from agent state.
 """
 
 import importlib
-import json
 import logging
 import os
 import re
 import shutil
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from open_ctf.agent.rollout_status import RolloutStatus, normalize_rollout_status
-from open_ctf.parsing.tool_calls import parse_tool_calls  # noqa: F401 — re-exported for backward compat
+from open_ctf.parsing.tool_calls import (
+    parse_tool_calls,  # noqa: F401 — re-exported for backward compat
+)
 
 logger = logging.getLogger(__name__)
 
 # Type aliases matching SkyRL's ConversationType
-ConversationType = List[Dict[str, Any]]
+ConversationType = list[dict[str, Any]]
 
 # Pattern for stripping <think>...</think> reasoning blocks from LLM output.
 # Qwen3.5 and similar models emit these during chain-of-thought; they must be
@@ -42,7 +43,7 @@ _THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
 # Agent class resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_class(dotpath: Optional[str]):
+def _resolve_class(dotpath: str | None):
     """Resolve a dotted path string to a class.
 
     Example: "my_module.MyAgent" -> <class my_module.MyAgent>
@@ -109,7 +110,7 @@ class OpenCTFTextEnv(_Base):
     def __init__(
         self,
         env_config: Any = None,
-        extras: Optional[Dict[str, Any]] = None,
+        extras: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
         if _Base is not object:
@@ -151,7 +152,7 @@ class OpenCTFTextEnv(_Base):
         # Optional progressive horizon schedule:
         #   {"rounds": [12, 24, 40, 60], "step_interval": 80}
         # If set, max_turns is reduced/expanded by global_step stage.
-        self._horizon_schedule: Optional[Dict[str, Any]] = (
+        self._horizon_schedule: dict[str, Any] | None = (
             extras.get("horizon_schedule")
             or kwargs.get("horizon_schedule")
         )
@@ -238,15 +239,15 @@ class OpenCTFTextEnv(_Base):
             self._reward_fn = None
 
         # Per-episode data (set from dataset sample extras)
-        self._ground_truth_flag: Optional[str] = extras.get("ground_truth_flag")
-        self._optimal_steps: Optional[int] = extras.get("optimal_steps")
-        self._challenge_id: Optional[str] = extras.get("challenge_id")
+        self._ground_truth_flag: str | None = extras.get("ground_truth_flag")
+        self._optimal_steps: int | None = extras.get("optimal_steps")
+        self._challenge_id: str | None = extras.get("challenge_id")
         self._infra_type: str = str(
             extras.get("infra_type")
             or kwargs.get("infra_type")
             or "docker"
         )
-        self._path_hint: Optional[str] = (
+        self._path_hint: str | None = (
             extras.get("path_hint")
             or kwargs.get("path_hint")
         )
@@ -272,7 +273,7 @@ class OpenCTFTextEnv(_Base):
         # The output_dir is a plain string path, not a logger object, because
         # this must be serializable through Ray. Each env worker creates its
         # own TrajectoryLogger instance writing to the shared output dir.
-        self._trajectory_output_dir: Optional[str] = (
+        self._trajectory_output_dir: str | None = (
             kwargs.get("trajectory_output_dir")
             or extras.get("trajectory_output_dir")
         )
@@ -296,13 +297,13 @@ class OpenCTFTextEnv(_Base):
         self._global_step: int = extras.get("global_step", 0)
         self._generation_idx: int = extras.get("generation_idx", 0)
         # Challenge metadata for logging
-        self._category: Optional[str] = extras.get("category")
-        self._difficulty: Optional[str] = extras.get("difficulty")
+        self._category: str | None = extras.get("category")
+        self._difficulty: str | None = extras.get("difficulty")
         # Prompt messages for logging (set in init())
-        self._prompt_messages: Optional[list] = None
+        self._prompt_messages: list | None = None
         self._last_rollout_status: str = RolloutStatus.OK.value
-        self._status_counts: Dict[str, int] = {}
-        self._timing_totals: Dict[str, float] = {
+        self._status_counts: dict[str, int] = {}
+        self._timing_totals: dict[str, float] = {
             "parse_s": 0.0,
             "execute_s": 0.0,
             "total_s": 0.0,
@@ -585,7 +586,7 @@ class OpenCTFTextEnv(_Base):
             stage = len(rounds) - 1
         return max(1, min(self._base_max_turns, int(rounds[stage])))
 
-    def _resolve_static_source_path(self) -> Optional[str]:
+    def _resolve_static_source_path(self) -> str | None:
         """Resolve static challenge source path from path_hint + known roots."""
         hint = (self._path_hint or "").strip()
         if not hint:
@@ -593,7 +594,7 @@ class OpenCTFTextEnv(_Base):
         if os.path.isabs(hint) and os.path.exists(hint):
             return hint
 
-        roots: List[str] = []
+        roots: list[str] = []
         env_roots = os.environ.get("OPEN_CTF_BENCHMARK_ROOTS", os.environ.get("OPENCTF_BENCHMARK_ROOTS", ""))
         if env_roots:
             roots.extend([p.strip() for p in env_roots.split(":") if p.strip()])
@@ -606,7 +607,7 @@ class OpenCTFTextEnv(_Base):
             ]
         )
 
-        candidates: List[str] = []
+        candidates: list[str] = []
         for root in roots:
             candidates.append(os.path.join(root, hint))
             if hint.startswith("benchmark/"):
@@ -798,7 +799,7 @@ class OpenCTFTextEnv(_Base):
 
         return prompt
 
-    def step(self, action: str) -> Dict[str, Any]:
+    def step(self, action: str) -> dict[str, Any]:
         """Process LLM output: delegate to agent, compute reward.
 
         Args:
@@ -1089,14 +1090,14 @@ class OpenCTFTextEnv(_Base):
         tool_calls_history: list,
         tool_outputs: list,
         all_text: str,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Build completion messages for terminal CTFReward scoring.
 
         Converts agent tool-call history + outputs into the ChatML format
         expected by CTFReward. Uses safe ``.get()`` accessors throughout
         and skips non-dict entries in the history.
         """
-        completion_msgs: List[Dict[str, Any]] = []
+        completion_msgs: list[dict[str, Any]] = []
         for i, tc in enumerate(tool_calls_history):
             if not isinstance(tc, dict):
                 continue
@@ -1123,7 +1124,7 @@ class OpenCTFTextEnv(_Base):
     def _log_episode_trajectory(
         self,
         reward_total: float,
-        reward_breakdown: Optional[Dict[str, float]],
+        reward_breakdown: dict[str, float] | None,
         tool_calls_history: list,
         tool_outputs: list,
         all_text: str,
@@ -1224,7 +1225,7 @@ class OpenCTFTextEnv(_Base):
             all_text = getattr(self._agent, "all_text", "")
             episode_done = bool(getattr(self._agent, "episode_done", False))
             reward_total = 1.0 if episode_done else 0.0
-            reward_breakdown: Optional[Dict[str, float]] = None
+            reward_breakdown: dict[str, float] | None = None
             if self._reward_fn is not None:
                 completion_msgs = self._build_terminal_completion_msgs(
                     tool_calls_history, tool_outputs, all_text,
@@ -1253,9 +1254,7 @@ class OpenCTFTextEnv(_Base):
                     )
                     reward_total = rewards[0] if rewards else reward_total
 
-            if self._last_rollout_status in self._hard_mask_statuses:
-                reward_total = 0.0
-            elif (
+            if self._last_rollout_status in self._hard_mask_statuses or (
                 self._positive_only_until_step > 0
                 and int(self._global_step) < self._positive_only_until_step
                 and float(reward_total) <= self._positive_only_reward_floor
@@ -1293,7 +1292,7 @@ class OpenCTFTextEnv(_Base):
         self._cleanup_ephemeral_workspace()
         logger.debug("OpenCTFTextEnv closed (challenge=%s)", self._challenge_id)
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         """Return episode-level metrics."""
         tool_calls_history = getattr(self._agent, "tool_calls_history", [])
         episode_done = getattr(self._agent, "episode_done", False)
@@ -1310,7 +1309,7 @@ class OpenCTFTextEnv(_Base):
         }
 
     @staticmethod
-    def aggregate_metrics(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def aggregate_metrics(metrics: list[dict[str, Any]]) -> dict[str, Any]:
         """Aggregate metrics across multiple episodes."""
         if not metrics:
             return {}

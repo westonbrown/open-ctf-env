@@ -18,7 +18,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any
 
 from open_ctf.challenges.registry import ChallengeInfo, ChallengeRegistry
 
@@ -37,7 +37,7 @@ class ContainerRecord:
     working_dir: str
     service: str
     project: str
-    ports: List[PortBinding]
+    ports: list[PortBinding]
 
 
 def _normalize(value: str) -> str:
@@ -48,8 +48,8 @@ def _iter_tokens(value: str) -> set[str]:
     return {tok for tok in re.split(r"[^a-z0-9]+", (value or "").lower()) if tok}
 
 
-def _parse_ports(raw_ports: str) -> List[PortBinding]:
-    parsed: List[PortBinding] = []
+def _parse_ports(raw_ports: str) -> list[PortBinding]:
+    parsed: list[PortBinding] = []
     for match in re.finditer(r":(\d+)->(\d+)/tcp", raw_ports or ""):
         parsed.append(
             PortBinding(host_port=int(match.group(1)), container_port=int(match.group(2)))
@@ -57,7 +57,7 @@ def _parse_ports(raw_ports: str) -> List[PortBinding]:
     return parsed
 
 
-def _list_containers() -> List[ContainerRecord]:
+def _list_containers() -> list[ContainerRecord]:
     cmd = [
         "docker",
         "ps",
@@ -69,7 +69,7 @@ def _list_containers() -> List[ContainerRecord]:
     except FileNotFoundError as exc:
         raise RuntimeError("docker command not found on this host") from exc
 
-    records: List[ContainerRecord] = []
+    records: list[ContainerRecord] = []
     for line in out.splitlines():
         if not line.strip():
             continue
@@ -90,7 +90,7 @@ def _list_containers() -> List[ContainerRecord]:
     return records
 
 
-def _load_metadata(path_hint: Optional[str], benchmark_root: Path) -> Dict[str, Any]:
+def _load_metadata(path_hint: str | None, benchmark_root: Path) -> dict[str, Any]:
     if not path_hint:
         return {}
     root = Path(path_hint)
@@ -110,7 +110,7 @@ def _load_metadata(path_hint: Optional[str], benchmark_root: Path) -> Dict[str, 
     return {}
 
 
-def _target_hint_parts(metadata: Dict[str, Any]) -> Tuple[str, Optional[int]]:
+def _target_hint_parts(metadata: dict[str, Any]) -> tuple[str, int | None]:
     raw = metadata.get("target_host")
     if not raw:
         return "", None
@@ -126,8 +126,8 @@ def _target_hint_parts(metadata: Dict[str, Any]) -> Tuple[str, Optional[int]]:
 
 
 def _pick_binding(
-    ports: List[PortBinding], container_port_hint: Optional[int]
-) -> Optional[PortBinding]:
+    ports: list[PortBinding], container_port_hint: int | None
+) -> PortBinding | None:
     if not ports:
         return None
     if container_port_hint is not None:
@@ -139,10 +139,10 @@ def _pick_binding(
 
 def _resolve_from_path_matches(
     info: ChallengeInfo,
-    matches: List[ContainerRecord],
+    matches: list[ContainerRecord],
     service_hint: str,
-    container_port_hint: Optional[int],
-) -> Optional[Tuple[ContainerRecord, PortBinding, str]]:
+    container_port_hint: int | None,
+) -> tuple[ContainerRecord, PortBinding, str] | None:
     service_hint_norm = _normalize(service_hint)
 
     # First preference: explicit service match with a published port.
@@ -157,7 +157,7 @@ def _resolve_from_path_matches(
             return record, binding, "path+service"
 
     # Second preference: any path-matched container with published port.
-    scored: List[Tuple[int, ContainerRecord]] = []
+    scored: list[tuple[int, ContainerRecord]] = []
     for record in matches:
         score = 0
         if _normalize(info.id) and _normalize(info.id) in _normalize(record.project):
@@ -195,12 +195,12 @@ def _resolve_from_path_matches(
 
 def _resolve_fallback(
     info: ChallengeInfo,
-    containers: List[ContainerRecord],
+    containers: list[ContainerRecord],
     service_hint: str,
-    container_port_hint: Optional[int],
-) -> Optional[Tuple[ContainerRecord, PortBinding, str]]:
+    container_port_hint: int | None,
+) -> tuple[ContainerRecord, PortBinding, str] | None:
     query_tokens = _iter_tokens(info.id) | _iter_tokens(info.name) | _iter_tokens(service_hint)
-    candidates: List[Tuple[int, ContainerRecord]] = []
+    candidates: list[tuple[int, ContainerRecord]] = []
 
     for record in containers:
         if not record.ports:
@@ -238,7 +238,7 @@ def _resolve_fallback(
     return top_record, binding, "fallback"
 
 
-def _path_matches(path_hint: Optional[str], benchmark_root: Path, record: ContainerRecord) -> bool:
+def _path_matches(path_hint: str | None, benchmark_root: Path, record: ContainerRecord) -> bool:
     if not path_hint or not record.working_dir:
         return False
     hint_rel = str(Path(path_hint)).replace("\\", "/").strip("/")
@@ -261,13 +261,13 @@ def build_live_target_map(
     benchmark_root: Path,
     host: str,
     port_offset: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     containers = _list_containers()
     docker_challenges = registry.list_docker_challenges()
 
-    mapping: Dict[str, str] = {}
-    details: List[Dict[str, Any]] = []
-    unmatched: List[str] = []
+    mapping: dict[str, str] = {}
+    details: list[dict[str, Any]] = []
+    unmatched: list[str] = []
 
     for info in docker_challenges:
         metadata = _load_metadata(info.path_hint, benchmark_root=benchmark_root)

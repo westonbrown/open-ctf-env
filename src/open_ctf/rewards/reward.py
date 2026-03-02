@@ -40,7 +40,7 @@ import json
 import random
 import re
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 # Placeholder flag strings that should not be used for matching.
 # "CHECK" is used by PortSwigger challenges (appears in system prompt).
@@ -128,7 +128,7 @@ class CTFReward:
     __name__ = "ctf_reward"
 
     # GDPO (Group-Decoupled Policy Optimization) buffer
-    _gdpo_stats: Dict[str, collections.deque] = {
+    _gdpo_stats: dict[str, collections.deque] = {
         "flag": collections.deque(maxlen=256),
         "efficiency": collections.deque(maxlen=256),
         "progression": collections.deque(maxlen=256),
@@ -154,7 +154,7 @@ class CTFReward:
         hallucination_penalty: float = 0.20,
         noise_range: float = 0.01,
         exploration_gamma: float = 0.95,
-        seed: Optional[int] = None,
+        seed: int | None = None,
         use_gdpo: bool = False,
     ) -> None:
         """Initialize reward configuration.
@@ -209,10 +209,10 @@ class CTFReward:
 
     def __call__(
         self,
-        completions: List[Any],
-        prompts: Optional[List[Any]] = None,
+        completions: list[Any],
+        prompts: list[Any] | None = None,
         **kwargs: Any,
-    ) -> List[float]:
+    ) -> list[float]:
         """Score a batch of completions.
 
         Args:
@@ -226,17 +226,17 @@ class CTFReward:
             List of float reward values, one per completion.
         """
         n = len(completions)
-        ground_truth_flags: List[Optional[str]] = kwargs.get(
+        ground_truth_flags: list[str | None] = kwargs.get(
             "ground_truth_flag", [None] * n
         )
-        optimal_steps_list: List[Optional[int]] = kwargs.get(
+        optimal_steps_list: list[int | None] = kwargs.get(
             "optimal_steps", [None] * n
         )
-        metadata_list: List[Optional[Dict[str, Any]]] = kwargs.get(
+        metadata_list: list[dict[str, Any] | None] = kwargs.get(
             "metadata", [None] * n
         )
 
-        rewards: List[float] = []
+        rewards: list[float] = []
         for idx, completion in enumerate(completions):
             gt_flag = (
                 ground_truth_flags[idx]
@@ -261,10 +261,10 @@ class CTFReward:
 
     def compute_with_breakdown(
         self,
-        completions: List[Any],
-        prompts: Optional[List[Any]] = None,
+        completions: list[Any],
+        prompts: list[Any] | None = None,
         **kwargs: Any,
-    ) -> List[Tuple[float, Dict[str, float]]]:
+    ) -> list[tuple[float, dict[str, float]]]:
         """Score a batch of completions, returning per-signal breakdowns.
 
         Same interface as ``__call__`` but returns a list of
@@ -274,17 +274,17 @@ class CTFReward:
         This method does NOT modify the existing ``__call__`` contract.
         """
         n = len(completions)
-        ground_truth_flags: List[Optional[str]] = kwargs.get(
+        ground_truth_flags: list[str | None] = kwargs.get(
             "ground_truth_flag", [None] * n
         )
-        optimal_steps_list: List[Optional[int]] = kwargs.get(
+        optimal_steps_list: list[int | None] = kwargs.get(
             "optimal_steps", [None] * n
         )
-        metadata_list: List[Optional[Dict[str, Any]]] = kwargs.get(
+        metadata_list: list[dict[str, Any] | None] = kwargs.get(
             "metadata", [None] * n
         )
 
-        results: List[Tuple[float, Dict[str, float]]] = []
+        results: list[tuple[float, dict[str, float]]] = []
         for idx, completion in enumerate(completions):
             gt_flag = (
                 ground_truth_flags[idx]
@@ -310,10 +310,10 @@ class CTFReward:
     def _score_one(
         self,
         completion: Any,
-        gt_flag: Optional[str],
-        opt_steps: Optional[int],
-        meta: Optional[Dict[str, Any]],
-    ) -> Tuple[float, Dict[str, float]]:
+        gt_flag: str | None,
+        opt_steps: int | None,
+        meta: dict[str, Any] | None,
+    ) -> tuple[float, dict[str, float]]:
         """Score a single completion. Returns (total_score, breakdown_dict).
 
         The breakdown dict contains raw signal values (before weighting)
@@ -459,8 +459,8 @@ class CTFReward:
     def _flag_score(
         self,
         text: str,
-        ground_truth: Optional[str],
-        metadata_success: Optional[bool] = None,
+        ground_truth: str | None,
+        metadata_success: bool | None = None,
     ) -> float:
         """Score flag capture (online mode).
 
@@ -514,7 +514,7 @@ class CTFReward:
                 return False
         return True
 
-    def _uniqueness_score(self, tool_calls: List[Dict[str, str]]) -> float:
+    def _uniqueness_score(self, tool_calls: list[dict[str, str]]) -> float:
         """Score command diversity (0.0 - 1.0). No regex.
 
         Information entropy: ratio of unique commands to total commands.
@@ -523,7 +523,7 @@ class CTFReward:
         if not tool_calls:
             return 0.0
 
-        commands: List[str] = []
+        commands: list[str] = []
         for tc in tool_calls:
             cmd = self._extract_command(tc)
             if cmd:
@@ -535,7 +535,7 @@ class CTFReward:
         return len(set(commands)) / len(commands)
 
     @staticmethod
-    def _extract_command(tc: Dict[str, str]) -> str:
+    def _extract_command(tc: dict[str, str]) -> str:
         """Extract the command string from a tool call's arguments.
 
         Handles common BoxPwnr argument schemas:
@@ -574,7 +574,7 @@ class CTFReward:
         return ""
 
     def _efficiency_score(
-        self, actual_steps: int, optimal_steps: Optional[int],
+        self, actual_steps: int, optimal_steps: int | None,
         flag_found: bool = False,
     ) -> float:
         """Principle of least action: min(optimal / actual, 1.0).
@@ -593,7 +593,7 @@ class CTFReward:
             return min(raw, 0.3)  # Cap efficiency credit for non-flag completions
         return raw
 
-    def _format_score(self, tool_calls: List[Dict[str, str]]) -> float:
+    def _format_score(self, tool_calls: list[dict[str, str]]) -> float:
         """Signal fidelity: valid instrument readings from known tools only.
 
         Scoring per known tool call:
@@ -632,7 +632,7 @@ class CTFReward:
         """Check if a tool name is a recognized CTF instrument."""
         return name in _KNOWN_TOOL_NAMES
 
-    def _progression_score(self, tool_calls: List[Dict[str, str]]) -> float:
+    def _progression_score(self, tool_calls: list[dict[str, str]]) -> float:
         """Phase space trajectory: RECON->ENUM->EXPLOIT ordering.
 
         Scoring: 0.6 for phase presence + 0.4 for correct ordering.
@@ -641,7 +641,7 @@ class CTFReward:
             return 0.0
 
         # Build deduplicated phase sequence
-        phases: List[str] = []
+        phases: list[str] = []
         for tc in tool_calls:
             phase = self._classify_phase(tc)
             if phase and (not phases or phases[-1] != phase):
@@ -669,7 +669,7 @@ class CTFReward:
         return min(presence + order, 1.0)
 
     @staticmethod
-    def _classify_phase(tc: Dict[str, str]) -> Optional[str]:
+    def _classify_phase(tc: dict[str, str]) -> str | None:
         """Classify a tool call into a CTF phase. Set-based, no regex."""
         name = tc.get("name", "")
 
@@ -692,7 +692,7 @@ class CTFReward:
 
         return None
 
-    def _exploration_score(self, tool_calls: List[Dict[str, str]]) -> float:
+    def _exploration_score(self, tool_calls: list[dict[str, str]]) -> float:
         """Exponentially-decayed novelty of known instruments.
 
         Uses gamma^t decay so earlier novel tool use carries exponentially
@@ -725,7 +725,7 @@ class CTFReward:
 
         return score / max_possible if max_possible > 0 else 0.0
 
-    def _recovery_score(self, tool_calls: List[Dict[str, str]]) -> float:
+    def _recovery_score(self, tool_calls: list[dict[str, str]]) -> float:
         """Resilience: reward pivots after stuck runs.
 
         A "stuck run" is 2+ consecutive calls with the same action
@@ -743,7 +743,7 @@ class CTFReward:
             return 0.5  # Too short to measure
 
         # Build action fingerprint sequence
-        actions: List[str] = []
+        actions: list[str] = []
         for tc in tool_calls:
             actions.append(self._action_fingerprint(tc))
 
@@ -774,7 +774,7 @@ class CTFReward:
         return pivots / stuck_runs
 
     @staticmethod
-    def _action_fingerprint(tc: Dict[str, str]) -> str:
+    def _action_fingerprint(tc: dict[str, str]) -> str:
         """Create a fingerprint for a tool call action.
 
         For shell wrappers, includes the binary name so that
@@ -790,7 +790,7 @@ class CTFReward:
                 return f"{name}:{binary}"
         return name
 
-    def _cognitive_score(self, text: str, tool_calls: List[Dict[str, str]]) -> float:
+    def _cognitive_score(self, text: str, tool_calls: list[dict[str, str]]) -> float:
         """Words-per-action scoring. Optimal reasoning density at ~42 WPA.
 
         Research finding (H12): success traces average 51 WPA, failures
@@ -827,7 +827,7 @@ class CTFReward:
             return 0.3
 
     def _hallucination_score(
-        self, tool_calls: List[Dict[str, str]], flag_sc: float, ground_truth: Optional[str] = None
+        self, tool_calls: list[dict[str, str]], flag_sc: float, ground_truth: str | None = None
     ) -> float:
         """Energy loss for false flag submissions. Structural, no regex.
 
@@ -867,7 +867,7 @@ class CTFReward:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract(completion: Any) -> Tuple[str, List[Dict[str, str]]]:
+    def _extract(completion: Any) -> tuple[str, list[dict[str, str]]]:
         """Extract flat text and structured tool calls from a completion.
 
         Returns:
@@ -889,8 +889,8 @@ class CTFReward:
                 tool_calls.append({"name": name, "arguments": args or ""})
             return str(content), tool_calls
         if isinstance(completion, list):
-            text_parts: List[str] = []
-            tool_calls: List[Dict[str, str]] = []
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, str]] = []
             for msg in completion:
                 if not isinstance(msg, dict):
                     text_parts.append(str(msg))

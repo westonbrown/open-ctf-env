@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from open_ctf.agent.default_agent import DefaultStepAgent
 from open_ctf.agent.protocol import StepResult
@@ -12,6 +12,7 @@ from open_ctf.parsing import parse_tool_calls
 logger = logging.getLogger(__name__)
 
 import socket
+
 
 def _get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -25,21 +26,21 @@ class ProxyStepAgent(DefaultStepAgent):
     to the external BYO agent process via an HTTP Proxy and blocks until
     the external agent makes its next POST /v1/chat/completions request.
     """
-    def __init__(self, agent_cmd: Optional[str] = None, **kwargs: Any):
+    def __init__(self, agent_cmd: str | None = None, **kwargs: Any):
         super().__init__(**kwargs)
         self.port = _get_free_port()
-        
+
         self.agent_cmd = agent_cmd or os.environ.get(
-            "OPEN_CTF_AGENT_CMD", 
+            "OPEN_CTF_AGENT_CMD",
             "python examples/adapters/langgraph_native_runtime_adapter.py"
         )
         self.bridge = RLProxyRuntimeBridge(
             agent_cmd=self.agent_cmd, max_steps=self.max_steps, port=self.port
         )
         self.loop = asyncio.new_event_loop()
-        
+
         self.last_prompt_len = 0
-        self._initial_prompt: Optional[List[Dict[str, Any]]] = None
+        self._initial_prompt: list[dict[str, Any]] | None = None
 
     def reset(self, *args, **kwargs):
         super().reset(*args, **kwargs)
@@ -47,11 +48,11 @@ class ProxyStepAgent(DefaultStepAgent):
         challenge_id = kwargs.get("challenge_id") or "Unknown"
         logger.info(f"Starting ProxyStepAgent bridge on port {self.port} for target {target} with CMD: {self.agent_cmd}")
         self.loop.run_until_complete(self.bridge.start(target=target, challenge_id=challenge_id))
-        
+
         # Block until the BYO agent boots and sends its very first prompt
         logger.info("Waiting for initial prompt from BYO Agent...")
         initial_prompt = self.loop.run_until_complete(self.bridge.get_next_prompt(wait_timeout=20.0))
-        
+
         if initial_prompt:
             self._initial_prompt = initial_prompt
             self.last_prompt_len = len(initial_prompt)
@@ -59,37 +60,37 @@ class ProxyStepAgent(DefaultStepAgent):
         else:
             logger.error("BYO Agent failed to send initial prompt.")
             self.episode_done = False
-            
-    def get_initial_prompt(self) -> Optional[List[Dict[str, Any]]]:
+
+    def get_initial_prompt(self) -> list[dict[str, Any]] | None:
         """Called by openctf_env.py to rewrite the starting prompt to match the agent."""
         return self._initial_prompt
 
     def step(self, action: str) -> StepResult:
         # 1. We just got text from vLLM/Megatron. Send it back to the resting BYO Agent.
         logger.debug(f"Sending action to proxy bridge: {action[:100]}")
-        
+
         # We must append the model's text (and mock tool outputs in our local memory to match BaseAgent)
         self.all_text += action
-        
+
         self.loop.run_until_complete(self.bridge.send_action(action))
-        
+
         # 2. Block until the BYO Agent executes its tool and asks for the next generation
         new_prompt = self.loop.run_until_complete(self.bridge.get_next_prompt(wait_timeout=30.0))
-        
+
         info = {"rollout_status": RolloutStatus.OK.value}
-        
+
         if self.bridge.is_done or new_prompt is None:
             logger.info(f"Proxy bridge is done. Terminal Reward assigned: {self.bridge.terminal_reward}")
             self.episode_done = (self.bridge.terminal_reward > 0)
             if self.bridge.terminal_reward < 0:
                 info["rollout_status"] = RolloutStatus.TOOL_TIMEOUT.value
-                
+
             return StepResult(observations=[], done=True, info=info)
-            
+
         # 3. Calculate delta to return as standard gym observations
         delta = new_prompt[self.last_prompt_len:]
         self.last_prompt_len = len(new_prompt)
-        
+
         # Parse delta messages to populate tool_calls_history AND tool_outputs
         # for CTFReward scoring.  Without this, format and recovery reward
         # signals are always 0.0 because the reward function reads
@@ -114,7 +115,7 @@ class ProxyStepAgent(DefaultStepAgent):
                 self.all_text += "\n" + truncated
 
         return StepResult(observations=delta, done=False, info=info)
-        
+
     def _extract_metrics_only(self, text: str):
         """Parse tool calls from assistant text for reward-signal metrics.
 

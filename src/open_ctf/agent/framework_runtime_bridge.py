@@ -16,8 +16,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
@@ -29,12 +28,11 @@ from open_ctf.agent.runtime_protocol import (
     normalize_runtime_request,
     parse_runtime_stdout,
 )
-from open_ctf.parsing import parse_tool_calls
 from open_ctf.formatters.tool_registry import (
     RUNTIME_TOOL_NAMES,
     TOOL_SCHEMA_VERSION,
 )
-
+from open_ctf.parsing import parse_tool_calls
 
 PROTOCOL_VERSION = "1.0"
 MODE_TOOL_CALLS = "tool_calls"
@@ -54,7 +52,7 @@ def _boxpwnr_available() -> bool:
         return False
 
 
-def _emit(payload: Dict[str, Any]) -> int:
+def _emit(payload: dict[str, Any]) -> int:
     print(json.dumps(payload, ensure_ascii=True))
     return 0
 
@@ -66,7 +64,7 @@ def _normalize_mode(raw: str) -> str:
     return MODE_TOOL_CALLS
 
 
-def _request_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _request_settings(payload: dict[str, Any]) -> dict[str, Any]:
     state = payload.get("runtime_state")
     if not isinstance(state, dict):
         state = {}
@@ -117,10 +115,10 @@ def _request_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _normalize_tool_calls(raw_calls: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _normalize_tool_calls(raw_calls: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     allowed = set(RUNTIME_TOOL_NAMES)
-    normalized: List[Dict[str, Any]] = []
-    rejected: List[str] = []
+    normalized: list[dict[str, Any]] = []
+    rejected: list[str] = []
 
     for call in raw_calls:
         name = str(call.get("name", "")).strip()
@@ -138,10 +136,10 @@ def _normalize_tool_calls(raw_calls: List[Dict[str, Any]]) -> Tuple[List[Dict[st
 
 def _tool_calls_response(
     *,
-    tool_calls: List[Dict[str, Any]],
-    state: Dict[str, Any],
-    info: Dict[str, Any],
-) -> Dict[str, Any]:
+    tool_calls: list[dict[str, Any]],
+    state: dict[str, Any],
+    info: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "protocol_version": PROTOCOL_VERSION,
         "capabilities": ["tool_calls_response", "state_persistence"],
@@ -155,15 +153,15 @@ def _tool_calls_response(
 
 def _passthrough_response(
     *,
-    observations: List[Dict[str, str]],
+    observations: list[dict[str, str]],
     done: bool,
     episode_done: bool,
-    state: Dict[str, Any],
-    info: Dict[str, Any],
-    tool_calls: List[Dict[str, Any]] | None = None,
+    state: dict[str, Any],
+    info: dict[str, Any],
+    tool_calls: list[dict[str, Any]] | None = None,
     all_text_append: str | None = None,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "done": bool(done),
         "episode_done": bool(episode_done),
         "observations": observations,
@@ -183,9 +181,9 @@ def _passthrough_response(
 
 
 def _run_external_framework(
-    payload: Dict[str, Any],
-    settings: Dict[str, Any],
-) -> Dict[str, Any]:
+    payload: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
     cmd = settings["cmd"]
     if not cmd:
         raise RuntimeError(
@@ -239,7 +237,7 @@ def _run_external_framework(
     observations = raw.get("observations", []) if isinstance(raw, dict) else []
     if not isinstance(observations, list):
         observations = []
-    normalized_obs: List[Dict[str, str]] = []
+    normalized_obs: list[dict[str, str]] = []
     for item in observations:
         if isinstance(item, dict):
             normalized_obs.append(

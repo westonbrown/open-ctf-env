@@ -10,7 +10,7 @@ Key differences from OpenAI format:
 """
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from .base import ModelFormatter
 from .tool_registry import AGENT_TOOLS
@@ -33,7 +33,7 @@ class GLM4Formatter(ModelFormatter):
         The scan reveals open ports 22 and 80.
     """
 
-    def format_messages(self, messages: List[Dict[str, Any]]) -> str:
+    def format_messages(self, messages: list[dict[str, Any]]) -> str:
         """Format messages into GLM-4 chat template.
 
         If a tokenizer is provided, delegates to
@@ -47,7 +47,7 @@ class GLM4Formatter(ModelFormatter):
                 tools=[t["function"] for t in AGENT_TOOLS],
             )
 
-        parts: List[str] = []
+        parts: list[str] = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -81,7 +81,7 @@ class GLM4Formatter(ModelFormatter):
 
         return "\n".join(parts)
 
-    def get_tool_definitions(self) -> List[Dict[str, Any]]:
+    def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Return tools in OpenAI function-calling format.
 
         GLM-4 accepts the standard schema when tools are passed via API.

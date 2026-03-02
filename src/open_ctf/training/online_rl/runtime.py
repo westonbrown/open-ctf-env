@@ -6,13 +6,13 @@ Algorithm choice (GRPO/RLOO/etc) is
 configured via ``advantage_estimator`` and related settings.
 """
 
-import json
 import importlib.util
+import json
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import yaml
@@ -20,8 +20,8 @@ import yaml
 logger = logging.getLogger(__name__)
 
 # Canonical difficulty ordering for curriculum filtering.
-_DIFFICULTY_ORDER: List[str] = ["very_easy", "easy", "medium", "hard", "expert", "master"]
-_DIFFICULTY_RANK: Dict[str, int] = {d: i for i, d in enumerate(_DIFFICULTY_ORDER)}
+_DIFFICULTY_ORDER: list[str] = ["very_easy", "easy", "medium", "hard", "expert", "master"]
+_DIFFICULTY_RANK: dict[str, int] = {d: i for i, d in enumerate(_DIFFICULTY_ORDER)}
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _CONFIGS_DIR = _PROJECT_ROOT / "configs" / "skyrl"
@@ -53,7 +53,7 @@ def _as_float(name: str, raw_value: Any, default: float) -> float:
         return default
 
 
-def _resolve_online_rl_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_online_rl_cfg(config: dict[str, Any]) -> dict[str, Any]:
     """Return canonical ``online_rl`` config section."""
     preferred = config.get("online_rl")
     if isinstance(preferred, dict):
@@ -61,7 +61,7 @@ def _resolve_online_rl_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _resolve_policy_loss_type(online_rl_cfg: Dict[str, Any]) -> str:
+def _resolve_policy_loss_type(online_rl_cfg: dict[str, Any]) -> str:
     """Resolve SkyRL ``policy_loss_type`` with backward-compatible aliases.
 
     Historically configs used ``online_rl.loss_type`` (for example ``dapo``).
@@ -91,7 +91,7 @@ def _resolve_policy_loss_type(online_rl_cfg: Dict[str, Any]) -> str:
     return mapped
 
 
-def _detect_visible_gpu_count() -> Optional[int]:
+def _detect_visible_gpu_count() -> int | None:
     """Best-effort count of GPUs visible to the current process."""
     visible = os.getenv("CUDA_VISIBLE_DEVICES")
     if visible is not None:
@@ -173,7 +173,7 @@ def _missing_qwen3_5_fast_path_deps() -> list[str]:
 
 def _validate_qwen3_5_runtime_dependencies(
     hf_cfg: Any,
-    online_rl_cfg: Dict[str, Any],
+    online_rl_cfg: dict[str, Any],
 ) -> None:
     """Fail fast when Qwen3.5 runtime dependencies are missing."""
     if not _is_qwen3_5_config(hf_cfg):
@@ -228,7 +228,7 @@ def _has_step_wise_resp_index_guard(source: str) -> bool:
 
 
 def _validate_step_wise_resp_index_guard(
-    online_rl_cfg: Dict[str, Any],
+    online_rl_cfg: dict[str, Any],
     step_wise_trajectories: bool,
 ) -> None:
     """Fail fast if SkyRL lacks the step-wise reward index guard patch."""
@@ -278,7 +278,7 @@ def _validate_step_wise_resp_index_guard(
     )
 
 
-def _resolve_reward_config(config: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_reward_config(config: dict[str, Any]) -> dict[str, Any]:
     """Normalize reward config and enforce a dict payload."""
     reward_cfg = config.get("reward")
     if reward_cfg is None:
@@ -411,7 +411,7 @@ def _canonical_system_prompt() -> str:
         )
 
 
-def _normalize_prompt_system_tools(prompt: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _normalize_prompt_system_tools(prompt: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Ensure the prompt has a system message with required tool docs.
 
     Some upstream traces occasionally include truncated system prompts
@@ -457,7 +457,7 @@ def _normalize_prompt_system_tools(prompt: List[Dict[str, Any]]) -> List[Dict[st
     return prompt
 
 
-def _parse_lora_rank(lora_cfg: Dict[str, Any]) -> int:
+def _parse_lora_rank(lora_cfg: dict[str, Any]) -> int:
     """Parse LoRA rank from config with a defensive fallback."""
     raw_rank = lora_cfg.get("r", 64)
     try:
@@ -467,7 +467,7 @@ def _parse_lora_rank(lora_cfg: Dict[str, Any]) -> int:
         return 64
 
 
-def _normalize_module_filter(raw_modules: Any, *, default: Optional[str]) -> Any:
+def _normalize_module_filter(raw_modules: Any, *, default: str | None) -> Any:
     """Normalize LoRA target/exclude module filters for SkyRL + PEFT.
 
     Important: SkyRL's FSDP worker serializes PEFT target_modules via
@@ -503,7 +503,7 @@ def _normalize_module_filter(raw_modules: Any, *, default: Optional[str]) -> Any
     return [value]
 
 
-def _parse_lora_modules(lora_cfg: Dict[str, Any]) -> tuple[Any, Any]:
+def _parse_lora_modules(lora_cfg: dict[str, Any]) -> tuple[Any, Any]:
     """Parse LoRA target/exclude module filters from config."""
     target_modules = _normalize_module_filter(
         lora_cfg.get("target_modules"),
@@ -521,7 +521,7 @@ def _normalize_remote_url(url: str) -> str:
     return re.sub(r"^https?://", "", str(url).strip()).rstrip("/")
 
 
-def _resolve_generator_topology(online_rl_cfg: Dict[str, Any], lora_rank: int) -> Dict[str, Any]:
+def _resolve_generator_topology(online_rl_cfg: dict[str, Any], lora_rank: int) -> dict[str, Any]:
     """Resolve SkyRL generator topology from config.
 
     SkyRL currently supports LoRA weight sync only when engines are local
@@ -607,18 +607,18 @@ def _convert_online_rl_data(
     registry=None,
     drop_unresolved_registry_samples: bool = False,
     drop_static_challenges: bool = False,
-    max_samples: Optional[int] = None,
-    max_samples_per_challenge: Optional[int] = None,
+    max_samples: int | None = None,
+    max_samples_per_challenge: int | None = None,
     target_port_offset: int = 0,
-    target_host_override: Optional[str] = None,
+    target_host_override: str | None = None,
     fail_on_target_collisions: bool = False,
     fail_on_flag_mismatch: bool = False,
     fail_on_missing_registry_flag: bool = False,
     require_all_registry_challenges: bool = False,
     prefer_registry_target: bool = False,
-    difficulty_min: Optional[str] = None,
-    difficulty_max: Optional[str] = None,
-    exclude_challenge_ids: Optional[List[str]] = None,
+    difficulty_min: str | None = None,
+    difficulty_max: str | None = None,
+    exclude_challenge_ids: list[str] | None = None,
 ) -> str:
     """Convert our GRPO JSONL to SkyRL dataset format.
 
@@ -674,8 +674,8 @@ def _convert_online_rl_data(
     os.makedirs(output_dir, exist_ok=True)
 
     # Validate difficulty bounds.
-    min_rank: Optional[int] = None
-    max_rank: Optional[int] = None
+    min_rank: int | None = None
+    max_rank: int | None = None
     if difficulty_min is not None:
         if difficulty_min not in _DIFFICULTY_RANK:
             raise ValueError(
@@ -700,12 +700,12 @@ def _convert_online_rl_data(
     skipped = 0
     skipped_static = 0
     skipped_difficulty = 0
-    unresolved_counts: Dict[str, int] = {}
+    unresolved_counts: dict[str, int] = {}
     missing_challenge_id = 0
-    per_challenge_counts: Dict[str, int] = {}
-    target_to_challenges: Dict[str, set[str]] = {}
-    target_to_infra_types: Dict[str, set[str]] = {}
-    flag_mismatch_counts: Dict[str, int] = {}
+    per_challenge_counts: dict[str, int] = {}
+    target_to_challenges: dict[str, set[str]] = {}
+    target_to_infra_types: dict[str, set[str]] = {}
+    flag_mismatch_counts: dict[str, int] = {}
     missing_registry_flag_ids: set[str] = set()
     converted_registry_ids: set[str] = set()
     prompt_target_mismatch_samples = 0
@@ -757,7 +757,7 @@ def _convert_online_rl_data(
             )
         )
 
-    def _first_user_url(prompt_messages: List[Dict[str, str]]) -> Optional[str]:
+    def _first_user_url(prompt_messages: list[dict[str, str]]) -> str | None:
         """Return first URL in user prompt text, if present."""
         for msg in prompt_messages:
             if msg.get("role") != "user":
@@ -768,9 +768,9 @@ def _convert_online_rl_data(
         return None
 
     def _rewrite_prompt_targets(
-        prompt_messages: List[Dict[str, str]],
+        prompt_messages: list[dict[str, str]],
         canonical_target: str,
-    ) -> List[Dict[str, str]]:
+    ) -> list[dict[str, str]]:
         """Rewrite stale connection URLs in user prompt text to canonical target.
 
         This helper is intentionally benchmark-neutral. It normalizes connection
@@ -784,7 +784,7 @@ def _convert_online_rl_data(
                 "# CHALLENGE QUICKSTART (HIGH PRIORITY)",
             }
             lines = text.splitlines()
-            cleaned: List[str] = []
+            cleaned: list[str] = []
             skipping = False
             for line in lines:
                 stripped = line.strip()
@@ -817,7 +817,7 @@ def _convert_online_rl_data(
             except Exception:
                 return canonical_target
 
-        rewritten: List[Dict[str, str]] = []
+        rewritten: list[dict[str, str]] = []
         for msg in prompt_messages:
             role = msg.get("role")
             content = str(msg.get("content", ""))
@@ -986,10 +986,7 @@ def _convert_online_rl_data(
 
             # Prefer canonical registry target when configured (useful for
             # remote/tunneled runs where prompts may contain stale localhost URLs).
-            if prefer_registry_target and registry_target:
-                target = registry_target
-            # Otherwise, only use registry target as fallback when no URL was parsed.
-            elif not target and registry_target:
+            if prefer_registry_target and registry_target or not target and registry_target:
                 target = registry_target
             # Static challenges do not expose network targets in the registry.
             # Use a stable file:// target so envs avoid falling back to localhost.
@@ -1061,7 +1058,7 @@ def _convert_online_rl_data(
                 converted_registry_ids.add(key)
                 if target:
                     target_to_challenges.setdefault(str(target), set()).add(key)
-                    infra_key = str((registry_infra_type or metadata.get("infra_type") or "")).strip()
+                    infra_key = str(registry_infra_type or metadata.get("infra_type") or "").strip()
                     if infra_key:
                         target_to_infra_types.setdefault(str(target), set()).add(infra_key)
 
@@ -1199,7 +1196,11 @@ def _resolve_skyrl_logger(report_to: str, output_dir: str) -> str:
             # Output dir may not exist yet (unit tests use fake paths).
             # The directory will be created later by train_online_rl().
             pass
-        # SkyRL's TensorBoardLogger reads TENSORBOARD_LOGDIR from env.
+        # SkyRL's _TensorboardAdapter reads TENSORBOARD_DIR from env.
+        # Our TrajectoryLogger and openctf_env read TENSORBOARD_LOGDIR.
+        # Set both so all metrics (SkyRL training + environment) land in
+        # the same directory.
+        os.environ["TENSORBOARD_DIR"] = tb_dir
         os.environ["TENSORBOARD_LOGDIR"] = tb_dir
         return "tensorboard"
 
@@ -1239,9 +1240,9 @@ def _setup_persistent_logging(output_dir: str) -> None:
 def _build_skyrl_config(
     model_path: str,
     output_dir: str,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     data_path: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build a SkyRL config dict matching SkyRLConfig dataclass schema.
 
     Uses SkyRLConfig dataclass defaults as the base, then overrides with
@@ -1253,6 +1254,7 @@ def _build_skyrl_config(
     skyrl_defaults = {}
     try:
         from dataclasses import asdict
+
         from skyrl_train.config.config import SkyRLConfig
         skyrl_defaults = asdict(SkyRLConfig())
     except (ImportError, ModuleNotFoundError):
@@ -1260,6 +1262,7 @@ def _build_skyrl_config(
     if not skyrl_defaults:
         try:
             import importlib.resources as pkg_resources
+
             from omegaconf import OmegaConf as _OC
             # Load the YAML base config from skyrl_train package
             cfg_dir = Path(
@@ -2155,10 +2158,10 @@ def train_online_rl(
     model_path: str,
     data_path: str,
     output_dir: str,
-    config: Dict[str, Any],
-    resume_from: Optional[str] = None,
-    challenge_registry: Optional[str] = None,
-    agent_class: Optional[str] = None,
+    config: dict[str, Any],
+    resume_from: str | None = None,
+    challenge_registry: str | None = None,
+    agent_class: str | None = None,
 ) -> str:
     """Run stage-2 online RL training via SkyRL.
 
@@ -2335,7 +2338,7 @@ def train_online_rl(
             positive_only_until_step=positive_only_until_step,
             positive_only_reward_floor=positive_only_reward_floor,
         )
-    except ImportError as e:
+    except ImportError:
         logger.error(
             "SkyRL not installed. Install with: pip install skyrl-train skyrl-gym ray[default] vllm"
         )
@@ -2390,15 +2393,15 @@ def train_online_rl(
 
 
 def _run_skyrl_training(
-    config: Dict[str, Any],
-    reward_config: Dict[str, Any],
-    agent_class: Optional[str] = None,
-    agent_kwargs: Optional[Dict[str, Any]] = None,
+    config: dict[str, Any],
+    reward_config: dict[str, Any],
+    agent_class: str | None = None,
+    agent_kwargs: dict[str, Any] | None = None,
     use_new_inference: bool = False,
-    trajectory_output_dir: Optional[str] = None,
-    pytorch_cuda_alloc_conf: Optional[str] = None,
-    horizon_schedule: Optional[Dict[str, Any]] = None,
-    hard_mask_statuses: Optional[List[str]] = None,
+    trajectory_output_dir: str | None = None,
+    pytorch_cuda_alloc_conf: str | None = None,
+    horizon_schedule: dict[str, Any] | None = None,
+    hard_mask_statuses: list[str] | None = None,
     positive_only_until_step: int = 0,
     positive_only_reward_floor: float = 0.0,
 ) -> None:
@@ -2431,19 +2434,19 @@ def _run_skyrl_training(
 
     def _build_openctf_env_kwargs(
         cfg_obj: Any,
-        reward_cfg: Dict[str, Any],
+        reward_cfg: dict[str, Any],
         *,
-        agent_cls: Optional[str],
-        agent_kw: Optional[Dict[str, Any]],
-        trajectory_dir: Optional[str],
-        horizon: Optional[Dict[str, Any]],
-        hard_mask: Optional[List[str]],
+        agent_cls: str | None,
+        agent_kw: dict[str, Any] | None,
+        trajectory_dir: str | None,
+        horizon: dict[str, Any] | None,
+        hard_mask: list[str] | None,
         positive_until_step: int,
         positive_reward_floor: float,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Build serializable kwargs passed to OpenCTFTextEnv registration."""
         generator_max_turns = int(getattr(cfg_obj.generator, "max_turns", 15))
-        env_kwargs: Dict[str, Any] = {
+        env_kwargs: dict[str, Any] = {
             "reward_config": reward_cfg,
             "max_turns": generator_max_turns,
             # Pass the generator's max_turns as the authoritative iteration
@@ -2558,8 +2561,9 @@ def _run_skyrl_training(
 
         from omegaconf import OmegaConf
         from skyrl_gym.envs import register
-        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
         from skyrl_train.entrypoints.main_base import BasePPOExp
+
+        from open_ctf.envs.skyrl.openctf_env import OpenCTFTextEnv
 
         cfg = OmegaConf.create(cfg_dict)
 

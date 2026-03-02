@@ -6,7 +6,7 @@ enabling BoxPwnr to be used interchangeably with other agents.
 
 import logging
 import time
-from typing import Any, Optional
+from typing import Any
 
 from .protocol import AgentResult
 

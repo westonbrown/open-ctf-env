@@ -36,8 +36,8 @@ Usage:
 import argparse
 import json
 import logging
-import subprocess
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -328,8 +328,8 @@ def cmd_gepa(args: argparse.Namespace) -> None:
 def cmd_merge(args: argparse.Namespace) -> None:
     """Merge LoRA adapter into base model weights via PEFT merge_and_unload()."""
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     logger.info("Merging adapter from %s", args.adapter)
 

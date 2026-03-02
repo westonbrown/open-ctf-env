@@ -4,16 +4,18 @@ Generic BoxPwnr runtime proxy for OpenCTF RL training.
 Reads `OPEN_CTF_TARGET_URL` and uses `OPENAI_API_BASE` to communicate with the RL proxy.
 """
 
-import sys
-import os
-import time
 import logging
+import os
+import sys
+import time
 
 sys.path.insert(0, "/workspace/BoxPwnr/src")
 
+import subprocess
+
 from boxpwnr.strategies.chat_tools import ChatCompletionToolsStrategy
 from boxpwnr.utils.secrets_manager import SecretManager
-import subprocess
+
 
 class ExecutionResult:
     def __init__(self, stdout, stderr, exit_code, duration, status, timeout_reason):
@@ -94,13 +96,13 @@ CHALLENGE_URL = os.environ.get("OPEN_CTF_TARGET_URL", "http://localhost:80")
 CHALLENGE_ID = os.environ.get("OPEN_CTF_CHALLENGE_ID", "Unknown")
 API_BASE = os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1")
 
-# The ChatCompletionToolsStrategy uses OPENAI_API_KEY explicitly 
+# The ChatCompletionToolsStrategy uses OPENAI_API_KEY explicitly
 # and defaults to reading OPENAI_API_BASE or VLLM_BASE_URL.
 os.environ["VLLM_BASE_URL"] = API_BASE
 os.environ["VLLM_MAX_TOKENS"] = "8192"
 os.environ["OPENAI_API_KEY"] = "dummy"
 
-MODEL_NAME = "vllm/proxy_model" # arbitrary for proxy mode 
+MODEL_NAME = "vllm/proxy_model" # arbitrary for proxy mode
 
 MAX_TURNS = 30
 
@@ -145,7 +147,7 @@ You operate on a Linux system with common security tools available.
 def run():
     executor = DirectExecutor()
     secrets_manager = SecretManager()
-    
+
     strategy = ChatCompletionToolsStrategy(
         model=MODEL_NAME,
         secrets_manager=secrets_manager,
@@ -155,11 +157,11 @@ def run():
 
     system_prompt = build_system_prompt()
     logger.info(f"Connecting to challenge: {CHALLENGE_URL} ({CHALLENGE_ID}) via {API_BASE}")
-    
+
     if not strategy.initialize(system_prompt, platform_name="OpenCTF", target_name=CHALLENGE_ID):
         logger.error("Failed to initialize strategy!")
         return
-        
+
     for turn in range(1, MAX_TURNS + 1):
         try:
             logger.info(f"Requesting action for turn {turn}...")
@@ -168,13 +170,13 @@ def run():
         except Exception as e:
             logger.error(f"Error getting action: {e}")
             break
-            
+
         if not action:
             logger.warning("Agent returned no action, exiting loop.")
             break
-            
+
         logger.info(f"Action type: {action.type}")
-        
+
         if action.type == "flag":
             logger.info(f"Submitted flag to proxy evaluated loop: {action.content}")
             strategy.handle_flag_result(flag=action.content, is_valid=True, message="Flag submitted.")
@@ -183,7 +185,7 @@ def run():
             logger.info(f"Executing: {action.content}")
             timeout = action.metadata.get("timeout", 30) if action.metadata else 30
             result = executor.execute_command(action.content, timeout=timeout)
-            
+
             formatted_result = {
                 "command": action.content,
                 "output": result.output,
@@ -198,7 +200,7 @@ def run():
             metadata = getattr(action, "metadata", {}) or {}
             if metadata.get("status") == "no_tool_call":
                 strategy.llm_manager.add_try_harder_message()
-            
+
     logger.info("Agent proxy loop finished.")
 
 if __name__ == "__main__":

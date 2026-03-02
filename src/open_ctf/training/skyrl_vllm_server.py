@@ -498,7 +498,6 @@ class SkyRLVllmServer:
             result.  If the model emits Hermes-style ``<tool_call>`` blocks
             they are parsed and returned as structured ``tool_calls``.
             """
-            import asyncio
             import json as _json
             import re as _re
             import uuid

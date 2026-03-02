@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any
 
 from .rollout_status import RolloutStatus, normalize_rollout_status
-
 
 RUNTIME_PROTOCOL_VERSION = "1.0"
 RUNTIME_REQUEST_CAPABILITIES = (
@@ -48,17 +47,17 @@ def build_runtime_request(
     max_steps: int,
     target: str,
     ground_truth_flag: str,
-    tool_calls_history: List[Dict[str, Any]],
-    tool_outputs: List[str],
+    tool_calls_history: list[dict[str, Any]],
+    tool_outputs: list[str],
     all_text: str,
-    runtime_state: Dict[str, Any],
-    prompt_messages: List[Dict[str, Any]] | None = None,
+    runtime_state: dict[str, Any],
+    prompt_messages: list[dict[str, Any]] | None = None,
     challenge_id: str = "",
     category: str = "",
     difficulty: str = "",
     infra_type: str = "",
     objective: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build protocol-versioned request payload for BYO runtime command."""
     prompt_messages = list(prompt_messages or [])
     return {
@@ -85,7 +84,7 @@ def build_runtime_request(
     }
 
 
-def parse_runtime_stdout(stdout: str) -> Dict[str, Any]:
+def parse_runtime_stdout(stdout: str) -> dict[str, Any]:
     """Parse runtime stdout as JSON object (supports final-line JSON)."""
     text = (stdout or "").strip()
     if not text:
@@ -110,7 +109,7 @@ def parse_runtime_stdout(stdout: str) -> Dict[str, Any]:
     raise RuntimeProtocolError("Runtime stdout did not contain a JSON object.")
 
 
-def normalize_runtime_request(raw: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_runtime_request(raw: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize BYO runtime request payload.
 
     Compatibility behavior:
@@ -176,13 +175,13 @@ def normalize_runtime_request(raw: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def _normalize_observations(raw: Any) -> List[Dict[str, str]]:
+def _normalize_observations(raw: Any) -> list[dict[str, str]]:
     if raw is None:
         return []
     if not isinstance(raw, list):
         raise RuntimeProtocolError("runtime response 'observations' must be a list")
 
-    observations: List[Dict[str, str]] = []
+    observations: list[dict[str, str]] = []
     for item in raw:
         if not isinstance(item, dict):
             raise RuntimeProtocolError("runtime observation must be an object")
@@ -192,13 +191,13 @@ def _normalize_observations(raw: Any) -> List[Dict[str, str]]:
     return observations
 
 
-def _normalize_tool_calls(raw: Any) -> List[Dict[str, Any]]:
+def _normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
     if raw is None:
         return []
     if not isinstance(raw, list):
         raise RuntimeProtocolError("runtime response 'tool_calls' must be a list")
 
-    tool_calls: List[Dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
     for call in raw:
         if not isinstance(call, dict):
             raise RuntimeProtocolError("runtime tool_call must be an object")
@@ -212,7 +211,7 @@ def _normalize_tool_calls(raw: Any) -> List[Dict[str, Any]]:
     return tool_calls
 
 
-def normalize_runtime_response(raw: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_runtime_response(raw: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize BYO runtime response payload."""
     if not isinstance(raw, dict):
         raise RuntimeProtocolError("runtime response must be a JSON object")

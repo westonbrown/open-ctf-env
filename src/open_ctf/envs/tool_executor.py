@@ -14,6 +14,7 @@ is reset/step/close with plain-dict returns for Ray serialization.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import shlex
 import shutil
@@ -21,10 +22,9 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
-
-import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 _FLAG_PARAM_NAMES = ("content", "flag", "value", "submission")
 
 
-def _extract_flag_value(arguments: Dict[str, Any]) -> str:
+def _extract_flag_value(arguments: dict[str, Any]) -> str:
     """Extract the submitted flag string from tool arguments.
 
     Tries canonical name first, then common aliases, then first string value.
@@ -51,7 +51,7 @@ def _extract_flag_value(arguments: Dict[str, Any]) -> str:
     return ""
 
 
-def _noninteractive_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def _noninteractive_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Return a process env tuned for unattended tool execution."""
     env = os.environ.copy()
     env.setdefault("UNZIPOPT", "-o")
@@ -68,14 +68,14 @@ def _noninteractive_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str
 class _Session:
     """A running interactive process with non-blocking stdout/stderr capture."""
 
-    def __init__(self, session_id: str, cmd: str, workdir: Optional[str] = None):
+    def __init__(self, session_id: str, cmd: str, workdir: str | None = None):
         self.session_id = session_id
         self.cmd = cmd
         self.start_time = time.time()
         self._buf = io.StringIO()
         self._lock = threading.Lock()
 
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
@@ -105,7 +105,7 @@ class _Session:
         return self._proc.poll() is None
 
     @property
-    def exit_code(self) -> Optional[int]:
+    def exit_code(self) -> int | None:
         return self._proc.poll()
 
     @property
@@ -140,10 +140,10 @@ class SessionManager:
     """Manages interactive PTY sessions for exec_command/write_stdin."""
 
     def __init__(self):
-        self._sessions: Dict[str, _Session] = {}
+        self._sessions: dict[str, _Session] = {}
         self._next_id = 1
 
-    def start(self, cmd: str, workdir: Optional[str] = None, yield_time: int = 5) -> tuple[str, str]:
+    def start(self, cmd: str, workdir: str | None = None, yield_time: int = 5) -> tuple[str, str]:
         """Start a new session. Returns (session_id, initial_output)."""
         sid = str(self._next_id)
         self._next_id += 1
@@ -274,7 +274,7 @@ class ToolState:
     step_count: int = 0
     target: str = ""
     tools_used: int = 0
-    tools_available: List[str] = field(default_factory=list)
+    tools_available: list[str] = field(default_factory=list)
     flag_submitted: bool = False
     flag_correct: bool = False
     ground_truth: str = ""
@@ -285,7 +285,7 @@ class ToolState:
 # Tool handler type
 # ---------------------------------------------------------------------------
 
-ToolHandler = Callable[[Dict[str, Any], int], tuple[str, str, int]]
+ToolHandler = Callable[[dict[str, Any], int], tuple[str, str, int]]
 
 # Full tool set organized by tier
 TIER1_TOOLS = {"shell_command", "exec_command", "write_stdin", "python_code", "execute_command"}
@@ -300,15 +300,15 @@ ALL_TOOLS = TIER1_TOOLS | TIER2_TOOLS | TIER3_TOOLS
 
 class BaseExecutor:
     """Base interface for CTF tool execution environments."""
-    
+
     def __init__(self, **kwargs):
         self.ground_truth = kwargs.get("ground_truth", "")
         self.max_steps = kwargs.get("max_steps", 30)
 
-    def reset(self, generation_id: Optional[str] = None) -> dict:
+    def reset(self, generation_id: str | None = None) -> dict:
         raise NotImplementedError
 
-    def step(self, tool_name: str, arguments: dict, generation_id: Optional[str] = None) -> dict:
+    def step(self, tool_name: str, arguments: dict, generation_id: str | None = None) -> dict:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -336,15 +336,15 @@ class SubprocessExecutor(BaseExecutor):
 
     def __init__(
         self,
-        target: Optional[str] = None,
+        target: str | None = None,
         ground_truth: str = "",
         max_steps: int = 30,
         command_timeout: int = 30,
-        tools: Optional[List[str]] = None,
-        tool_handlers: Optional[Dict[str, ToolHandler]] = None,
+        tools: list[str] | None = None,
+        tool_handlers: dict[str, ToolHandler] | None = None,
         stdout_limit: int = 4096,
         stderr_limit: int = 1024,
-        default_workdir: Optional[str] = None,
+        default_workdir: str | None = None,
     ):
         self.target = target or os.getenv("CHALLENGE_TARGET", "http://localhost:8080")
         self.ground_truth = ground_truth or os.getenv("GROUND_TRUTH", "")
@@ -359,12 +359,12 @@ class SubprocessExecutor(BaseExecutor):
             or "/root/challenge"
         )
 
-        self._states: Dict[str, ToolState] = {}
+        self._states: dict[str, ToolState] = {}
         self._states_lock = threading.Lock()
         self._sessions = SessionManager()
 
         # Register built-in handlers
-        self._handlers: Dict[str, ToolHandler] = {
+        self._handlers: dict[str, ToolHandler] = {
             # Tier 1
             "shell_command": self._handle_shell,
             "execute_command": self._handle_shell,  # alias
@@ -406,14 +406,14 @@ class SubprocessExecutor(BaseExecutor):
                 sorted(missing),
             )
 
-    def _resolve_default_workdir(self) -> Optional[str]:
+    def _resolve_default_workdir(self) -> str | None:
         """Return a safe default working directory if it exists."""
         workdir = str(self.default_workdir or "").strip()
         if workdir and os.path.isdir(workdir):
             return workdir
         return None
 
-    def _resolve_workdir(self, requested: Any) -> Optional[str]:
+    def _resolve_workdir(self, requested: Any) -> str | None:
         """Prefer explicit workdir, then fall back to challenge workspace."""
         if isinstance(requested, str) and requested.strip():
             return requested.strip()
@@ -421,7 +421,7 @@ class SubprocessExecutor(BaseExecutor):
 
     # -- Per-generation state -----------------------------------------------
 
-    def _get_state(self, generation_id: Optional[str] = None) -> ToolState:
+    def _get_state(self, generation_id: str | None = None) -> ToolState:
         gid = generation_id or self._DEFAULT_GEN
         with self._states_lock:
             if gid not in self._states:
@@ -440,7 +440,7 @@ class SubprocessExecutor(BaseExecutor):
 
     # -- Public API ---------------------------------------------------------
 
-    def reset(self, generation_id: Optional[str] = None) -> dict:
+    def reset(self, generation_id: str | None = None) -> dict:
         """Reset the environment for a new episode.
 
         Returns:
@@ -472,7 +472,7 @@ class SubprocessExecutor(BaseExecutor):
             "reward": 0.0,
         }
 
-    def step(self, tool_name: str, arguments: dict, generation_id: Optional[str] = None) -> dict:
+    def step(self, tool_name: str, arguments: dict, generation_id: str | None = None) -> dict:
         """Execute a tool call.
 
         Args:
@@ -559,7 +559,7 @@ class SubprocessExecutor(BaseExecutor):
 
     # -- Tier 1: Execution handlers -----------------------------------------
 
-    def _handle_shell(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_shell(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         cmd = args.get("command", "echo 'no command'")
         t = args.get("timeout", timeout)
         # Model may pass timeout as string with suffix (e.g. "5s", "10s")
@@ -572,7 +572,7 @@ class SubprocessExecutor(BaseExecutor):
         workdir = self._resolve_workdir(args.get("workdir"))
         return _default_shell(cmd, t, workdir=workdir)
 
-    def _handle_python(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_python(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         code = args.get("code", "print('no code')")
         t = args.get("timeout", timeout)
         if isinstance(t, str):
@@ -583,14 +583,14 @@ class SubprocessExecutor(BaseExecutor):
                 t = timeout
         return _default_python(code, t)
 
-    def _handle_exec_command(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_exec_command(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         cmd = args.get("cmd", args.get("command", "bash"))
         workdir = self._resolve_workdir(args.get("workdir"))
         yield_time = args.get("yield_time", 5)
         sid, output = self._sessions.start(cmd, workdir, yield_time=yield_time)
         return output, "", 0
 
-    def _handle_write_stdin(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_write_stdin(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         session_id = args.get("session_id", "1")
         chars = args.get("chars", "")
         yield_time = args.get("yield_time", 2)
@@ -601,7 +601,7 @@ class SubprocessExecutor(BaseExecutor):
 
     # -- Tier 2: File operation handlers ------------------------------------
 
-    def _handle_read_file(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_read_file(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         file_path = args.get("file_path", args.get("path", args.get("file", args.get("filename", ""))))
         line_numbers = args.get("line_numbers", True)
         if not file_path:
@@ -610,7 +610,7 @@ class SubprocessExecutor(BaseExecutor):
         cmd = f"cat -n {quoted}" if line_numbers else f"cat {quoted}"
         return _default_shell(cmd, timeout)
 
-    def _handle_grep(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_grep(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         pattern = args.get("pattern", "")
         path = args.get("path", self._resolve_default_workdir() or ".")
         include = args.get("include", "")
@@ -621,13 +621,13 @@ class SubprocessExecutor(BaseExecutor):
             cmd += f" --include={shlex.quote(include)}"
         return _default_shell(cmd, timeout)
 
-    def _handle_file_search(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_file_search(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         pattern = args.get("pattern", "*")
         path = args.get("path", self._resolve_default_workdir() or ".")
         cmd = f"find {shlex.quote(path)} -name {shlex.quote(pattern)} 2>/dev/null"
         return _default_shell(cmd, timeout)
 
-    def _handle_apply_patch(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_apply_patch(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         patch = args.get("patch", "")
         if not patch:
             return "", "No patch provided", 1
@@ -661,9 +661,9 @@ class SubprocessExecutor(BaseExecutor):
         return candidate
 
     @staticmethod
-    def _apply_boxpwnr_update_block(original_text: str, block_lines: List[str]) -> str:
+    def _apply_boxpwnr_update_block(original_text: str, block_lines: list[str]) -> str:
         """Apply BoxPwnr update-hunk lines to file content."""
-        hunks: List[List[tuple[str, str]]] = [[]]
+        hunks: list[list[tuple[str, str]]] = [[]]
         for raw in block_lines:
             if raw.startswith("@@"):
                 if hunks[-1]:
@@ -681,7 +681,7 @@ class SubprocessExecutor(BaseExecutor):
             hunks = [h for h in hunks if h]
 
         src_lines = original_text.splitlines()
-        out_lines: List[str] = []
+        out_lines: list[str] = []
         cursor = 0
 
         def _find_line(value: str, start: int) -> int:
@@ -731,7 +731,7 @@ class SubprocessExecutor(BaseExecutor):
             return "", "Invalid patch: missing '*** Begin Patch' header", 1
 
         i = 1
-        results: List[str] = []
+        results: list[str] = []
         try:
             while i < len(lines):
                 line = lines[i]
@@ -742,7 +742,7 @@ class SubprocessExecutor(BaseExecutor):
                     rel = line.split(":", 1)[1].strip()
                     dst = self._resolve_patch_path(rel)
                     i += 1
-                    added: List[str] = []
+                    added: list[str] = []
                     while i < len(lines) and not lines[i].startswith("*** "):
                         if not lines[i].startswith("+"):
                             raise ValueError(f"Invalid add-file line (missing '+'): {lines[i]}")
@@ -774,12 +774,12 @@ class SubprocessExecutor(BaseExecutor):
                         raise ValueError(f"Update target does not exist: {rel}")
                     i += 1
 
-                    move_to: Optional[str] = None
+                    move_to: str | None = None
                     if i < len(lines) and lines[i].startswith("*** Move to: "):
                         move_to = lines[i].split(":", 1)[1].strip()
                         i += 1
 
-                    block: List[str] = []
+                    block: list[str] = []
                     while i < len(lines):
                         nxt = lines[i]
                         if nxt.startswith("*** End Patch"):
@@ -789,7 +789,7 @@ class SubprocessExecutor(BaseExecutor):
                         block.append(nxt)
                         i += 1
 
-                    with open(src, "r", encoding="utf-8") as f:
+                    with open(src, encoding="utf-8") as f:
                         old = f.read()
                     new = self._apply_boxpwnr_update_block(old, block)
 
@@ -817,7 +817,7 @@ class SubprocessExecutor(BaseExecutor):
 
     # -- Tier 3: Meta handlers ----------------------------------------------
 
-    def _handle_web_search(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_web_search(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         query = args.get("query", "")
         if not query:
             return "", "No query provided", 1
@@ -829,11 +829,11 @@ class SubprocessExecutor(BaseExecutor):
         )
         return _default_shell(cmd, timeout)
 
-    def _handle_list_sessions(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_list_sessions(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         output = self._sessions.list()
         return output, "", 0
 
-    def _handle_close_session(self, args: Dict[str, Any], timeout: int) -> tuple[str, str, int]:
+    def _handle_close_session(self, args: dict[str, Any], timeout: int) -> tuple[str, str, int]:
         session_id = args.get("session_id", "")
         if not session_id:
             return "", "No session_id provided", 1
@@ -852,11 +852,11 @@ class RemoteBatchExecutor(BaseExecutor):
         self.tools = kwargs.get("tools") or sorted(ALL_TOOLS)
         self.stdout_limit = kwargs.get("stdout_limit", 4096)
         self.stderr_limit = kwargs.get("stderr_limit", 1024)
-        
+
         self._step_count = 0
         self._done = False
-        
-    def reset(self, generation_id: Optional[str] = None) -> dict:
+
+    def reset(self, generation_id: str | None = None) -> dict:
         self._step_count = 0
         self._done = False
         return {
@@ -867,9 +867,9 @@ class RemoteBatchExecutor(BaseExecutor):
             "reward": 0.0,
         }
 
-    def step(self, tool_name: str, arguments: dict, generation_id: Optional[str] = None) -> dict:
+    def step(self, tool_name: str, arguments: dict, generation_id: str | None = None) -> dict:
         self._step_count += 1
-        
+
         if tool_name not in self.tools:
             return {
                 "stdout": "",
@@ -906,7 +906,7 @@ class RemoteBatchExecutor(BaseExecutor):
         exit_code = 0
         reward = 0.05
         done = self._step_count >= self.max_steps
-        
+
         return {
             "stdout": stdout,
             "stderr": "",

@@ -8,11 +8,10 @@ Defaults to BoxPwnr, but resolves it generically from:
 """
 
 import importlib
+import logging
 import os
 import sys
-import logging
 from pathlib import Path
-from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +51,13 @@ def _boxpwnr_import_origin() -> str:
     return "python-path"
 
 
-def _import_boxpwnr() -> Tuple[object, object, object, object, object, str]:
+def _import_boxpwnr() -> tuple[object, object, object, object, object, str]:
     """Import BoxPwnr components and return (classes..., resolved_source)."""
     # Prefer installed package/import path first for maximum portability.
     try:
         from boxpwnr.core.solver import Solver
         from boxpwnr.executors.docker.docker_executor import DockerExecutor
-        from boxpwnr.strategies import ChatCompletionToolsStrategy, ChatCompletionStrategy
+        from boxpwnr.strategies import ChatCompletionStrategy, ChatCompletionToolsStrategy
         from boxpwnr.utils.secrets_manager import SecretManager
         return (
             Solver,
@@ -81,7 +80,7 @@ def _import_boxpwnr() -> Tuple[object, object, object, object, object, str]:
         try:
             from boxpwnr.core.solver import Solver
             from boxpwnr.executors.docker.docker_executor import DockerExecutor
-            from boxpwnr.strategies import ChatCompletionToolsStrategy, ChatCompletionStrategy
+            from boxpwnr.strategies import ChatCompletionStrategy, ChatCompletionToolsStrategy
             from boxpwnr.utils.secrets_manager import SecretManager
             return (
                 Solver,
@@ -143,15 +142,15 @@ class AgentRunner:
         model: str = "openrouter/openai/gpt-oss-120b",
         strategy: str = "chat_tools",
         max_turns: int = 50,
-        max_time: Optional[int] = 30,
-        max_cost: Optional[float] = None,
+        max_time: int | None = 30,
+        max_cost: float | None = None,
         traces_dir: str = "./targets",
         debug: bool = False,
         keep_container: bool = False,
         keep_target: bool = False,
         reasoning_effort: str = "medium",
         attempts: int = 1,
-        custom_instructions: Optional[str] = None,
+        custom_instructions: str | None = None,
     ):
         """Initialize the agent runner.
 

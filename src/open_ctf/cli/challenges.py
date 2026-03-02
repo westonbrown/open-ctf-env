@@ -27,9 +27,9 @@ DEFAULT_REGISTRY = Path(__file__).resolve().parent.parent.parent.parent / "confi
 
 def cmd_setup(args: argparse.Namespace) -> None:
     """Launch challenge containers."""
-    from open_ctf.challenges.registry import ChallengeRegistry
     from open_ctf.challenges.manager import ChallengeManager
     from open_ctf.challenges.preflight import validate_no_target_collisions
+    from open_ctf.challenges.registry import ChallengeRegistry
 
     registry = ChallengeRegistry(args.registry)
     validate_no_target_collisions(
@@ -48,9 +48,9 @@ def cmd_setup(args: argparse.Namespace) -> None:
             url = manager.setup(args.id)
             print(f"  {args.id}: {url}")
             if manager.health_check(args.id):
-                print(f"  Health check: OK")
+                print("  Health check: OK")
             else:
-                print(f"  Health check: PENDING (service may still be starting)")
+                print("  Health check: PENDING (service may still be starting)")
         else:
             results = manager.setup_all()
             for cid, url in results.items():
@@ -64,8 +64,8 @@ def cmd_setup(args: argparse.Namespace) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     """Show running challenge containers."""
-    from open_ctf.challenges.registry import ChallengeRegistry
     from open_ctf.challenges.manager import ChallengeManager
+    from open_ctf.challenges.registry import ChallengeRegistry
 
     registry = ChallengeRegistry(args.registry)
     manager = ChallengeManager(
@@ -88,8 +88,8 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 def cmd_teardown(args: argparse.Namespace) -> None:
     """Stop challenge containers."""
-    from open_ctf.challenges.registry import ChallengeRegistry
     from open_ctf.challenges.manager import ChallengeManager
+    from open_ctf.challenges.registry import ChallengeRegistry
 
     registry = ChallengeRegistry(args.registry)
     manager = ChallengeManager(

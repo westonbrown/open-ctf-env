@@ -22,7 +22,7 @@ import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +56,18 @@ class TrajectoryLogger:
         self,
         output_dir: str,
         enabled: bool = True,
-        tensorboard_dir: Optional[str] = None,
+        tensorboard_dir: str | None = None,
     ) -> None:
         self._output_dir = output_dir
         self._enabled = enabled
         self._trajectories_dir = os.path.join(output_dir, "trajectories")
         self._lock = threading.Lock()
         # Challenge scoreboard: {challenge_id: {attempts, solves, rewards, ...}}
-        self._scoreboard: Dict[str, Dict[str, Any]] = {}
+        self._scoreboard: dict[str, dict[str, Any]] = {}
         # Per-step aggregates built incrementally from log_generation().
         # This lets us emit step_summaries.jsonl and TensorBoard charts
         # without requiring a separate reducer pass.
-        self._step_aggregates: Dict[int, Dict[str, Any]] = {}
+        self._step_aggregates: dict[int, dict[str, Any]] = {}
         self._tb_writer = None
 
         if self._enabled:
@@ -98,7 +98,7 @@ class TrajectoryLogger:
             .replace(".", "_")
         )
 
-    def _ensure_step_state_locked(self, step: int) -> Dict[str, Any]:
+    def _ensure_step_state_locked(self, step: int) -> dict[str, Any]:
         state = self._step_aggregates.get(step)
         if state is not None:
             return state
@@ -130,16 +130,16 @@ class TrajectoryLogger:
         self,
         *,
         global_step: int,
-        challenge_id: Optional[str],
+        challenge_id: str | None,
         reward_total: float,
-        reward_breakdown: Optional[Dict[str, float]],
+        reward_breakdown: dict[str, float] | None,
         flag_found: bool,
         num_tool_calls: int,
         response_length: int,
-        tool_calls: Optional[List[Dict[str, Any]]],
-        rollout_status: Optional[str],
-        timing: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        tool_calls: list[dict[str, Any]] | None,
+        rollout_status: str | None,
+        timing: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         state = self._ensure_step_state_locked(global_step)
 
         state["total_generations"] += 1
@@ -211,10 +211,10 @@ class TrajectoryLogger:
 
     @staticmethod
     def _check_straggler(
-        state: Dict[str, Any],
+        state: dict[str, Any],
         total_s: float,
         global_step: int,
-        challenge_id: Optional[str],
+        challenge_id: str | None,
     ) -> None:
         """Warn when a rollout exceeds 3x the running median for this step."""
         values = state["timing_total_values"]
@@ -240,7 +240,7 @@ class TrajectoryLogger:
 
     @staticmethod
     def _max_consecutive_same_tool(
-        tool_calls: List[Dict[str, Any]],
+        tool_calls: list[dict[str, Any]],
     ) -> int:
         """Return the longest run of consecutive identical tool name+command."""
         if not tool_calls:
@@ -274,7 +274,7 @@ class TrajectoryLogger:
             prev_key = key
         return max_run
 
-    def _build_step_summary_locked(self, global_step: int, state: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_step_summary_locked(self, global_step: int, state: dict[str, Any]) -> dict[str, Any]:
         total = int(state["total_generations"])
         if total <= 0:
             total = 1
@@ -341,7 +341,7 @@ class TrajectoryLogger:
         }
         return summary
 
-    def _emit_step_summary_to_tensorboard(self, summary: Dict[str, Any]) -> None:
+    def _emit_step_summary_to_tensorboard(self, summary: dict[str, Any]) -> None:
         if self._tb_writer is None:
             return
         step = int(summary.get("global_step", 0))
@@ -413,18 +413,18 @@ class TrajectoryLogger:
         self,
         global_step: int,
         generation_idx: int = 0,
-        challenge_id: Optional[str] = None,
-        category: Optional[str] = None,
-        difficulty: Optional[str] = None,
-        target: Optional[str] = None,
-        prompt_messages: Optional[List[Dict[str, Any]]] = None,
-        model_output: Optional[str] = None,
-        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        challenge_id: str | None = None,
+        category: str | None = None,
+        difficulty: str | None = None,
+        target: str | None = None,
+        prompt_messages: list[dict[str, Any]] | None = None,
+        model_output: str | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
         reward_total: float = 0.0,
-        reward_breakdown: Optional[Dict[str, float]] = None,
+        reward_breakdown: dict[str, float] | None = None,
         flag_found: bool = False,
-        flag_submitted: Optional[str] = None,
-        ground_truth_flag: Optional[str] = None,
+        flag_submitted: str | None = None,
+        ground_truth_flag: str | None = None,
         response_length: int = 0,
         num_tool_calls: int = 0,
         **extra: Any,
@@ -504,12 +504,12 @@ class TrajectoryLogger:
     def log_step_summary(
         self,
         global_step: int,
-        rewards: Optional[List[float]] = None,
+        rewards: list[float] | None = None,
         flag_found_count: int = 0,
         total_generations: int = 0,
         avg_tool_calls: float = 0.0,
         avg_response_length: float = 0.0,
-        challenge_ids: Optional[List[str]] = None,
+        challenge_ids: list[str] | None = None,
         **extra: Any,
     ) -> None:
         """Log aggregate statistics for a training step.
@@ -551,17 +551,16 @@ class TrajectoryLogger:
         filepath = os.path.join(self._trajectories_dir, "step_summaries.jsonl")
         line = json.dumps(summary, default=str, ensure_ascii=False) + "\n"
 
-        with self._lock:
-            with open(filepath, "a") as f:
-                f.write(line)
+        with self._lock, open(filepath, "a") as f:
+            f.write(line)
 
         self._emit_step_summary_to_tensorboard(summary)
 
     def log_challenge_result(
         self,
         challenge_id: str,
-        category: Optional[str] = None,
-        difficulty: Optional[str] = None,
+        category: str | None = None,
+        difficulty: str | None = None,
         reward: float = 0.0,
         flag_found: bool = False,
     ) -> None:
@@ -592,7 +591,7 @@ class TrajectoryLogger:
             if difficulty and not entry.get("difficulty"):
                 entry["difficulty"] = difficulty
 
-    def save_scoreboard(self) -> Optional[str]:
+    def save_scoreboard(self) -> str | None:
         """Write the challenge scoreboard to JSON.
 
         Returns:
@@ -640,9 +639,9 @@ class TrajectoryLogger:
         )
         return filepath
 
-    def _rebuild_scoreboard_from_logs_locked(self) -> Dict[str, Dict[str, Any]]:
+    def _rebuild_scoreboard_from_logs_locked(self) -> dict[str, dict[str, Any]]:
         """Rebuild challenge scoreboard from persisted per-step JSONL logs."""
-        rebuilt: Dict[str, Dict[str, Any]] = {}
+        rebuilt: dict[str, dict[str, Any]] = {}
         for step_file in sorted(Path(self._trajectories_dir).glob("step_*.jsonl")):
             try:
                 with open(step_file) as f:
@@ -679,7 +678,7 @@ class TrajectoryLogger:
                 continue
         return rebuilt
 
-    def get_scoreboard(self) -> Dict[str, Dict[str, Any]]:
+    def get_scoreboard(self) -> dict[str, dict[str, Any]]:
         """Return a copy of the current scoreboard data."""
         with self._lock:
             result = {}
@@ -726,14 +725,14 @@ class TrajectoryLogger:
             self._tb_writer = None
 
 
-def _truncate(text: Optional[str], max_len: int = 50000) -> Optional[str]:
+def _truncate(text: str | None, max_len: int = 50000) -> str | None:
     """Truncate text to max_len characters with an indicator."""
     if text is None or len(text) <= max_len:
         return text
     return text[:max_len] + f"... [truncated, {len(text)} total chars]"
 
 
-def _std(values: List[float]) -> float:
+def _std(values: list[float]) -> float:
     """Compute sample standard deviation."""
     if len(values) < 2:
         return 0.0

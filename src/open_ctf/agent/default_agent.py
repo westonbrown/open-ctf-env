@@ -21,7 +21,7 @@ import os
 import re
 import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from open_ctf.agent.protocol import StepResult
 from open_ctf.agent.rollout_status import RolloutStatus, normalize_rollout_status
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Severity ordering for rollout statuses: higher index = more severe.
 # Used to prevent runtime_info from downgrading a status (e.g., MAX_TURN_ABORT -> OK).
-_STATUS_SEVERITY: Dict[str, int] = {
+_STATUS_SEVERITY: dict[str, int] = {
     RolloutStatus.OK.value: 0,
     RolloutStatus.NO_TOOL_CALL.value: 1,
     RolloutStatus.PARSER_ERROR.value: 2,
@@ -87,7 +87,7 @@ class DefaultStepAgent:
     def __init__(self, **kwargs: Any):
         self._executor = None
         self._executor_type: str = kwargs.get("executor_type", "subprocess")
-        self._executor_kwargs: Dict[str, Any] = kwargs
+        self._executor_kwargs: dict[str, Any] = kwargs
         self._tool_call_format: str = str(
             kwargs.get("tool_call_format", "hermes")
         ).strip() or "hermes"
@@ -105,12 +105,12 @@ class DefaultStepAgent:
         )
         # Optional BYO runtime hook. If set, this command receives a JSON
         # payload on stdin and should print a JSON response on stdout.
-        self.runtime_cmd: Optional[str] = kwargs.get("runtime_cmd")
+        self.runtime_cmd: str | None = kwargs.get("runtime_cmd")
         self.runtime_timeout_seconds: int = int(
             kwargs.get("runtime_timeout_seconds", 30)
         )
-        self.runtime_workdir: Optional[str] = kwargs.get("runtime_workdir")
-        self.runtime_env: Dict[str, str] = {
+        self.runtime_workdir: str | None = kwargs.get("runtime_workdir")
+        self.runtime_env: dict[str, str] = {
             str(k): str(v)
             for k, v in dict(kwargs.get("runtime_env") or {}).items()
         }
@@ -123,7 +123,7 @@ class DefaultStepAgent:
         )
         # Optional tokenizer used to decode token-id outputs when generator
         # paths return numeric sequences instead of plain text.
-        self.tokenizer_name_or_path: Optional[str] = (
+        self.tokenizer_name_or_path: str | None = (
             str(kwargs.get("tokenizer_name_or_path")).strip()
             if kwargs.get("tokenizer_name_or_path")
             else str(os.getenv("OPEN_CTF_TOKENIZER_PATH", "")).strip() or None
@@ -133,10 +133,10 @@ class DefaultStepAgent:
             str(os.getenv("OPEN_CTF_STEP_DEBUG", "0")).strip().lower()
             in {"1", "true", "yes", "on"}
         )
-        self._runtime_state: Dict[str, Any] = {}
+        self._runtime_state: dict[str, Any] = {}
         self._target: str = ""
         self._ground_truth_flag: str = ""
-        self._prompt_messages: List[Dict[str, Any]] = []
+        self._prompt_messages: list[dict[str, Any]] = []
         self._challenge_id: str = ""
         self._category: str = ""
         self._difficulty: str = ""
@@ -149,8 +149,8 @@ class DefaultStepAgent:
         )
 
         # Episode state (exposed as properties for reward computation)
-        self.tool_calls_history: List[Dict[str, str]] = []
-        self.tool_outputs: List[str] = []
+        self.tool_calls_history: list[dict[str, str]] = []
+        self.tool_outputs: list[str] = []
         self.all_text: str = ""
         self.episode_done: bool = False
         self.turns: int = 0
@@ -178,7 +178,7 @@ class DefaultStepAgent:
         return any(sig in lowered for sig in signals)
 
     @staticmethod
-    def _status_from_tool_output(output: str) -> Optional[str]:
+    def _status_from_tool_output(output: str) -> str | None:
         lowered = output.lower()
         if "timed out" in lowered or "timeout" in lowered:
             return RolloutStatus.TOOL_TIMEOUT.value
@@ -226,7 +226,7 @@ class DefaultStepAgent:
             }
         return payload
 
-    def _decode_token_ids(self, token_ids: List[int]) -> Optional[str]:
+    def _decode_token_ids(self, token_ids: list[int]) -> str | None:
         """Decode token IDs to text using a lazily-loaded tokenizer."""
         if not token_ids or not self.tokenizer_name_or_path:
             return None
@@ -266,7 +266,7 @@ class DefaultStepAgent:
                 return decoded
         return text
 
-    def _extract_fallback_shell_command(self, action: str) -> Optional[str]:
+    def _extract_fallback_shell_command(self, action: str) -> str | None:
         """Recover one explicit command when model skipped tool-call wrappers.
 
         Intentionally conservative: only extract when the model emitted a
@@ -283,7 +283,7 @@ class DefaultStepAgent:
             double = re.sub(r'\\"', "", cmd).count('"')
             return (single % 2 == 0) and (double % 2 == 0)
 
-        def _clean(cmd: str) -> Optional[str]:
+        def _clean(cmd: str) -> str | None:
             value = " ".join(str(cmd or "").split()).strip().rstrip(".,;")
             if not value:
                 return None
@@ -356,7 +356,7 @@ class DefaultStepAgent:
             )
         return "No tool call detected. Reply with one valid tool call in <tool_call>{...}</tool_call> format."
 
-    def _run_external_runtime(self, action: str) -> tuple[Optional[Dict[str, Any]], float]:
+    def _run_external_runtime(self, action: str) -> tuple[dict[str, Any] | None, float]:
         """Run optional external runtime hook and return (payload, seconds)."""
         if not self.runtime_cmd:
             return None, 0.0
@@ -553,9 +553,9 @@ class DefaultStepAgent:
 
         # Parse tool calls from LLM output
         runtime_payload, runtime_seconds = self._run_external_runtime(action)
-        runtime_info: Dict[str, Any] = {}
-        runtime_obs: List[Dict[str, str]] = []
-        tool_calls: List[Dict[str, Any]] = []
+        runtime_info: dict[str, Any] = {}
+        runtime_obs: list[dict[str, str]] = []
+        tool_calls: list[dict[str, Any]] = []
         parse_seconds = 0.0
 
         if isinstance(runtime_payload, dict):
@@ -754,7 +754,7 @@ class DefaultStepAgent:
             )
 
         # Execute each tool call via executor
-        obs_messages: List[Dict[str, str]] = list(runtime_obs)
+        obs_messages: list[dict[str, str]] = list(runtime_obs)
         status = RolloutStatus.OK.value
         for tc in tool_calls:
             tc_name = str(tc.get("name", ""))

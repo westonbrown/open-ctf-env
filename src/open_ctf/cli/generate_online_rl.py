@@ -12,16 +12,13 @@ Usage:
 """
 
 import argparse
-import copy
 import json
 import logging
-import os
-import re
 import socket
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+
 import yaml
 
 from open_ctf.prompts.composer import build_registry_user_prompt, get_canonical_system_prompt
@@ -44,12 +41,12 @@ def _is_reachable(target_url: str, category: str, timeout: float = 3.0) -> bool:
     clean_url = target_url.replace("http://", "").replace("https://", "")
     host_port = clean_url.split("/")[0]
     parts = host_port.split(":")
-    
+
     # Skip resolution for placeholder DNS names that clearly won't resolve locally
     # unless mapping explicitly sets them.
     if len(parts) > 0 and parts[0] in ("placeholder", "target", "example.com"):
         return False
-        
+
     if len(parts) == 1:
         host = parts[0]
         port = 80 if "http://" in target_url else 443
@@ -64,7 +61,7 @@ def _is_reachable(target_url: str, category: str, timeout: float = 3.0) -> bool:
     s.settimeout(timeout)
     try:
         s.connect((host, port))
-        
+
         # If web, try to get an HTTP response to ensure service is actually up
         if category == "web" and ("http://" in target_url or "https://" in target_url):
             try:
@@ -88,7 +85,7 @@ def build_messages(
     category: str,
     difficulty: str,
     description: str | None = None,
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Build the prompt messages list using the centralized composer."""
     return [
         {
@@ -119,10 +116,10 @@ def main():
     parser.add_argument("--include-static", action="store_true", help="Include pure static challenges (file:// targets)")
     args = parser.parse_args()
 
-    with open(args.registry, "r") as f:
+    with open(args.registry) as f:
         registry = yaml.safe_load(f)
-        
-    with open(args.target_map, "r") as f:
+
+    with open(args.target_map) as f:
         target_map = json.load(f)
 
     # Difficulty thresholds
@@ -131,7 +128,7 @@ def main():
 
     challenges = registry.get("challenges", [])
     logger.info(f"Loaded {len(challenges)} challenges from registry")
-    
+
     # Flatten map if necessary
     flat_map = {}
     if "domains" in target_map:
@@ -151,7 +148,7 @@ def main():
         cid = chall["id"]
         category = chall["category"]
         diff = chall["difficulty"]
-        
+
         # Check difficulty filter
         if diff_order.get(diff, 99) > max_diff_val:
             skipped["difficulty_too_high"] += 1
@@ -161,7 +158,7 @@ def main():
         if not target_url:
             skipped["missing_target_url"] += 1
             continue
-            
+
         is_static = target_url.startswith("file://") or target_url.startswith("local://")
         if is_static and not args.include_static:
             skipped["excluded_static"] += 1
@@ -201,7 +198,7 @@ def main():
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     with open(out_path, "w") as f:
         for sample in samples:
             f.write(json.dumps(sample) + "\n")

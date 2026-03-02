@@ -2,12 +2,12 @@
 Offline Simulated environment mimicking the ToolExecutor interface for fast, scalable generation.
 """
 
+import logging
 import os
 import re
-import logging
-from typing import Dict, Any, Optional
+from typing import Any
 
-from ..envs.tool_executor import BaseExecutor, ALL_TOOLS
+from ..envs.tool_executor import ALL_TOOLS, BaseExecutor
 from .manifest import WorldManifest
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         self.ground_truth = self._current_manifest.ground_truth_flag
         self._cwd = "/root"
 
-    def reset(self, generation_id: Optional[str] = None) -> dict:
+    def reset(self, generation_id: str | None = None) -> dict:
         self._step_count = 0
         self._done = False
         self._current_manifest = self.manifest_template.clone()
@@ -45,7 +45,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
             "reward": 0.0,
         }
 
-    def step(self, tool_name: str, arguments: dict, generation_id: Optional[str] = None) -> dict:
+    def step(self, tool_name: str, arguments: dict, generation_id: str | None = None) -> dict:
         self._step_count += 1
 
         if tool_name not in self.tools:
@@ -86,7 +86,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         pass
 
     # -- Path resolution --
-    def _resolve_file(self, path: str) -> Optional[str]:
+    def _resolve_file(self, path: str) -> str | None:
         """Resolve a file path against the manifest, trying multiple strategies."""
         files = self._current_manifest.files
 
@@ -112,7 +112,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
     # -- Manifest response matching --
     _SHELL_TOOL_NAMES = {"shell_command", "execute_command", "exec_command"}
 
-    def _check_manifest_responses(self, query: str) -> Optional[str]:
+    def _check_manifest_responses(self, query: str) -> str | None:
         """Check ALL shell-type manifest tool_responses against a command/code string.
 
         Returns the best matching scripted response.
@@ -150,20 +150,28 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         return None
 
     # -- Mock Dispatchers --
-    def _handle_mock(self, tool_name: str, args: Dict[str, Any]) -> tuple[str, str, int]:
+    def _handle_mock(self, tool_name: str, args: dict[str, Any]) -> tuple[str, str, int]:
         """Routes tool call dynamically based on manifest mappings or defined logic."""
 
-        # 1. Check exact/regex tool match overrides from manifest (any tool name)
+        # 1. Check tool match overrides from manifest (non-shell tools only).
+        #    Shell tools use _check_manifest_responses (which has priority matching)
+        #    via _mock_shell, so skip them here to avoid first-match bugs.
         command_query = str(args.get("command", args.get("code", args.get("path", args.get("file_path", "")))))
-        if tool_name in self._current_manifest.tool_responses:
+        if tool_name not in self._SHELL_TOOL_NAMES and tool_name in self._current_manifest.tool_responses:
+            # Use longest-match-wins, same as _check_manifest_responses
+            regex_matches = []
             for pattern, response in self._current_manifest.tool_responses[tool_name].items():
                 try:
                     if re.search(pattern, command_query):
-                        return response, "", 0
+                        regex_matches.append((len(pattern), response))
+                        continue
                 except re.error:
                     pass
                 if pattern in command_query:
-                    return response, "", 0
+                    regex_matches.append((len(pattern), response))
+            if regex_matches:
+                regex_matches.sort(key=lambda x: x[0], reverse=True)
+                return regex_matches[0][1], "", 0
 
         # 2. File read tools
         if tool_name == "read_file":
@@ -196,7 +204,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
 
         return "Simulated execution success", "", 0
 
-    def _mock_read_file(self, args: Dict[str, Any]) -> tuple[str, str, int]:
+    def _mock_read_file(self, args: dict[str, Any]) -> tuple[str, str, int]:
         path = args.get("path", args.get("file_path", ""))
         resolved = self._resolve_file(path)
         if resolved:
@@ -206,7 +214,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
             return numbered, "", 0
         return "", f"cat: {path}: No such file or directory", 1
 
-    def _mock_shell(self, args: Dict[str, Any]) -> tuple[str, str, int]:
+    def _mock_shell(self, args: dict[str, Any]) -> tuple[str, str, int]:
         cmd = args.get("command", args.get("cmd", ""))
 
         # --- Check manifest scripted responses first (cross-references all shell keys) ---
@@ -239,13 +247,18 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
             return self._mock_ls(cmd)
 
         # --- cat (treat as read_file) ---
-        cat_match = re.match(r"^cat\s+([^\s|;&>]+)", cmd.strip())
+        # Skip flags like -A, -n, -v etc. and extract the file path
+        cat_match = re.match(r"^cat\s+(?:-[a-zA-Z]+\s+)*([^\s|;&>]+)", cmd.strip())
         if cat_match:
             path = cat_match.group(1).strip().strip("'\"")
             resolved = self._resolve_file(path)
             if resolved:
                 return self._current_manifest.files[resolved].content, "", 0
             return "", f"cat: {path}: No such file or directory", 1
+
+        # --- strings / hexdump / xxd / wc / file (binary inspection) ---
+        if re.match(r"^(strings|hexdump|xxd|wc|file)\b", cmd.strip()):
+            return self._mock_binary_inspect(cmd)
 
         # --- find ---
         if cmd.strip().startswith("find"):
@@ -286,6 +299,22 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         if re.match(r"^(grep|egrep|fgrep)\b", cmd.strip()):
             return self._mock_shell_grep(cmd)
 
+        # --- python3/python inline scripts (heredoc, -c, pipe) ---
+        # Models often run `python3 -c '...'` or `python3 - <<'PY' ...` in shell.
+        # Route these to _mock_python so they get proper manifest-aware responses.
+        if re.match(r"^python[23]?\s+(-|(-c\s))", cmd.strip()):
+            # Extract the code portion — use the full command as fallback
+            code = cmd
+            # -c 'code' — greedy match to last quote to handle nested quotes
+            c_match = re.search(r"""-c\s+['"](.*)['"]\s*$""", cmd.strip(), re.DOTALL)
+            if c_match:
+                code = c_match.group(1)
+            # heredoc pattern: python3 - <<'PY'\n...\nPY
+            hd_match = re.search(r"<<['\"]?\w+['\"]?\s*\n(.+)", cmd, re.DOTALL)
+            if hd_match:
+                code = hd_match.group(1)
+            return self._mock_python({"code": code})
+
         # --- Credential-aware fallback ---
         # If the command uses secrets/credentials found in manifest files,
         # return the most relevant scripted response (typically the flag-bearing one).
@@ -297,7 +326,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         # --- Fallback: return plausible empty result ---
         return "", "bash: command output unavailable in simulated environment", 0
 
-    def _check_credential_command(self, cmd: str) -> Optional[str]:
+    def _check_credential_command(self, cmd: str) -> str | None:
         """Generic handler for commands that use credentials/secrets from manifest files.
 
         Works for mysql, psql, ssh, crackmapexec, wmic, kubectl, etc.
@@ -343,7 +372,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         ]
         for host in seen_hosts.values():
             lines.append(f"Nmap scan report for {host.hostname} ({host.ip})")
-            lines.append(f"Host is up (0.0012s latency).")
+            lines.append("Host is up (0.0012s latency).")
             if host.services:
                 lines.append("")
                 lines.append("PORT      STATE SERVICE       VERSION")
@@ -425,8 +454,11 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         return "\n".join(lines) + "\n" if lines else "", "" if lines else "find: no matches", 0
 
     def _mock_curl(self, cmd: str) -> tuple[str, str, int]:
-        # Extract URL from curl command — handle arbitrary flags before/after URL
-        # Strategy: find any token that looks like a URL (has :// or host:port)
+        # The full curl command is already checked against manifest tool_responses
+        # by _check_manifest_responses in _mock_shell before we get here.
+        # This handles cases where no scripted response matched.
+
+        # Extract URL from curl command
         url = None
         tokens = re.findall(r'[^\s"\']+|"[^"]*"|\'[^\']*\'', cmd)
         for tok in tokens:
@@ -434,12 +466,10 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
             if re.match(r'https?://', tok_clean):
                 url = tok_clean
                 break
-            # Also match bare host:port like 10.0.4.15:80
             if re.match(r'\d+\.\d+\.\d+\.\d+:\d+', tok_clean) or re.match(r'[a-zA-Z][\w.-]+:\d+', tok_clean):
                 url = f"http://{tok_clean}"
                 break
         if not url:
-            # Last resort: check for bare hostname/IP that matches manifest
             for tok in tokens:
                 tok_clean = tok.strip("'\"")
                 for host in self._current_manifest.hosts.values():
@@ -468,7 +498,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
 
         return "", f"curl: (7) Failed to connect to {url}", 1
 
-    def _mock_grep(self, args: Dict[str, Any]) -> tuple[str, str, int]:
+    def _mock_grep(self, args: dict[str, Any]) -> tuple[str, str, int]:
         pattern_str = args.get("pattern", "")
         search_path = args.get("path", ".")
 
@@ -515,7 +545,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
             return "\n".join(results) + "\n", "", 0
         return "", f"grep: {pattern_str}: no matches", 1
 
-    def _mock_python(self, args: Dict[str, Any]) -> tuple[str, str, int]:
+    def _mock_python(self, args: dict[str, Any]) -> tuple[str, str, int]:
         code = args.get("code", "")
 
         # 1. Check manifest scripted responses (e.g. python code that runs mysql)
@@ -529,14 +559,22 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         if cred_response is not None:
             return cred_response, "", 0
 
-        # 3. If code references files in manifest, try to provide useful output
+        # 3. If code references files in manifest, return the file contents.
+        #    This handles patterns like Path('file').read_text(), open('file'), etc.
+        matched_files = []
         for fpath, fnode in self._current_manifest.files.items():
             if fpath in code or os.path.basename(fpath) in code:
-                if self._current_manifest.ground_truth_flag in fnode.content:
-                    return f"Output:\n{fnode.content}\n", "", 0
+                matched_files.append((fpath, fnode))
+        if matched_files:
+            parts = []
+            for fpath, fnode in matched_files:
+                parts.append(fnode.content.strip())
+            return "\n---\n".join(parts) + "\n", "", 0
 
-        # 4. If code uses requests/urllib to hit manifest hosts, return HTML
-        if any(ind in code for ind in ("requests.get", "urllib", "http.client")):
+        # 4. If code uses requests/urllib/socket to hit manifest hosts, check
+        #    manifest tool_responses first (the full code as query), then fall back
+        #    to generic HTML.
+        if any(ind in code for ind in ("requests.", "urllib", "http.client", "socket")):
             for host in self._current_manifest.hosts.values():
                 if host.ip in code or host.hostname in code:
                     http_svcs = [s for s in host.services if s.name in ("http", "https")]
@@ -551,7 +589,7 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
 
         return "Python code executed successfully.\n", "", 0
 
-    def _mock_file_search(self, args: Dict[str, Any]) -> tuple[str, str, int]:
+    def _mock_file_search(self, args: dict[str, Any]) -> tuple[str, str, int]:
         pattern = args.get("pattern", "*")
         search_path = args.get("path", ".")
 
@@ -564,6 +602,46 @@ class SimulatedEnvironmentExecutor(BaseExecutor):
         if results:
             return "\n".join(results) + "\n", "", 0
         return "", f"No files matching '{pattern}' found", 1
+
+    def _mock_binary_inspect(self, cmd: str) -> tuple[str, str, int]:
+        """Handle strings, hexdump, xxd, wc, file commands on manifest files."""
+        # Extract the file path (last non-flag argument)
+        tokens = cmd.strip().split()
+        path = None
+        for tok in reversed(tokens[1:]):
+            if not tok.startswith("-"):
+                path = tok.strip("'\"")
+                break
+        if not path:
+            return "", f"{tokens[0]}: missing file operand", 1
+
+        resolved = self._resolve_file(path)
+        if not resolved:
+            return "", f"{tokens[0]}: {path}: No such file or directory", 1
+
+        content = self._current_manifest.files[resolved].content
+        tool = tokens[0]
+        if tool == "strings":
+            # Return printable strings from the file content
+            return content, "", 0
+        elif tool in ("hexdump", "xxd"):
+            # Return a hex dump of first few bytes
+            raw = content.encode()[:64]
+            hex_lines = []
+            for i in range(0, len(raw), 16):
+                chunk = raw[i:i+16]
+                hex_part = " ".join(f"{b:02x}" for b in chunk)
+                ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+                hex_lines.append(f"{i:08x}  {hex_part:<48}  |{ascii_part}|")
+            return "\n".join(hex_lines) + "\n", "", 0
+        elif tool == "wc":
+            lines = content.count("\n")
+            words = len(content.split())
+            chars = len(content)
+            return f"  {lines}  {words} {chars} {path}\n", "", 0
+        elif tool == "file":
+            return f"{path}: ASCII text\n", "", 0
+        return content, "", 0
 
     def _mock_process_info(self, cmd: str) -> tuple[str, str, int]:
         if cmd.strip().startswith("ps"):

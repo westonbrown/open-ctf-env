@@ -1,7 +1,7 @@
 """Abstract base class for model-specific message formatters."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 class ModelFormatter(ABC):
@@ -19,7 +19,7 @@ class ModelFormatter(ABC):
         tools = formatter.get_tool_definitions()
     """
 
-    def __init__(self, tokenizer: Optional[Any] = None) -> None:
+    def __init__(self, tokenizer: Any | None = None) -> None:
         self.tokenizer = tokenizer
 
     # ── Factory ───────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ class ModelFormatter(ABC):
     def from_model_id(
         cls,
         model_id: str,
-        tokenizer: Optional[Any] = None,
+        tokenizer: Any | None = None,
     ) -> "ModelFormatter":
         """Auto-detect model family and return the appropriate formatter.
 
@@ -62,7 +62,7 @@ class ModelFormatter(ABC):
     # ── Abstract interface ────────────────────────────────────────────
 
     @abstractmethod
-    def format_messages(self, messages: List[Dict[str, Any]]) -> str:
+    def format_messages(self, messages: list[dict[str, Any]]) -> str:
         """Convert an OpenAI-style message list into a model-native string.
 
         The returned string is suitable for tokenisation and training.
@@ -70,7 +70,7 @@ class ModelFormatter(ABC):
         ...
 
     @abstractmethod
-    def get_tool_definitions(self) -> List[Dict[str, Any]]:
+    def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Return BoxPwnr tool definitions in the model-native format.
 
         Most models accept the OpenAI function-calling schema directly;

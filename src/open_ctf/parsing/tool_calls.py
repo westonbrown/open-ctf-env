@@ -15,7 +15,7 @@ import ast
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ _PY_CALL_LINE_PATTERN = re.compile(r"^\s*([A-Za-z_]\w*)\((.*)\)\s*$")
 # Known tool names and argument ordering
 # ---------------------------------------------------------------------------
 
-_TOOL_ARG_ORDER: Dict[str, List[str]] = {
+_TOOL_ARG_ORDER: dict[str, list[str]] = {
     "shell_command": ["command", "timeout"],
     "execute_command": ["command", "timeout"],
     "python_code": ["code", "timeout"],
@@ -102,9 +102,9 @@ def _coerce_scalar(raw: str) -> Any:
         return text
 
 
-def _parse_call_arguments(name: str, args_src: str) -> Dict[str, Any]:
+def _parse_call_arguments(name: str, args_src: str) -> dict[str, Any]:
     """Parse python-style call arguments from raw source text."""
-    args: Dict[str, Any] = {}
+    args: dict[str, Any] = {}
     call_src = f"{name}({args_src})"
     try:
         parsed = ast.parse(call_src, mode="eval")
@@ -135,7 +135,7 @@ def _parse_call_arguments(name: str, args_src: str) -> Dict[str, Any]:
     return args
 
 
-def _looks_like_placeholder_tool_call(name: str, args: Dict[str, Any]) -> bool:
+def _looks_like_placeholder_tool_call(name: str, args: dict[str, Any]) -> bool:
     """Reject obvious instructional placeholders parsed as executable calls."""
     cmd = ""
     if name in {"shell_command", "execute_command"}:
@@ -149,7 +149,7 @@ def _looks_like_placeholder_tool_call(name: str, args: Dict[str, Any]) -> bool:
     return False
 
 
-def _scan_balanced_call(text: str, open_idx: int) -> Optional[tuple[str, int]]:
+def _scan_balanced_call(text: str, open_idx: int) -> tuple[str, int] | None:
     """Return ``(args_src, end_idx)`` for balanced ``(...)`` or ``None``."""
     if open_idx < 0 or open_idx >= len(text) or text[open_idx] != "(":
         return None
@@ -179,9 +179,9 @@ def _scan_balanced_call(text: str, open_idx: int) -> Optional[tuple[str, int]]:
     return None
 
 
-def _parse_inline_python_calls(text: str) -> List[Dict[str, Any]]:
+def _parse_inline_python_calls(text: str) -> list[dict[str, Any]]:
     """Parse inline python-style calls embedded in prose."""
-    calls: List[Dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
     seen_signatures: set[tuple[str, str]] = set()
     for match in _TOOL_CALL_HEAD_PATTERN.finditer(text):
         name = match.group(1).strip()
@@ -208,7 +208,7 @@ def _parse_inline_python_calls(text: str) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _parse_hermes_json(text: str) -> List[Dict[str, Any]]:
+def _parse_hermes_json(text: str) -> list[dict[str, Any]]:
     """Parse Hermes/Qwen3/Nanbeige JSON: <tool_call>{"name":..., "arguments":...}</tool_call>."""
     calls = []
     for m in _HERMES_PATTERN.finditer(text):
@@ -228,7 +228,7 @@ def _parse_hermes_json(text: str) -> List[Dict[str, Any]]:
     return calls
 
 
-def _parse_qwen35_coder_xml(text: str) -> List[Dict[str, Any]]:
+def _parse_qwen35_coder_xml(text: str) -> list[dict[str, Any]]:
     """Parse Qwen3.5 Coder XML: <tool_call><function=name><parameter=k>v</parameter></function></tool_call>."""
     calls = []
     for m in _QWEN35_CODER_PATTERN.finditer(text):
@@ -247,7 +247,7 @@ def _parse_qwen35_coder_xml(text: str) -> List[Dict[str, Any]]:
     return calls
 
 
-def _parse_glm4_xml(text: str) -> List[Dict[str, Any]]:
+def _parse_glm4_xml(text: str) -> list[dict[str, Any]]:
     """Parse GLM-4 MoE XML: <tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>."""
     calls = []
     for m in _GLM4_TC_PATTERN.finditer(text):
@@ -266,7 +266,7 @@ def _parse_glm4_xml(text: str) -> List[Dict[str, Any]]:
     return calls
 
 
-def _parse_bare_json(text: str) -> List[Dict[str, Any]]:
+def _parse_bare_json(text: str) -> list[dict[str, Any]]:
     """Parse bare JSON fallback: {"name": "...", "arguments": {...}}."""
     calls = []
     for m in _BARE_JSON_PATTERN.finditer(text):
@@ -280,7 +280,7 @@ def _parse_bare_json(text: str) -> List[Dict[str, Any]]:
     return calls
 
 
-def _parse_python_style_calls(text: str) -> List[Dict[str, Any]]:
+def _parse_python_style_calls(text: str) -> list[dict[str, Any]]:
     """Parse python-style tool calls from assistant text.
 
     Supports lines like:
@@ -288,7 +288,7 @@ def _parse_python_style_calls(text: str) -> List[Dict[str, Any]]:
       read_file("/root/challenge/index.php")
       flag_found(content="HTB{...}")
     """
-    calls: List[Dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
     seen_signatures: set[tuple[str, str]] = set()
     cleaned = text.replace("```python", "").replace("```json", "").replace("```", "")
     for raw_line in cleaned.splitlines():
@@ -336,7 +336,7 @@ _PARSE_STRATEGIES = [
 ]
 
 
-def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
+def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Extract tool calls from LLM output text.
 
     Strips ``<think>...</think>`` blocks first to prevent regex confusion

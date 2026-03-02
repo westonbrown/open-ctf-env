@@ -34,7 +34,6 @@ Usage::
 
 import logging
 import threading
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +42,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _executor = None  # type: ignore
-_episode_id: Optional[str] = None
+_episode_id: str | None = None
 
 # Episode lifecycle tracking (managed by the GRPO trainer).
 _thread_local = threading.local()
@@ -104,7 +103,7 @@ def init_env(
     logger.info("ToolExecutor initialized (target=%s)", target or "(default)")
 
 
-def reset_env(challenge_id: Optional[str] = None, ground_truth: Optional[str] = None) -> str:
+def reset_env(challenge_id: str | None = None, ground_truth: str | None = None) -> str:
     """Reset the environment for a new episode.
 
     Args:
@@ -130,7 +129,7 @@ def close_env() -> None:
     logger.info("ToolExecutor closed")
 
 
-def mark_step_begin(challenge_id: Optional[str] = None, ground_truth: Optional[str] = None) -> None:
+def mark_step_begin(challenge_id: str | None = None, ground_truth: str | None = None) -> None:
     """Reset environment and clear episode state for a new training step.
 
     Called by the GRPO trainer before each batch's tool-call loop.

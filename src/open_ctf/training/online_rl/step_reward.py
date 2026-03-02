@@ -23,7 +23,7 @@ instance from a training config dict.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ _VALID_REWARD_KEYS = frozenset({
 })
 
 
-def create_reward_fn(config: Dict[str, Any]):
+def create_reward_fn(config: dict[str, Any]):
     """Create a CTFReward instance from training config.
 
     Args:
@@ -91,7 +91,7 @@ def create_reward_fn(config: Dict[str, Any]):
 
 # Map tool names to attack phases. Phases are ordered:
 # recon (0) -> enumerate (1) -> exploit (2) -> post-exploit (3)
-_TOOL_PHASE: Dict[str, int] = {
+_TOOL_PHASE: dict[str, int] = {
     # Phase 0: Reconnaissance — gathering initial information
     "web_search": 0,
     "file_search": 0,
@@ -128,7 +128,7 @@ LOOP_SUPPRESSION_PENALTY = -0.03   # exact command repetition
 
 
 def per_step_reward(
-    tool_calls_so_far: List[Dict[str, str]],
+    tool_calls_so_far: list[dict[str, str]],
     step: int,
     *,
     step_tool_call_count: int = 0,

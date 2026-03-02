@@ -11,9 +11,8 @@ Any class implementing solve() satisfies CTFAgent via structural subtyping.
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +30,9 @@ class StepResult:
     observations and done status only.
     """
 
-    observations: List[Dict[str, str]]  # [{role: "user", content: "[Tool: name]\noutput"}]
+    observations: list[dict[str, str]]  # [{role: "user", content: "[Tool: name]\noutput"}]
     done: bool
-    info: Dict[str, Any] = field(default_factory=dict)
+    info: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -121,7 +120,7 @@ class StepAgent(Protocol):
         ...
 
     @property
-    def tools(self) -> Optional[List[Dict[str, Any]]]:
+    def tools(self) -> list[dict[str, Any]] | None:
         """Tool schemas for prompt injection (OpenAI function format).
 
         Return None to use the environment's default tool schemas.
@@ -143,11 +142,11 @@ class StepAgent(Protocol):
 class AgentResult:
     """Result of an agent solving a CTF challenge."""
     success: bool
-    flag: Optional[str] = None
+    flag: str | None = None
     steps: int = 0
-    messages: List[Dict[str, Any]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
     duration_seconds: float = 0.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable

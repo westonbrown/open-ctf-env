@@ -11,9 +11,10 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any
 
 
 @dataclass
@@ -56,16 +57,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _text_size(messages: Iterable[Dict[str, Any]]) -> int:
+def _text_size(messages: Iterable[dict[str, Any]]) -> int:
     return sum(len(str(msg.get("content", ""))) for msg in messages if isinstance(msg, dict))
 
 
-def _challenge_key(sample: Dict[str, Any]) -> str:
+def _challenge_key(sample: dict[str, Any]) -> str:
     metadata = sample.get("metadata", {}) or {}
     return str(metadata.get("challenge") or metadata.get("challenge_id") or "").strip()
 
 
-def _resolve_registry_challenge(sample: Dict[str, Any], registry: Any) -> Optional[str]:
+def _resolve_registry_challenge(sample: dict[str, Any], registry: Any) -> str | None:
     """Resolve sample challenge name/id to a canonical registry id."""
     metadata = sample.get("metadata", {}) or {}
     candidates = [
@@ -88,9 +89,9 @@ def curate_dataset(
     input_path: Path,
     output_path: Path,
     max_chars: int,
-    registry_path: Optional[str] = None,
+    registry_path: str | None = None,
     dry_run: bool = False,
-    platforms: Optional[list[str]] = None,
+    platforms: list[str] | None = None,
 ) -> tuple[CurationStats, Counter]:
     stats = CurationStats()
     challenge_counts: Counter = Counter()

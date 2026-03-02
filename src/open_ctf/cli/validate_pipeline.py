@@ -905,7 +905,7 @@ def main() -> None:
 
     if not errors:
         print(f"\n  {GREEN}{BOLD}ALL CHECKS PASSED{RESET}")
-        print(f"  Pipeline is ready for training.\n")
+        print("  Pipeline is ready for training.\n")
     else:
         print(f"\n  {RED}{BOLD}{len(errors)} ERROR(S) FOUND:{RESET}")
         for e in errors:

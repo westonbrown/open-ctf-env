@@ -5,8 +5,7 @@ to provide tool definitions to the model.
 """
 
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
-
+from typing import Any
 
 TOOL_SCHEMA_VERSION = "2026-03-01"
 
@@ -29,7 +28,7 @@ RUNTIME_TOOL_NAMES = (
 )
 
 
-AGENT_TOOLS: List[Dict[str, Any]] = [
+AGENT_TOOLS: list[dict[str, Any]] = [
     # ─── One-shot execution ───────────────────────────────────────────
     {
         "type": "function",
@@ -392,12 +391,12 @@ AGENT_TOOLS: List[Dict[str, Any]] = [
 ]
 
 # Index by name for fast lookup.
-_TOOL_INDEX: Dict[str, Dict[str, Any]] = {
+_TOOL_INDEX: dict[str, dict[str, Any]] = {
     t["function"]["name"]: t for t in AGENT_TOOLS
 }
 
 
-def get_tool_by_name(name: str) -> Optional[Dict[str, Any]]:
+def get_tool_by_name(name: str) -> dict[str, Any] | None:
     """Return a single tool schema by name, or None if not found."""
     tool = _TOOL_INDEX.get(name)
     if tool is not None:
@@ -415,7 +414,7 @@ def get_tool_by_name(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def get_tools_by_names(names: List[str]) -> List[Dict[str, Any]]:
+def get_tools_by_names(names: list[str]) -> list[dict[str, Any]]:
     """Return a list of tool schemas for the given names.
 
     Raises KeyError for unknown tool names.
@@ -429,12 +428,12 @@ def get_tools_by_names(names: List[str]) -> List[Dict[str, Any]]:
     return tools
 
 
-def get_runtime_tools() -> List[Dict[str, Any]]:
+def get_runtime_tools() -> list[dict[str, Any]]:
     """Return the canonical runtime tool schemas for OpenCTF env execution."""
     return get_tools_by_names(list(RUNTIME_TOOL_NAMES))
 
 
-def get_runtime_tool_names() -> List[str]:
+def get_runtime_tool_names() -> list[str]:
     """Return ordered runtime tool names for OpenCTF env execution."""
     return list(RUNTIME_TOOL_NAMES)
 

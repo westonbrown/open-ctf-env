@@ -18,7 +18,11 @@ from typing import Any
 # Shared regex patterns (single source of truth in converter)
 from open_ctf.data.converter import (
     _COMMAND_RE as _COMMAND_TAG_RE,
+)
+from open_ctf.data.converter import (
     _OUTPUT_RE as _OUTPUT_TAG_RE,
+)
+from open_ctf.data.converter import (
     _STDOUT_RE as _STDOUT_TAG_RE,
 )
 

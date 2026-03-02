@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import yaml
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
-def _load_model_config(model_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
+def _load_model_config(model_id: str, config: dict[str, Any]) -> dict[str, Any]:
     """Resolve model-specific training config.
 
     Reads from config dict (loaded from training_*.yaml) or falls back to
@@ -67,7 +67,7 @@ def _load_model_config(model_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_jsonl_messages(data_path: str) -> List[Dict[str, Any]]:
+def _load_jsonl_messages(data_path: str) -> list[dict[str, Any]]:
     """Load JSONL data and return list of samples with 'messages' key."""
     samples = []
     with open(data_path) as f:
@@ -83,10 +83,10 @@ def _load_jsonl_messages(data_path: str) -> List[Dict[str, Any]]:
 
 
 def _format_dataset(
-    samples: List[Dict[str, Any]],
+    samples: list[dict[str, Any]],
     tokenizer,
     max_seq_length: int,
-    think_kwargs: Optional[Dict[str, Any]] = None,
+    think_kwargs: dict[str, Any] | None = None,
 ) -> "Dataset":
     """Format samples using the tokenizer's native chat template.
 
@@ -133,7 +133,7 @@ def _format_dataset(
     return Dataset.from_dict({"text": texts})
 
 
-def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize messages for tokenizer.apply_chat_template().
 
     Fixes:
@@ -176,9 +176,9 @@ def train_sft(
     model_id: str,
     data_path: str,
     output_dir: str,
-    config: Dict[str, Any],
-    val_data_path: Optional[str] = None,
-    resume_from: Optional[str] = None,
+    config: dict[str, Any],
+    val_data_path: str | None = None,
+    resume_from: str | None = None,
 ) -> str:
     """Run SFT training via TRL SFTTrainer + peft LoRA.
 
@@ -194,13 +194,13 @@ def train_sft(
         Path to the saved LoRA adapter directory.
     """
     import torch
+    from peft import LoraConfig, TaskType
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
         BitsAndBytesConfig,
     )
-    from peft import LoraConfig, TaskType
-    from trl import SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM
+    from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
 
     logger.info("=" * 60)
     logger.info("SFT TRAINING (TRL)")
@@ -375,7 +375,7 @@ def train_sft(
         sft_config.resume_from_checkpoint = resume_from
 
     # CRITICAL: Prevent catastrophic forgetting by masking out User/System prompts
-    # Note: Qwen uses ChatML. If response_template cannot map directly due to tokenization, 
+    # Note: Qwen uses ChatML. If response_template cannot map directly due to tokenization,
     # we convert it to token list first to bypass sub-word boundary issues.
     # Fallback to pure string if encode fails.
     try:
@@ -422,7 +422,7 @@ def train_sft(
     return final_dir
 
 
-def _detect_thinking_support(tokenizer, model_id: str) -> Dict[str, Any]:
+def _detect_thinking_support(tokenizer, model_id: str) -> dict[str, Any]:
     """Detect thinking mode support and return kwargs to preserve ``<think>``.
 
     Different models use different template kwargs for thinking:
@@ -439,7 +439,7 @@ def _detect_thinking_support(tokenizer, model_id: str) -> Dict[str, Any]:
     # Probe which thinking kwargs the template accepts.
     # For SFT we want ALL turns to preserve <think> so the model learns
     # reasoning patterns throughout multi-turn conversations.
-    think_kwargs: Dict[str, Any] = {}
+    think_kwargs: dict[str, Any] = {}
     test_msgs = [{"role": "user", "content": "test"}]
 
     for kwarg in ("enable_thinking", "keep_all_think"):

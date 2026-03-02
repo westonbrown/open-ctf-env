@@ -8,7 +8,7 @@ results are returned as ``tool`` role messages.
 """
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from .base import ModelFormatter
 from .tool_registry import AGENT_TOOLS
@@ -39,7 +39,7 @@ class Qwen3Formatter(ModelFormatter):
         <|im_end|>
     """
 
-    def format_messages(self, messages: List[Dict[str, Any]]) -> str:
+    def format_messages(self, messages: list[dict[str, Any]]) -> str:
         """Format messages into Qwen3 ChatML.
 
         If a tokenizer with ``apply_chat_template`` is available, it is
@@ -54,7 +54,7 @@ class Qwen3Formatter(ModelFormatter):
                 tools=[t["function"] for t in AGENT_TOOLS],
             )
 
-        parts: List[str] = []
+        parts: list[str] = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -62,7 +62,7 @@ class Qwen3Formatter(ModelFormatter):
             # Tool calls from the assistant are wrapped in <tool_call> tags.
             tool_calls = msg.get("tool_calls")
             if tool_calls:
-                tc_parts: List[str] = []
+                tc_parts: list[str] = []
                 for tc in tool_calls:
                     fn = tc.get("function", tc)
                     tc_parts.append(
@@ -80,7 +80,7 @@ class Qwen3Formatter(ModelFormatter):
             # Tool results carry an optional tool_call_id for traceability.
             if role == "tool":
                 name = msg.get("name", "")
-                header = f"<|im_start|>tool"
+                header = "<|im_start|>tool"
                 if name:
                     header += f" name={name}"
                 parts.append(f"{header}\n{body}\n<|im_end|>")
@@ -89,6 +89,6 @@ class Qwen3Formatter(ModelFormatter):
 
         return "\n".join(parts)
 
-    def get_tool_definitions(self) -> List[Dict[str, Any]]:
+    def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Return tools in OpenAI function-calling format (Qwen3-native)."""
         return list(AGENT_TOOLS)

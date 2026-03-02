@@ -65,8 +65,8 @@ def merge_lora(adapter_path: str, base_model: str, output_dir: str) -> str:
         Path to the merged model directory.
     """
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     logger.info("Loading base model: %s", base_model)
     logger.info("Loading adapter:    %s", adapter_path)
@@ -320,15 +320,15 @@ def main() -> None:
 
     # Print next steps
     print("\nNext steps:")
-    print(f"  # Serve with llama.cpp:")
+    print("  # Serve with llama.cpp:")
     print(f"  llama-server -m {output_path} --host 0.0.0.0 --port 8080 --jinja")
     print()
-    print(f"  # Or create an Ollama model:")
+    print("  # Or create an Ollama model:")
     print(f"  echo 'FROM {output_path}' > Modelfile")
-    print(f"  ollama create ctf-agent -f Modelfile")
-    print(f"  ollama run ctf-agent")
+    print("  ollama create ctf-agent -f Modelfile")
+    print("  ollama run ctf-agent")
     print()
-    print(f"  # Or serve with vLLM (from merged HF model):")
+    print("  # Or serve with vLLM (from merged HF model):")
     print(f"  vllm serve {args.base_model} --host 0.0.0.0 --port 8000 --dtype bfloat16")
 
 

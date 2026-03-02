@@ -2,16 +2,16 @@
 Generator orchestrator for offline synthetic trajectory mapping.
 """
 
-import os
 import json
 import logging
-from typing import Dict, List, Any
+import os
+from typing import Any
 
 from litellm import completion
 
-from .manifest import WorldManifest
-from .executor import SimulatedEnvironmentExecutor
 from ..formatters.tool_registry import AGENT_TOOLS
+from .executor import SimulatedEnvironmentExecutor
+from .manifest import WorldManifest
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def _build_user_prompt(manifest: WorldManifest) -> str:
     file_list = ""
     if manifest.files:
         file_paths = sorted(manifest.files.keys())
-        file_list = f"\n\nChallenge files available:\n" + "\n".join(f"- {fp}" for fp in file_paths)
+        file_list = "\n\nChallenge files available:\n" + "\n".join(f"- {fp}" for fp in file_paths)
 
     return (
         "# ROLE\n"
@@ -103,7 +103,7 @@ def _build_user_prompt(manifest: WorldManifest) -> str:
     )
 
 
-def _sanitize_assistant_message(msg_dict: Dict[str, Any]) -> Dict[str, Any]:
+def _sanitize_assistant_message(msg_dict: dict[str, Any]) -> dict[str, Any]:
     """Post-process an assistant message from LiteLLM into sft_v6-compatible format.
 
     - Converts reasoning_content / provider_specific_fields.reasoning into <think> blocks
@@ -160,7 +160,7 @@ class BaseAgentAdapter:
     Interface for hooking up any custom agent scaffolding (LangChain, BoxPwnr, Custom ReAct)
     to the synthetic generation pipeline.
     """
-    def run_episode(self, executor: SimulatedEnvironmentExecutor, manifest: WorldManifest, max_turns: int) -> Dict[str, Any]:
+    def run_episode(self, executor: SimulatedEnvironmentExecutor, manifest: WorldManifest, max_turns: int) -> dict[str, Any]:
         """
         Executes an agent trajectory using the provided executor.
         Must return a trace dictionary matching the SFT trace format:
@@ -177,29 +177,30 @@ class LiteLLMAgentAdapter(BaseAgentAdapter):
     def __init__(self, model_name: str = "openrouter/openai/gpt-4o"):
         self.model_name = model_name
 
-    def run_episode(self, executor: SimulatedEnvironmentExecutor, manifest: WorldManifest, max_turns: int) -> Dict[str, Any]:
+    def run_episode(self, executor: SimulatedEnvironmentExecutor, manifest: WorldManifest, max_turns: int) -> dict[str, Any]:
         system_prompt = _build_system_prompt(manifest)
         user_prompt = _build_user_prompt(manifest)
 
-        messages: List[Dict[str, Any]] = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
         # Raw messages sent to LLM (may contain provider-specific fields)
         # We'll build the clean output separately
-        llm_messages: List[Dict[str, Any]] = [
+        llm_messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
-        output_messages: List[Dict[str, Any]] = [
+        output_messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
         step_count = 0
         success = False
+        consecutive_no_tool = 0
 
         while step_count < max_turns:
             step_count += 1
@@ -211,6 +212,7 @@ class LiteLLMAgentAdapter(BaseAgentAdapter):
                     messages=llm_messages,
                     tools=AGENT_TOOLS,
                     temperature=0.7,
+                    drop_params=True,
                 )
             except Exception as e:
                 logger.error(f"LiteLLM Error on turn {step_count}: {e}")
@@ -227,6 +229,7 @@ class LiteLLMAgentAdapter(BaseAgentAdapter):
             output_messages.append(clean_msg)
 
             if msg.tool_calls:
+                consecutive_no_tool = 0
                 for tcall in msg.tool_calls:
                     tool_name = tcall.function.name
                     try:
@@ -250,8 +253,13 @@ class LiteLLMAgentAdapter(BaseAgentAdapter):
                         success = (res["exit_code"] == 0)
                         break
             else:
-                # No tool calls — model finished reasoning without acting
-                break
+                # No tool calls — model produced text-only response.
+                # Allow up to 2 consecutive text-only turns before breaking,
+                # since some models reason in one turn then act in the next.
+                consecutive_no_tool += 1
+                if consecutive_no_tool >= 3:
+                    break
+                continue
 
             if success or executor._done:
                 break
@@ -275,17 +283,18 @@ class SyntheticGenerator:
     """
     Coordinates generation of synthetic trajectories across mocked environments.
     """
-    def __init__(self, manifests: List[WorldManifest], agent_adapter: BaseAgentAdapter):
+    def __init__(self, manifests: list[WorldManifest], agent_adapter: BaseAgentAdapter):
         self.manifest_bank = manifests
         self.agent_adapter = agent_adapter
 
-    def batch_generate_traces(self, max_trajectories: int = 10, max_turns: int = 30) -> List[Dict[str, Any]]:
+    def batch_generate_traces(self, max_trajectories: int = 10, max_turns: int = 30) -> list[dict[str, Any]]:
         generated_traces = []
         for i in range(max_trajectories):
             manifest = self.manifest_bank[i % len(self.manifest_bank)]
             executor = SimulatedEnvironmentExecutor(manifest=manifest, max_steps=max_turns)
 
-            trace = self.agent_adapter.run_episode(executor, manifest, max_turns)
+            # Use executor's cloned manifest (flag randomized per episode)
+            trace = self.agent_adapter.run_episode(executor, executor._current_manifest, max_turns)
             generated_traces.append(trace)
 
             success = trace.get('metadata', {}).get('success', False)
@@ -293,7 +302,7 @@ class SyntheticGenerator:
 
         return generated_traces
 
-    def export_jsonl(self, traces: List[Dict[str, Any]], filepath: str) -> None:
+    def export_jsonl(self, traces: list[dict[str, Any]], filepath: str) -> None:
         """Export traces to JSONL format (usable for both SFT and online RL)."""
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         with open(filepath, "w") as f:

@@ -9,7 +9,6 @@ import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 from .registry import ChallengeRegistry
@@ -46,10 +45,10 @@ class ChallengeManager:
         self.bench_dir = Path(bench_dir)
         self.host = host
         self.network = network
-        self._running: Dict[str, str] = {}  # challenge_id -> target_url
-        self._startup_mode: Dict[str, str] = {}  # challenge_id -> compose|start_docker.sh
-        self._candidate_dirs_cache: Optional[List[Path]] = None
-        self._benchmark_root_cache: Optional[Path] = None
+        self._running: dict[str, str] = {}  # challenge_id -> target_url
+        self._startup_mode: dict[str, str] = {}  # challenge_id -> compose|start_docker.sh
+        self._candidate_dirs_cache: list[Path] | None = None
+        self._benchmark_root_cache: Path | None = None
         self._docker_preflight_ok = False
 
     @staticmethod
@@ -136,7 +135,7 @@ class ChallengeManager:
             return explicit
 
         # Generic benchmark repos often keep challenges under one of these roots.
-        roots: List[Path] = [
+        roots: list[Path] = [
             self.bench_dir / name
             for name in ("benchmarks", "challenges", "tasks", "ctf", "data")
             if (self.bench_dir / name).is_dir()
@@ -266,7 +265,7 @@ class ChallengeManager:
 
         self._docker_preflight_ok = True
 
-    def _list_candidate_dirs(self) -> List[Path]:
+    def _list_candidate_dirs(self) -> list[Path]:
         """Index challenge-like directories in benchmark tree."""
         if self._candidate_dirs_cache is not None:
             return self._candidate_dirs_cache
@@ -276,7 +275,7 @@ class ChallengeManager:
             self._candidate_dirs_cache = []
             return self._candidate_dirs_cache
 
-        candidates: List[Path] = []
+        candidates: list[Path] = []
         for path in root.rglob("*"):
             if not path.is_dir():
                 continue
@@ -370,7 +369,7 @@ class ChallengeManager:
         queries = [info.id, info.name, *info.aliases]
         queries = [q for q in queries if q]
 
-        best_path: Optional[Path] = None
+        best_path: Path | None = None
         best_score = 0
         second_score = 0
         for candidate in self._list_candidate_dirs():
@@ -400,14 +399,14 @@ class ChallengeManager:
         logger.info("Resolved challenge %s -> %s (score=%d)", challenge_id, best_path, best_score)
         return best_path
 
-    def _find_first(self, challenge_dir: Path, names: List[str]) -> Optional[Path]:
+    def _find_first(self, challenge_dir: Path, names: list[str]) -> Path | None:
         """Find launch artifact in challenge dir (first direct, then recursive)."""
         for name in names:
             direct = challenge_dir / name
             if direct.exists():
                 return direct
 
-        matches: List[Path] = []
+        matches: list[Path] = []
         for name in names:
             matches.extend(challenge_dir.rglob(name))
         if not matches:
@@ -613,7 +612,7 @@ class ChallengeManager:
         self._running.pop(info.id, None)
         self._startup_mode.pop(info.id, None)
 
-    def setup_all(self, ids: Optional[List[str]] = None) -> Dict[str, str]:
+    def setup_all(self, ids: list[str] | None = None) -> dict[str, str]:
         """Launch multiple challenges. Returns {challenge_id: target_url}.
 
         Args:
@@ -706,6 +705,6 @@ class ChallengeManager:
         except (OSError, ValueError):
             return False
 
-    def get_running(self) -> List[str]:
+    def get_running(self) -> list[str]:
         """Return list of currently running challenge IDs."""
         return list(self._running.keys())

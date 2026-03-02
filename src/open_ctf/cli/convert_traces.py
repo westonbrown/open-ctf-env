@@ -90,7 +90,7 @@ def main() -> None:
     # Summary stats
     total = len(successes) + len(failures)
     if total > 0:
-        print(f"\nSummary:")
+        print("\nSummary:")
         print(f"  Total traces found:  {total}")
         print(f"  Successes:           {len(successes)}")
         print(f"  Failures:            {len(failures)}")

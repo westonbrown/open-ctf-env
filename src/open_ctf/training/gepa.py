@@ -35,7 +35,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -65,79 +65,62 @@ You are an autonomous agent authorized to solve the given task.
 def _strip_react_boilerplate(instruction: str) -> str:
     """Strip DSPy ReAct agent framing, keeping only the CTF instructions.
 
-    DSPy ReAct prepends boilerplate like::
+    DSPy ReAct wraps the seed instructions in a larger prompt that includes:
 
-        You are an Agent designed to complete any task by
-        calling tools. At each step, ...
+    1. The original seed instructions (our CTF prompt)
+    2. "You are an Agent. In each episode, ..." framing
+    3. Numbered tool schemas: "(1) shell_command, whose description is ..."
+    4. Format instructions for next_tool_args
 
-    followed by tool schemas and the original seed instructions.  We want
-    just the CTF-specific part (evolved or original) — i.e. everything that
-    came from our seed prompt or GEPA mutations.
+    We want just the CTF-specific part (evolved or original) — everything
+    that came from our seed prompt or GEPA mutations, WITHOUT the ReAct
+    agent framing or tool schemas.
 
-    Strategy: look for known boilerplate markers and strip them.  If the
-    instruction doesn't contain boilerplate, return it as-is.
+    Strategy: identify and remove all ReAct boilerplate sections, keeping
+    only the CTF-specific content.
     """
     if not instruction:
         return instruction
 
-    # Pattern 1: DSPy ReAct wraps instructions in a larger agent prompt.
-    # The original seed instructions typically appear after the tool list.
-    # Look for the last occurrence of known seed markers.
-    markers = [
-        "You are an autonomous",
-        "# APPROACH",
-        "# STRATEGY",
-        "# ENVIRONMENT",
-    ]
+    # Split into paragraphs (double newline separated)
+    sections = re.split(r"\n{2,}", instruction)
+    content_sections = []
 
-    for marker in markers:
-        idx = instruction.find(marker)
-        if idx >= 0:
-            # Found our seed content — extract from this point
-            extracted = instruction[idx:].strip()
-            if len(extracted) > 50:  # sanity check — not a trivial fragment
-                return extracted
+    for section in sections:
+        stripped = section.strip()
+        if not stripped:
+            continue
 
-    # Pattern 2: If DSPy ReAct agent framing is detected, strip it.
-    # DSPy ReAct prepends: "You are an Agent. In each episode, you will be
-    # given the fields {inputs} as input..." followed by numbered tool schemas.
-    agent_markers = ["You are an Agent.", "You are an Agent designed to"]
-    if any(m in instruction for m in agent_markers):
-        # Try to find where the ReAct boilerplate ends and content begins.
-        # DSPy puts the original instructions after tool schemas.
-        sections = re.split(r"\n{2,}", instruction)
-        content_sections = []
-        in_boilerplate = True
-        for section in sections:
-            stripped = section.strip()
-            if not stripped:
-                continue
-            # Boilerplate indicators (match DSPy's actual ReAct format)
-            if in_boilerplate and any(bp in stripped for bp in [
-                "You are an Agent",
-                "In each episode,",
-                "At each step,",
-                "next_tool_name",
-                "next_tool_args",
-                "Tool Name:",
-                "Tool Description:",
-                "Tool Arguments:",
-            ]):
-                continue
-            # Numbered tool entries: "(1) shell_command: ..."
-            if in_boilerplate and re.match(r"^\(\d+\)\s+\w+", stripped):
-                continue
-            in_boilerplate = False
-            content_sections.append(stripped)
+        # Skip DSPy ReAct agent framing paragraphs
+        if any(bp in stripped for bp in [
+            "You are an Agent",
+            "In each episode,",
+            "At each step,",
+            "next_thought, next_tool_name, and next_tool_args",
+            "When writing next_thought,",
+            "When selecting the next_tool_name",
+            "When providing `next_tool_args`",
+            "you will interleave next_thought",
+            "After each tool call, you receive",
+            "your past trajectory so far",
+            "collect any necessary information for producing",
+        ]):
+            continue
 
-        if content_sections:
-            return "\n\n".join(content_sections)
+        # Skip numbered tool entries: "(1) shell_command, whose description..."
+        if re.match(r"^\(\d+\)\s+\w+", stripped):
+            continue
 
-    # No boilerplate detected — return as-is
+        content_sections.append(stripped)
+
+    if content_sections:
+        return "\n\n".join(content_sections)
+
+    # Fallback: return as-is if nothing survived filtering
     return instruction.strip()
 
 
-def _extract_first_url(text: str) -> Optional[str]:
+def _extract_first_url(text: str) -> str | None:
     """Extract the first HTTP(S) URL and normalize to scheme://host[:port]."""
     if not text:
         return None
@@ -231,22 +214,22 @@ def _build_metric(reward_fn):
         # Score bucket
         if score >= 0.8:
             feedback_parts.append(
-                "Strong performance (score={:.2f}). Flag was captured.".format(score)
+                f"Strong performance (score={score:.2f}). Flag was captured."
             )
         elif score >= 0.5:
             feedback_parts.append(
-                "Moderate performance (score={:.2f}). Some phases completed "
-                "but flag not captured.".format(score)
+                f"Moderate performance (score={score:.2f}). Some phases completed "
+                "but flag not captured."
             )
         elif score >= 0.2:
             feedback_parts.append(
-                "Weak performance (score={:.2f}). Agent attempted tool calls "
-                "but lacked a structured approach.".format(score)
+                f"Weak performance (score={score:.2f}). Agent attempted tool calls "
+                "but lacked a structured approach."
             )
         else:
             feedback_parts.append(
-                "Very weak performance (score={:.2f}). Agent failed to engage "
-                "effectively.".format(score)
+                f"Very weak performance (score={score:.2f}). Agent failed to engage "
+                "effectively."
             )
 
         # Concrete trace summary — show what commands ran and what happened.
@@ -310,7 +293,7 @@ def _build_metric(reward_fn):
 # ---------------------------------------------------------------------------
 
 
-def _extract_target_from_messages(messages: List[Dict[str, str]]) -> Optional[str]:
+def _extract_target_from_messages(messages: list[dict[str, str]]) -> str | None:
     """Extract target URL from user messages."""
     for msg in messages:
         if msg.get("role") == "user":
@@ -322,7 +305,7 @@ def _extract_target_from_messages(messages: List[Dict[str, str]]) -> Optional[st
 
 def _load_challenges(
     data_path: str,
-    max_samples: Optional[int] = None,
+    max_samples: int | None = None,
     registry=None,
 ) -> list:
     """Load challenges from GRPO JSONL as DSPy Examples.
@@ -483,7 +466,7 @@ class _EnvAwareReAct:
     can still inspect and evolve the prompt.
     """
 
-    def __init__(self, inner: "dspy.ReAct", challenge_flags: Dict[str, str]):
+    def __init__(self, inner: "dspy.ReAct", challenge_flags: dict[str, str]):
         self._inner = inner
         self._challenge_flags = challenge_flags
 
@@ -506,7 +489,8 @@ class _EnvAwareReAct:
 
         return ""
 
-    def __call__(self, challenge: str = "", **kwargs):
+    def _init_episode(self, challenge: str) -> None:
+        """Initialize ToolExecutor with correct ground_truth before an episode."""
         from open_ctf.training.tools import mark_step_begin
 
         gt_flag = self._resolve_ground_truth(challenge)
@@ -523,7 +507,20 @@ class _EnvAwareReAct:
                 challenge[:80],
             )
 
-        return self._inner(challenge=challenge, **kwargs)
+    def __call__(self, challenge: str = "", **kwargs):
+        """Route through forward() so bootstrap_trace's forward-patching works.
+
+        DSPy's bootstrap_trace_data patches program.forward to capture traces.
+        If __call__ bypasses forward(), the patched wrapper never fires and
+        GEPA gets "too many values to unpack" during trace collection.
+        """
+        return self.forward(challenge=challenge, **kwargs)
+
+    def forward(self, challenge: str = "", **kwargs):
+        """DSPy's bootstrap_trace_data uses object.__getattribute__(program, 'forward')
+        which bypasses __getattr__. Must be defined directly on the class."""
+        self._init_episode(challenge)
+        return self._inner.forward(challenge=challenge, **kwargs)
 
     # --- DSPy introspection delegation ---
     # GEPA needs these to inspect and evolve the prompt on the inner ReAct.
@@ -590,14 +587,14 @@ def run_gepa(
     model_id: str,
     data_path: str,
     output_dir: str,
-    config: Dict[str, Any],
-    reflection_model: Optional[str] = None,
+    config: dict[str, Any],
+    reflection_model: str | None = None,
     budget: str = "medium",
-    val_data_path: Optional[str] = None,
-    max_samples: Optional[int] = None,
-    challenge_registry: Optional[str] = None,
-    agent_class: Optional[str] = None,
-    tools: Optional[list] = None,
+    val_data_path: str | None = None,
+    max_samples: int | None = None,
+    challenge_registry: str | None = None,
+    agent_class: str | None = None,
+    tools: list | None = None,
 ) -> str:
     """Run GEPA prompt optimization.
 
@@ -656,7 +653,8 @@ def run_gepa(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Configure DSPy LM ------------------------------------------------
-    lm = dspy.LM(model=model_id, temperature=0.7, max_tokens=4096)
+    agent_max_tokens = gepa_cfg.get("max_tokens", 4096)
+    lm = dspy.LM(model=model_id, temperature=0.7, max_tokens=agent_max_tokens)
     dspy.configure(lm=lm)
 
     # Reflection LM — defaults to same model (no cloud APIs needed).
@@ -816,23 +814,38 @@ def run_gepa(
 
     # Save detailed results
     if hasattr(optimized, "detailed_results") and optimized.detailed_results:
-        results = optimized.detailed_results.to_dict()
-        results_path = out_dir / "gepa_results.json"
-        results_path.write_text(json.dumps(results, indent=2, default=str))
-        logger.info("Detailed results saved to %s", results_path)
-        logger.info(
-            "Best score: %.4f (candidate %d of %d)",
-            optimized.detailed_results.val_aggregate_scores[
-                optimized.detailed_results.best_idx
-            ],
-            optimized.detailed_results.best_idx,
-            len(optimized.detailed_results.candidates),
-        )
+        try:
+            results = optimized.detailed_results.to_dict()
+            results_path = out_dir / "gepa_results.json"
+            results_path.write_text(json.dumps(results, indent=2, default=str))
+            logger.info("Detailed results saved to %s", results_path)
+            logger.info(
+                "Best score: %.4f (candidate %d of %d)",
+                optimized.detailed_results.val_aggregate_scores[
+                    optimized.detailed_results.best_idx
+                ],
+                optimized.detailed_results.best_idx,
+                len(optimized.detailed_results.candidates),
+            )
+        except (AttributeError, TypeError, KeyError) as e:
+            # GEPA's to_dict() may call .items() on candidate programs
+            # which fails for wrapper objects. Save what we can.
+            logger.warning("Could not serialize detailed_results: %s", e)
+            try:
+                fallback = {
+                    "best_idx": optimized.detailed_results.best_idx,
+                    "val_scores": optimized.detailed_results.val_aggregate_scores,
+                }
+                results_path = out_dir / "gepa_results.json"
+                results_path.write_text(json.dumps(fallback, indent=2, default=str))
+                logger.info("Partial results saved to %s", results_path)
+            except Exception:
+                pass
 
     # Save the optimized DSPy module for reuse
     try:
-        optimized.save(str(out_dir / "optimized_agent"))
-        logger.info("Optimized DSPy module saved to %s", out_dir / "optimized_agent")
+        optimized.save(str(out_dir / "optimized_agent.json"))
+        logger.info("Optimized DSPy module saved to %s", out_dir / "optimized_agent.json")
     except Exception as e:
         logger.warning("Could not save DSPy module: %s", e)
 

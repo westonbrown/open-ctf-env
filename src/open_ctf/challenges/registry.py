@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import yaml
@@ -21,11 +21,11 @@ class ChallengeInfo:
     difficulty: str
     infra_type: str  # "docker" or "static"
     name: str = ""
-    port: Optional[int] = None
-    ground_truth_flag: Optional[str] = None
-    aliases: List[str] = field(default_factory=list)
-    path_hint: Optional[str] = None
-    target_url: Optional[str] = None
+    port: int | None = None
+    ground_truth_flag: str | None = None
+    aliases: list[str] = field(default_factory=list)
+    path_hint: str | None = None
+    target_url: str | None = None
 
 
 class ChallengeRegistry:
@@ -37,9 +37,9 @@ class ChallengeRegistry:
         url = registry.get_target_url("eval-me")  # -> "http://localhost:32805"
     """
 
-    def __init__(self, config_path: str, target_overrides_path: Optional[str] = None):
-        self._challenges: Dict[str, ChallengeInfo] = {}
-        self._target_overrides: Dict[str, str] = {}
+    def __init__(self, config_path: str, target_overrides_path: str | None = None):
+        self._challenges: dict[str, ChallengeInfo] = {}
+        self._target_overrides: dict[str, str] = {}
         self._load(config_path)
         if target_overrides_path:
             self.load_target_overrides(target_overrides_path)
@@ -72,7 +72,7 @@ class ChallengeRegistry:
         }
 
     @staticmethod
-    def _normalize_target_url(raw_value: Any) -> Optional[str]:
+    def _normalize_target_url(raw_value: Any) -> str | None:
         """Normalize a target URL/endpoint declaration to an absolute HTTP URL."""
         if raw_value is None:
             return None
@@ -156,10 +156,10 @@ class ChallengeRegistry:
         logger.info("Loaded %d challenges from %s", len(self._challenges), config_path)
 
     @staticmethod
-    def _extract_target_mapping(payload: Any) -> Dict[str, Any]:
+    def _extract_target_mapping(payload: Any) -> dict[str, Any]:
         """Extract a challenge_id -> endpoint mapping from common JSON/YAML shapes."""
         if isinstance(payload, list):
-            mapping: Dict[str, Any] = {}
+            mapping: dict[str, Any] = {}
             for item in payload:
                 if not isinstance(item, dict):
                     continue
@@ -187,7 +187,7 @@ class ChallengeRegistry:
         return {str(k): v for k, v in payload.items()}
 
     @staticmethod
-    def _coerce_mapping_value(value: Any) -> Optional[str]:
+    def _coerce_mapping_value(value: Any) -> str | None:
         if isinstance(value, dict):
             direct = value.get("target_url", value.get("target", value.get("url")))
             normalized = ChallengeRegistry._normalize_target_url(direct)
@@ -200,7 +200,7 @@ class ChallengeRegistry:
             return None
         return ChallengeRegistry._normalize_target_url(value)
 
-    def set_target_overrides(self, mapping: Dict[str, Any], strict: bool = False) -> int:
+    def set_target_overrides(self, mapping: dict[str, Any], strict: bool = False) -> int:
         """Apply target URL overrides keyed by challenge id/name/alias."""
         loaded = 0
         for raw_key, raw_value in mapping.items():
@@ -236,10 +236,10 @@ class ChallengeRegistry:
         logger.info("Loaded %d challenge target overrides from %s", loaded, path)
         return loaded
 
-    def get_target_overrides(self) -> Dict[str, str]:
+    def get_target_overrides(self) -> dict[str, str]:
         return dict(self._target_overrides)
 
-    def resolve_id(self, challenge_id: str) -> Optional[str]:
+    def resolve_id(self, challenge_id: str) -> str | None:
         """Resolve challenge ID/name/alias to a canonical registry ID."""
         if challenge_id in self._challenges:
             return challenge_id
@@ -249,7 +249,7 @@ class ChallengeRegistry:
             return None
 
         query_tokens = self._tokenize(challenge_id)
-        scores_by_id: Dict[str, int] = {}
+        scores_by_id: dict[str, int] = {}
 
         for cid, info in self._challenges.items():
             keys = [cid, info.name, *info.aliases]
@@ -307,19 +307,19 @@ class ChallengeRegistry:
             raise KeyError(f"Challenge not found: {challenge_id}")
         return self._challenges[resolved_id]
 
-    def list_all(self) -> List[ChallengeInfo]:
+    def list_all(self) -> list[ChallengeInfo]:
         """Return all challenges."""
         return list(self._challenges.values())
 
-    def list_docker_challenges(self) -> List[ChallengeInfo]:
+    def list_docker_challenges(self) -> list[ChallengeInfo]:
         """Return challenges that need Docker containers."""
         return [c for c in self._challenges.values() if c.infra_type == "docker"]
 
-    def list_static_challenges(self) -> List[ChallengeInfo]:
+    def list_static_challenges(self) -> list[ChallengeInfo]:
         """Return file-based challenges (no server needed)."""
         return [c for c in self._challenges.values() if c.infra_type == "static"]
 
-    def get_target_url(self, challenge_id: str, host: str = "localhost") -> Optional[str]:
+    def get_target_url(self, challenge_id: str, host: str = "localhost") -> str | None:
         """Get the target URL for a challenge, or None for static challenges."""
         info = self.get(challenge_id)
         override = self._target_overrides.get(info.id)

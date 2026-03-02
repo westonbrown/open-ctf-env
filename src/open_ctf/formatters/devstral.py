@@ -14,7 +14,7 @@ Key differences from OpenAI format:
 """
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from .base import ModelFormatter
 from .tool_registry import AGENT_TOOLS
@@ -32,7 +32,7 @@ class DevstralFormatter(ModelFormatter):
         The scan reveals open ports 22 and 80.
     """
 
-    def format_messages(self, messages: List[Dict[str, Any]]) -> str:
+    def format_messages(self, messages: list[dict[str, Any]]) -> str:
         """Format messages into Devstral/Mistral chat template.
 
         If a tokenizer is provided, delegates to
@@ -54,15 +54,12 @@ class DevstralFormatter(ModelFormatter):
         processed = self._merge_reasoning(messages)
         processed = self._enforce_alternation(processed)
 
-        parts: List[str] = []
+        parts: list[str] = []
         for msg in processed:
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
-            if role == "system":
-                parts.append(f"[INST] {content} [/INST]")
-
-            elif role == "user":
+            if role == "system" or role == "user":
                 parts.append(f"[INST] {content} [/INST]")
 
             elif role == "assistant":
@@ -96,7 +93,7 @@ class DevstralFormatter(ModelFormatter):
 
         return "\n".join(parts)
 
-    def get_tool_definitions(self) -> List[Dict[str, Any]]:
+    def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Return tools in OpenAI function-calling format.
 
         Mistral models accept the standard schema when served via vLLM
@@ -108,14 +105,14 @@ class DevstralFormatter(ModelFormatter):
 
     @staticmethod
     def _merge_reasoning(
-        messages: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """Merge ``reasoning_content`` into ``content``.
 
         Devstral does not support a separate reasoning field; we prepend
         reasoning text to the main content wrapped in ``<think>`` tags.
         """
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for msg in messages:
             msg = dict(msg)  # shallow copy
             reasoning = msg.pop("reasoning_content", None)
@@ -127,16 +124,16 @@ class DevstralFormatter(ModelFormatter):
 
     @staticmethod
     def _enforce_alternation(
-        messages: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         """Insert empty user messages to satisfy strict role alternation.
 
         Devstral requires user/assistant roles to alternate (tool calls
         and tool results are exempt). This inserts a minimal user turn
         between consecutive assistant messages when needed.
         """
-        out: List[Dict[str, Any]] = []
-        prev_role: Optional[str] = None
+        out: list[dict[str, Any]] = []
+        prev_role: str | None = None
         for msg in messages:
             role = msg.get("role", "user")
             # tool messages don't break alternation

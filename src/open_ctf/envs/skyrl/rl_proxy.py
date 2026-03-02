@@ -1,7 +1,6 @@
 import asyncio
-import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from aiohttp import web
 
@@ -19,11 +18,11 @@ class RLProxyServer:
         self.port = port
         self.app = web.Application()
         self.app.router.add_post("/v1/chat/completions", self.handle_chat_completion)
-        self.runner: Optional[web.AppRunner] = None
-        
+        self.runner: web.AppRunner | None = None
+
         # Synchronization Primitives
         # Queue from Agent -> RL Generator (Prompt requests)
-        self._request_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        self._request_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         # Queue from RL Generator -> Agent (Action responses)
         self._response_queue: asyncio.Queue[str] = asyncio.Queue()
 
@@ -45,18 +44,18 @@ class RLProxyServer:
         try:
             data = await request.json()
             messages = data.get("messages", [])
-            
+
             logger.debug(f"[RLProxy] Received completion request with {len(messages)} messages.")
-            
+
             # Send the request to the RL generator loop
             await self._request_queue.put({
                 "messages": messages,
                 "model": data.get("model", "default")
             })
-            
+
             # Block until the RL generator computes the action (forward pass)
             action_text = await self._response_queue.get()
-            
+
             # Format as a standard OpenAI response
             response_payload = {
                 "id": "chatcmpl-rlproxy",
@@ -72,14 +71,14 @@ class RLProxyServer:
                     "finish_reason": "stop"
                 }]
             }
-            
+
             return web.json_response(response_payload)
-            
+
         except Exception as e:
             logger.error(f"[RLProxy] Error handling request: {e}")
             return web.Response(status=500, text=str(e))
 
-    async def yield_prompt(self, timeout: float = 0.5) -> Optional[Dict[str, Any]]:
+    async def yield_prompt(self, timeout: float = 0.5) -> dict[str, Any] | None:
         """Used by the RL Generator to poll for new prompts from the agent.
         
         Returns None if no prompt is available within the timeout.

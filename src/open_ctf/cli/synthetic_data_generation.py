@@ -8,11 +8,10 @@ SimulatedEnvironmentExecutor and the SyntheticGenerator.
 import argparse
 import logging
 import sys
-import yaml
 from pathlib import Path
 
+from ..synthetic_data_generation.generator import LiteLLMAgentAdapter, SyntheticGenerator
 from ..synthetic_data_generation.manifest import WorldManifest
-from ..synthetic_data_generation.generator import SyntheticGenerator, LiteLLMAgentAdapter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,7 +55,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    
+
     config_path = Path(args.config)
     if not config_path.exists():
         logger.error(f"Config path {args.config} does not exist.")
@@ -71,22 +70,22 @@ def main() -> None:
 
     # In a full run, we would dynamically load a whole directory of manifests
     # For this proof of concept scale, we load one and scale it up.
-    
+
     logger.info("Initializing AgentAdapter and SyntheticGenerator...")
     agent_adapter = LiteLLMAgentAdapter(model_name=args.teacher_model)
     generator = SyntheticGenerator(
         manifests=[manifest],
         agent_adapter=agent_adapter
     )
-    
+
     logger.info(f"Generating {args.num_traces} raw traces from teacher...")
     raw_traces = generator.batch_generate_traces(max_trajectories=args.num_traces)
-    
+
     logger.info("Exporting to training formats...")
     generator.export_jsonl(raw_traces, args.sft_out)
     generator.export_jsonl(raw_traces, args.online_rl_out)
-    
+
     logger.info(f"Generation successful. Output traces span {args.num_traces} completed objectives.")
-    
+
 if __name__ == "__main__":
     main()

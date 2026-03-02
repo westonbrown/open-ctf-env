@@ -5,9 +5,9 @@ from __future__ import annotations
 import http.client
 import socket
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 from .registry import ChallengeRegistry
@@ -25,18 +25,18 @@ class TargetCheckResult:
     reachable: bool
     check_mode: str
     detail: str
-    container_port_bound: Optional[bool] = None
+    container_port_bound: bool | None = None
 
 
 @dataclass
 class RuntimePreflightReport:
     """Aggregated runtime preflight report."""
 
-    challenge_ids: List[str] = field(default_factory=list)
-    collisions: Dict[str, List[str]] = field(default_factory=dict)
-    checks: List[TargetCheckResult] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
+    challenge_ids: list[str] = field(default_factory=list)
+    collisions: dict[str, list[str]] = field(default_factory=dict)
+    checks: list[TargetCheckResult] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -46,9 +46,9 @@ class RuntimePreflightReport:
 def _resolve_selected_challenge_ids(
     registry: ChallengeRegistry,
     *,
-    challenge_ids: Optional[Iterable[str]] = None,
-) -> List[str]:
-    selected: List[str] = []
+    challenge_ids: Iterable[str] | None = None,
+) -> list[str]:
+    selected: list[str] = []
     if challenge_ids is None:
         selected = [info.id for info in registry.list_all()]
     else:
@@ -57,7 +57,7 @@ def _resolve_selected_challenge_ids(
             if resolved is not None:
                 selected.append(resolved)
 
-    deduped: List[str] = []
+    deduped: list[str] = []
     seen: set[str] = set()
     for cid in selected:
         if cid in seen:
@@ -67,7 +67,7 @@ def _resolve_selected_challenge_ids(
     return deduped
 
 
-def _extract_target_host_port(target: str) -> tuple[Optional[str], Optional[int], str]:
+def _extract_target_host_port(target: str) -> tuple[str | None, int | None, str]:
     """Return `(hostname, port, scheme)` for a target URL/endpoint."""
     text = str(target or "").strip()
     if not text:
@@ -94,7 +94,7 @@ def _extract_target_host_port(target: str) -> tuple[Optional[str], Optional[int]
     return None, None, scheme
 
 
-def _is_local_target(hostname: Optional[str]) -> bool:
+def _is_local_target(hostname: str | None) -> bool:
     if not hostname:
         return True
     return hostname.lower() in _LOCAL_HOSTS
@@ -115,8 +115,8 @@ def _probe_target_reachability(target: str, timeout_seconds: float) -> tuple[boo
 
     parsed = urlparse(text)
     scheme = (parsed.scheme or "").lower()
-    host: Optional[str] = None
-    port: Optional[int] = None
+    host: str | None = None
+    port: int | None = None
 
     if scheme in {"http", "https"}:
         host = parsed.hostname
@@ -162,7 +162,7 @@ def _probe_target_reachability(target: str, timeout_seconds: float) -> tuple[boo
         return False, "tcp", str(exc)
 
 
-def _docker_ports_snapshot(timeout_seconds: float) -> tuple[Optional[str], Optional[str]]:
+def _docker_ports_snapshot(timeout_seconds: float) -> tuple[str | None, str | None]:
     """Return docker port mappings text from `docker ps`, or an error string."""
     try:
         result = subprocess.run(
@@ -186,8 +186,8 @@ def find_target_collisions(
     registry: ChallengeRegistry,
     *,
     host: str = "localhost",
-    challenge_ids: Optional[Iterable[str]] = None,
-) -> Dict[str, List[str]]:
+    challenge_ids: Iterable[str] | None = None,
+) -> dict[str, list[str]]:
     """Return target URL collisions for selected challenges.
 
     Collisions are ignored for static/file-based targets because they
@@ -198,7 +198,7 @@ def find_target_collisions(
         challenge_ids=challenge_ids,
     )
 
-    target_to_ids: Dict[str, List[str]] = {}
+    target_to_ids: dict[str, list[str]] = {}
     for cid in selected:
         info = registry.get(cid)
         target = registry.get_target_url(cid, host=host)
@@ -208,7 +208,7 @@ def find_target_collisions(
             continue
         target_to_ids.setdefault(str(target), []).append(info.id)
 
-    collisions: Dict[str, List[str]] = {}
+    collisions: dict[str, list[str]] = {}
     for target, ids in target_to_ids.items():
         deduped = sorted(set(ids))
         if len(deduped) > 1:
@@ -220,7 +220,7 @@ def validate_no_target_collisions(
     registry: ChallengeRegistry,
     *,
     host: str = "localhost",
-    challenge_ids: Optional[Iterable[str]] = None,
+    challenge_ids: Iterable[str] | None = None,
 ) -> None:
     """Raise ValueError when multiple challenge IDs share one non-static target."""
     collisions = find_target_collisions(
@@ -242,7 +242,7 @@ def run_runtime_preflight(
     registry: ChallengeRegistry,
     *,
     host: str = "localhost",
-    challenge_ids: Optional[Iterable[str]] = None,
+    challenge_ids: Iterable[str] | None = None,
     timeout_seconds: float = 2.0,
     require_reachable: bool = True,
     strict_container_check: bool = True,
@@ -267,8 +267,8 @@ def run_runtime_preflight(
             f"Top collisions: {top}."
         )
 
-    docker_ports_text: Optional[str] = None
-    docker_snapshot_error: Optional[str] = None
+    docker_ports_text: str | None = None
+    docker_snapshot_error: str | None = None
     if strict_container_check:
         needs_local_docker_check = False
         for cid in selected:
@@ -316,7 +316,7 @@ def run_runtime_preflight(
                     f"for target {target}."
                 )
 
-        container_port_bound: Optional[bool] = None
+        container_port_bound: bool | None = None
         if (
             strict_container_check
             and info.infra_type == "docker"
@@ -363,7 +363,7 @@ def validate_runtime_preflight(
     registry: ChallengeRegistry,
     *,
     host: str = "localhost",
-    challenge_ids: Optional[Iterable[str]] = None,
+    challenge_ids: Iterable[str] | None = None,
     timeout_seconds: float = 2.0,
     require_reachable: bool = True,
     strict_container_check: bool = True,
