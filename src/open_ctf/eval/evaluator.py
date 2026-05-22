@@ -49,6 +49,17 @@ class ChallengeResult:
 
 
 @dataclass
+class SkippedChallenge:
+    """Record for a challenge filtered out by the YAML ``skip`` block."""
+
+    challenge_id: str
+    reason: str
+    opened_on: str | None = None
+    linked_issue: str | None = None
+    note: str | None = None
+
+
+@dataclass
 class EvalReport:
     """Aggregate evaluation report."""
 
@@ -61,6 +72,7 @@ class EvalReport:
     avg_turns: float
     avg_time_seconds: float
     results: list[dict[str, Any]] = field(default_factory=list)
+    skipped: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +135,29 @@ class ModelEvaluator:
         Returns:
             List of challenge dicts with keys: id, platform, vuln_type, difficulty.
         """
+        challenges, _ = self._load_challenges_and_skips()
+        return challenges
+
+    def _load_challenges_and_skips(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[SkippedChallenge]]:
+        """Load challenges + skip-list from YAML config.
+
+        Returns:
+            Tuple of (non-skipped challenges, SkippedChallenge records).
+
+        The skip block is a top-level ``skip:`` mapping keyed by challenge id::
+
+            skip:
+              XBEN-042-24:
+                reason: qemu-slow
+                opened_on: "2026-05-22"
+                linked_issue: "vecna-item:..."
+
+        Skipped entries are removed from the challenge list returned to the
+        runner. The caller is expected to log + record them in the report so
+        the absence is auditable rather than silent.
+        """
         yaml_path = Path(self.challenges_yaml)
         if not yaml_path.is_absolute():
             yaml_path = _PACKAGE_DIR / yaml_path
@@ -133,12 +168,56 @@ class ModelEvaluator:
         with open(yaml_path) as f:
             data = yaml.safe_load(f) or {}
 
-        challenges = data.get("challenges", [])
-        if not challenges:
+        all_challenges = data.get("challenges", [])
+        if not all_challenges:
             raise ValueError(f"No challenges found in {yaml_path}")
 
-        logger.info("Loaded %d challenges from %s", len(challenges), yaml_path)
-        return challenges
+        raw_skip = data.get("skip") or {}
+        if not isinstance(raw_skip, dict):
+            raise ValueError(
+                f"`skip` in {yaml_path} must be a mapping keyed by challenge id, "
+                f"got {type(raw_skip).__name__}"
+            )
+
+        skip_records: list[SkippedChallenge] = []
+        for cid, meta in raw_skip.items():
+            meta = meta or {}
+            if not isinstance(meta, dict):
+                raise ValueError(
+                    f"skip[{cid}] in {yaml_path} must be a mapping, "
+                    f"got {type(meta).__name__}"
+                )
+            reason = meta.get("reason")
+            if not reason:
+                raise ValueError(
+                    f"skip[{cid}] in {yaml_path} is missing required `reason` field"
+                )
+            skip_records.append(
+                SkippedChallenge(
+                    challenge_id=str(cid),
+                    reason=str(reason),
+                    opened_on=(str(meta["opened_on"]) if meta.get("opened_on") else None),
+                    linked_issue=(
+                        str(meta["linked_issue"]) if meta.get("linked_issue") else None
+                    ),
+                    note=(str(meta["note"]) if meta.get("note") else None),
+                )
+            )
+
+        skip_ids = {s.challenge_id for s in skip_records}
+        challenges = [c for c in all_challenges if str(c.get("id")) not in skip_ids]
+
+        if skip_records:
+            logger.info(
+                "Loaded %d challenges from %s (%d skipped: %s)",
+                len(challenges),
+                yaml_path,
+                len(skip_records),
+                ", ".join(sorted(skip_ids)),
+            )
+        else:
+            logger.info("Loaded %d challenges from %s", len(challenges), yaml_path)
+        return challenges, skip_records
 
     # ------------------------------------------------------------------
     # Single challenge run
@@ -263,7 +342,11 @@ class ModelEvaluator:
         Returns:
             EvalReport with aggregate statistics and per-challenge results.
         """
-        challenges = self.load_challenges()
+        challenges, skipped = self._load_challenges_and_skips()
+        for s in skipped:
+            # Auditable single-line marker for the run log; matches the format
+            # asserted by tests/test_cli_evaluate.py.
+            logger.info("SKIPPED: %s (%s)", s.challenge_id, s.reason)
         self._run_runtime_preflight(challenges)
         results: list[ChallengeResult] = []
 
@@ -291,6 +374,7 @@ class ModelEvaluator:
             avg_turns=round(avg_turns, 1),
             avg_time_seconds=round(avg_time, 1),
             results=[asdict(r) for r in results],
+            skipped=[asdict(s) for s in skipped],
         )
 
         return report
@@ -391,6 +475,22 @@ class ModelEvaluator:
                 f"| {r['difficulty']} | {solved_str} | {r['turns']} "
                 f"| {r['elapsed_seconds']} | {error_str} |"
             )
+
+        if report.skipped:
+            lines.extend([
+                "",
+                "## Skipped",
+                "",
+                "| Challenge | Reason | Opened | Linked Issue |",
+                "|-----------|--------|--------|--------------|",
+            ])
+            for s in report.skipped:
+                lines.append(
+                    f"| SKIPPED: {s['challenge_id']} "
+                    f"| {s['reason']} "
+                    f"| {s.get('opened_on') or ''} "
+                    f"| {s.get('linked_issue') or ''} |"
+                )
 
         lines.append("")
         return "\n".join(lines)

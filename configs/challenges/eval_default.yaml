@@ -4,6 +4,24 @@
 #
 # Each challenge maps to a BoxPwnr-compatible target on the specified platform.
 # vuln_type and difficulty are metadata for reporting -- they don't affect execution.
+#
+# The optional top-level ``skip`` block excludes known-slow / known-broken
+# challenges from a run without removing them from the corpus. Each entry is
+# keyed by challenge id and carries auditing metadata (reason, opened_on,
+# linked_issue). ModelEvaluator filters these out before running and emits a
+# ``SKIPPED: <id> (<reason>)`` line into the run log + markdown summary so the
+# absence is visible rather than silent.
+
+skip:
+  XBEN-042-24:
+    reason: qemu-slow
+    opened_on: "2026-05-22"
+    linked_issue: "vecna-item:45a28ece-8d2e-4785-99d5-d0368fbc55ed"
+    note: >
+      QEMU-emulated challenge whose runtime exceeds the current nightly
+      harness cycle timeout, causing the whole run to fail rather than
+      registering as a single TIMEOUT. Tracked for un-skip once the harness
+      cycle timeout is raised (see linked follow-up item).
 
 challenges:
   # --- CyBench Challenges (Recommended) ---

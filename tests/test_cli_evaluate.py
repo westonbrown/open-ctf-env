@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import types
 from argparse import Namespace
 
@@ -105,3 +106,106 @@ def test_model_evaluator_custom_agent_path(tmp_path, monkeypatch):
     )
     assert result.solved is True
     assert result.turns == 2
+
+
+def test_skip_list_filters_and_emits_skipped_line(tmp_path, caplog):
+    """``skip`` block excludes ids from the run and logs ``SKIPPED: <id> (<reason>)``.
+
+    Verifies the four acceptance points from the XBEN-042 skip-list task:
+    skipped ids do not appear in run_all results, a SKIPPED log line is
+    emitted, the EvalReport.skipped list carries the audit metadata, and
+    the markdown summary renders a Skipped section.
+    """
+    from open_ctf.eval.evaluator import ModelEvaluator, SkippedChallenge
+
+    config_path = tmp_path / "challenges.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "skip": {
+                    "XBEN-042-24": {
+                        "reason": "qemu-slow",
+                        "opened_on": "2026-05-22",
+                        "linked_issue": "vecna-item:45a28ece",
+                    },
+                },
+                "challenges": [
+                    {
+                        "id": "XBEN-042-24",
+                        "platform": "xbow",
+                        "vuln_type": "pwn",
+                        "difficulty": "hard",
+                    },
+                    {
+                        "id": "XBEN-003-24",
+                        "platform": "xbow",
+                        "vuln_type": "idor",
+                        "difficulty": "medium",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    evaluator = ModelEvaluator(
+        model="stub",
+        challenges_yaml=str(config_path),
+        traces_dir=str(tmp_path / "traces"),
+        max_turns=1,
+        max_time=1,
+    )
+
+    # load_challenges directly drops skipped entries.
+    challenges = evaluator.load_challenges()
+    assert [c["id"] for c in challenges] == ["XBEN-003-24"]
+
+    # _load_challenges_and_skips returns the SkippedChallenge record with metadata.
+    _, skipped = evaluator._load_challenges_and_skips()
+    assert skipped == [
+        SkippedChallenge(
+            challenge_id="XBEN-042-24",
+            reason="qemu-slow",
+            opened_on="2026-05-22",
+            linked_issue="vecna-item:45a28ece",
+        )
+    ]
+
+    # run_all emits the auditable SKIPPED log line and records it in the report.
+    # Stub out run_challenge so we don't actually invoke BoxPwnr.
+    from open_ctf.eval.evaluator import ChallengeResult
+
+    def _fake_run(challenge):
+        return ChallengeResult(
+            challenge_id=challenge["id"],
+            platform=challenge["platform"],
+            vuln_type=challenge["vuln_type"],
+            difficulty=challenge["difficulty"],
+            solved=False,
+            turns=0,
+            elapsed_seconds=0.0,
+        )
+
+    evaluator.run_challenge = _fake_run  # type: ignore[assignment]
+    evaluator._run_runtime_preflight = lambda _c: None  # type: ignore[assignment]
+
+    with caplog.at_level(logging.INFO, logger="open_ctf.eval.evaluator"):
+        report = evaluator.run_all()
+
+    assert "SKIPPED: XBEN-042-24 (qemu-slow)" in caplog.text
+    assert report.total_challenges == 1
+    assert [r["challenge_id"] for r in report.results] == ["XBEN-003-24"]
+    assert report.skipped == [
+        {
+            "challenge_id": "XBEN-042-24",
+            "reason": "qemu-slow",
+            "opened_on": "2026-05-22",
+            "linked_issue": "vecna-item:45a28ece",
+            "note": None,
+        }
+    ]
+
+    md = ModelEvaluator._format_markdown(report)
+    assert "## Skipped" in md
+    assert "SKIPPED: XBEN-042-24" in md
+    assert "qemu-slow" in md
