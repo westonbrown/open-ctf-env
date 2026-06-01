@@ -11,19 +11,53 @@
 # linked_issue). ModelEvaluator filters these out before running and emits a
 # ``SKIPPED: <id> (<reason>)`` line into the run log + markdown summary so the
 # absence is visible rather than silent.
+#
+# The optional top-level ``cycle_timeouts`` block sets per-queue-class
+# wall-clock budgets (seconds). Each challenge may carry an optional
+# ``class:`` key; challenges without a class fall into the ``default``
+# queue. Independent queues run under independent budgets so a slow-queue
+# timeout never blocks the fast queue's results from flushing, and the
+# regression gate can attribute a ``cycle_timeout`` result to the harness
+# rather than to the solver.
+#
+# WARNING: do not raise the ``default`` budget. The fast queue's p99
+# wall-clock is the signal the nightly is standing up to defend; raising it
+# silently hides regressions. Slow challenges go to a dedicated class
+# instead (see ``emulation-slow`` below).
 
+cycle_timeouts:
+  default: 3600           # 1h fast queue; protects the green-nightly signal.
+  emulation-slow: 21600   # 6h slow queue (6x default); revisit after 3 green cycles.
+
+# Skip-list — temporary belt-and-suspenders for XBEN-042-24. The
+# emulation-slow queue infrastructure ships in the same PR; once the slow
+# queue has cleared three nightly cycles in a row, a follow-up PR removes
+# this entry so the challenge runs for real on the slow queue.
 skip:
   XBEN-042-24:
     reason: qemu-slow
     opened_on: "2026-05-22"
     linked_issue: "vecna-item:45a28ece-8d2e-4785-99d5-d0368fbc55ed"
     note: >
-      QEMU-emulated challenge whose runtime exceeds the current nightly
-      harness cycle timeout, causing the whole run to fail rather than
-      registering as a single TIMEOUT. Tracked for un-skip once the harness
-      cycle timeout is raised (see linked follow-up item).
+      QEMU-emulated challenge whose runtime exceeds the default cycle
+      timeout. Now classified as ``class: emulation-slow`` so it routes to
+      the dedicated 6h slow queue. Skip stays in place until the slow
+      queue has three consecutive green cycles; tracked for un-skip via
+      vecna-item:6d4b587a-7c6c-4e00-81e6-1a1c915a71bc.
 
 challenges:
+  # --- Emulation-Slow (QEMU full-system) ---
+  # Registered under the dedicated ``emulation-slow`` queue class so it
+  # routes to the 6h slow-queue budget instead of the 1h fast-queue
+  # budget. Currently still gated by the ``skip:`` entry above; activated
+  # by a follow-up PR once the slow queue is green.
+  - id: XBEN-042-24
+    platform: xbow
+    vuln_type: pwn
+    difficulty: hard
+    class: emulation-slow
+    description: "QEMU full-system emulation; routed to the emulation-slow queue."
+
   # --- CyBench Challenges (Recommended) ---
   - id: "[Very Easy] Dynastic"
     platform: cybench
